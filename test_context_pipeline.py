@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest import mock
 
@@ -122,10 +123,15 @@ def _map_chunks_json(
     return json.dumps({"chunks": items})
 
 
-def _finding(finding_id: str, body: str | None = None) -> Finding:
+def _finding(
+    finding_id: str,
+    body: str | None = None,
+    *,
+    severity: str = "MAJOR",
+) -> Finding:
     return Finding(
         id=finding_id,
-        severity="MAJOR",
+        severity=severity,
         path="a.c",
         side="RIGHT",
         line=1,
@@ -1651,6 +1657,286 @@ class ValidationAttemptBudgetTests(unittest.TestCase):
         self.assertEqual(stats.validation_calls_succeeded, 1)
         self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
         self.assertNotIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
+
+
+class ReducerDecisionValidationTests(unittest.TestCase):
+    """Reducer JSON is untrusted; only current group_ids may mutate state."""
+
+    def _store(self, *findings: Finding) -> EvidenceStore:
+        store = EvidenceStore()
+        for finding in findings:
+            store.findings[finding.id] = finding
+        return store
+
+    def _assert_known_identities(self, store: EvidenceStore) -> None:
+        known = set(store.findings)
+        self.assertLessEqual(store.kept, known)
+        self.assertLessEqual(set(store.rejected), known)
+        self.assertLessEqual(set(store.merged_into), known)
+        self.assertLessEqual(set(store.merged_into.values()), known)
+
+    def test_hallucinated_keep_id_is_ignored(self) -> None:
+        store = self._store(_finding("A"), _finding("B"))
+        raw = json.dumps({"keep": ["NOT_REAL"], "reject": [], "merge": []})
+        apply_reduce_decision(store, raw, ["A", "B"])
+        self.assertNotIn("NOT_REAL", store.kept)
+        self.assertIn("A", store.kept)
+        self.assertIn("B", store.kept)
+        self._assert_known_identities(store)
+
+    def test_hallucinated_reject_id_is_ignored(self) -> None:
+        store = self._store(_finding("A"), _finding("B"))
+        raw = json.dumps(
+            {
+                "keep": [],
+                "reject": [{"id": "NOT_REAL", "reason": "because model said so"}],
+                "merge": [],
+            }
+        )
+        apply_reduce_decision(store, raw, ["A", "B"])
+        self.assertNotIn("NOT_REAL", store.rejected)
+        self.assertIn("A", store.kept)
+        self.assertIn("B", store.kept)
+        self._assert_known_identities(store)
+
+    def test_merge_with_hallucinated_canonical_is_rejected(self) -> None:
+        store = self._store(_finding("A"), _finding("B"))
+        raw = json.dumps(
+            {
+                "keep": [],
+                "reject": [],
+                "merge": [{"ids": ["A", "B"], "canonical": "NOT_REAL"}],
+            }
+        )
+        apply_reduce_decision(store, raw, ["A", "B"])
+        self.assertIn("A", store.kept)
+        self.assertIn("B", store.kept)
+        self.assertNotIn("A", store.merged_into)
+        self.assertNotIn("B", store.merged_into)
+        self.assertNotIn("NOT_REAL", store.kept)
+        self.assertFalse(store.merged_into)
+        self._assert_known_identities(store)
+
+    def test_merge_canonical_must_be_a_merge_member(self) -> None:
+        store = self._store(_finding("A"), _finding("B"), _finding("C"))
+        raw = json.dumps(
+            {
+                "keep": [],
+                "reject": [],
+                "merge": [{"ids": ["A", "B"], "canonical": "C"}],
+            }
+        )
+        apply_reduce_decision(store, raw, ["A", "B", "C"])
+        self.assertIn("A", store.kept)
+        self.assertIn("B", store.kept)
+        self.assertIn("C", store.kept)
+        self.assertNotIn("A", store.merged_into)
+        self.assertNotIn("B", store.merged_into)
+        self.assertFalse(store.merged_into)
+        self._assert_known_identities(store)
+
+    def test_foreign_real_finding_cannot_be_merge_canonical(self) -> None:
+        store = self._store(_finding("A"), _finding("B"), _finding("C"))
+        raw = json.dumps(
+            {
+                "keep": [],
+                "reject": [],
+                "merge": [{"ids": ["A", "B"], "canonical": "C"}],
+            }
+        )
+        apply_reduce_decision(store, raw, ["A", "B"])
+        self.assertIn("A", store.kept)
+        self.assertIn("B", store.kept)
+        self.assertNotIn("C", store.kept)
+        self.assertNotIn("A", store.merged_into)
+        self.assertNotIn("B", store.merged_into)
+        self.assertNotIn("C", store.merged_into)
+        self.assertNotIn("C", store.merged_into.values())
+        self._assert_known_identities(store)
+
+    def test_foreign_real_finding_cannot_be_merge_member(self) -> None:
+        store = self._store(_finding("A"), _finding("B"), _finding("C"))
+        raw = json.dumps(
+            {
+                "keep": [],
+                "reject": [],
+                "merge": [{"ids": ["A", "C"], "canonical": "A"}],
+            }
+        )
+        apply_reduce_decision(store, raw, ["A", "B"])
+        self.assertIn("A", store.kept)
+        self.assertIn("B", store.kept)
+        self.assertNotIn("C", store.kept)
+        self.assertNotIn("C", store.merged_into)
+        self.assertNotIn("C", store.merged_into.values())
+        self.assertFalse(store.merged_into)
+        self._assert_known_identities(store)
+
+    def test_valid_merge_still_works(self) -> None:
+        store = self._store(_finding("A"), _finding("B"))
+        raw = json.dumps(
+            {
+                "keep": [],
+                "reject": [],
+                "merge": [{"ids": ["A", "B"], "canonical": "A"}],
+            }
+        )
+        apply_reduce_decision(store, raw, ["A", "B"])
+        self.assertIn("A", store.kept)
+        self.assertEqual(store.merged_into["B"], "A")
+        self.assertNotIn("B", store.kept)
+        kept_ids = {finding.id for finding in store.kept_findings()}
+        self.assertEqual(kept_ids, {"A"})
+        self._assert_known_identities(store)
+
+    def test_valid_reject_still_works(self) -> None:
+        store = self._store(_finding("A"), _finding("B"))
+        raw = json.dumps(
+            {
+                "reject": [{"id": "A", "reason": "Contradicted by C7"}],
+                "keep": ["B"],
+                "merge": [],
+            }
+        )
+        apply_reduce_decision(store, raw, ["A", "B"])
+        self.assertIn("A", store.rejected)
+        self.assertEqual(store.rejected["A"], "Contradicted by C7")
+        self.assertIn("B", store.kept)
+        self.assertNotIn("A", store.kept)
+        self._assert_known_identities(store)
+
+    def test_malformed_canonical_fails_safe_to_keep(self) -> None:
+        a = "diff:a.c:1/F1"
+        b = "diff:b.c:1/F1"
+        store = self._store(_finding(a), _finding(b))
+        raw = json.dumps(
+            {
+                "keep": [],
+                "reject": [],
+                "merge": [{"ids": [a, b], "canonical": "F1"}],
+            }
+        )
+        apply_reduce_decision(store, raw, [a, b])
+        self.assertIn(a, store.kept)
+        self.assertIn(b, store.kept)
+        self.assertFalse(store.merged_into)
+        self.assertNotIn("F1", store.kept)
+        self._assert_known_identities(store)
+
+    def test_invalid_canonical_cannot_erase_blocking_finding(self) -> None:
+        a = "diff:a.c:1/F1"
+        b = "diff:b.c:1/F1"
+        store = self._store(
+            _finding(a, severity="MINOR"),
+            _finding(b, severity="BLOCKING"),
+        )
+        raw = json.dumps(
+            {
+                "keep": [],
+                "reject": [],
+                "merge": [{"ids": [a, b], "canonical": "F1"}],
+            }
+        )
+        apply_reduce_decision(store, raw, [a, b])
+        kept_ids = {finding.id for finding in store.kept_findings()}
+        self.assertIn(a, kept_ids)
+        self.assertIn(b, kept_ids)
+        self.assertEqual(
+            {finding.severity for finding in store.kept_findings()},
+            {"MINOR", "BLOCKING"},
+        )
+        self._assert_known_identities(store)
+
+    def test_reducer_cannot_mutate_finding_outside_its_group(self) -> None:
+        store = self._store(_finding("A"), _finding("B"), _finding("C"))
+        store.kept.add("C")
+        before = {
+            "finding": deepcopy(store.findings["C"]),
+            "kept": set(store.kept),
+            "rejected": dict(store.rejected),
+            "merged_into": dict(store.merged_into),
+        }
+        raw = json.dumps(
+            {
+                "keep": [],
+                "reject": [{"id": "C", "reason": "foreign reject"}],
+                "merge": [{"ids": ["A", "B"], "canonical": "C"}],
+            }
+        )
+        apply_reduce_decision(store, raw, ["A", "B"])
+        self.assertEqual(store.findings["C"], before["finding"])
+        self.assertEqual("C" in store.kept, "C" in before["kept"])
+        self.assertEqual(
+            {key: value for key, value in store.rejected.items() if key == "C"},
+            {key: value for key, value in before["rejected"].items() if key == "C"},
+        )
+        self.assertEqual(
+            {
+                key: value
+                for key, value in store.merged_into.items()
+                if key == "C" or value == "C"
+            },
+            {
+                key: value
+                for key, value in before["merged_into"].items()
+                if key == "C" or value == "C"
+            },
+        )
+        self.assertIn("C", store.kept)
+        self.assertIn("A", store.kept)
+        self.assertIn("B", store.kept)
+        self.assertFalse(store.merged_into)
+        self._assert_known_identities(store)
+
+    def test_keep_and_reject_conflict_fails_safe_to_keep(self) -> None:
+        """One response may not both keep and reject the same finding.
+
+        Conflicting actions are ignored so the finding defaults to KEEP.
+        """
+        store = self._store(_finding("A"), _finding("B"))
+        raw = json.dumps(
+            {
+                "keep": ["A"],
+                "reject": [{"id": "A", "reason": "contradiction"}],
+                "merge": [],
+            }
+        )
+        apply_reduce_decision(store, raw, ["A", "B"])
+        self.assertIn("A", store.kept)
+        self.assertNotIn("A", store.rejected)
+        self.assertIn("B", store.kept)
+        self._assert_known_identities(store)
+
+    def test_reject_and_merge_conflict_fails_safe_to_keep(self) -> None:
+        store = self._store(_finding("A"), _finding("B"))
+        raw = json.dumps(
+            {
+                "keep": [],
+                "reject": [{"id": "A", "reason": "bad"}],
+                "merge": [{"ids": ["A", "B"], "canonical": "B"}],
+            }
+        )
+        apply_reduce_decision(store, raw, ["A", "B"])
+        self.assertIn("A", store.kept)
+        self.assertIn("B", store.kept)
+        self.assertNotIn("A", store.rejected)
+        self.assertFalse(store.merged_into)
+        self._assert_known_identities(store)
+
+    def test_single_member_merge_is_ignored(self) -> None:
+        store = self._store(_finding("A"), _finding("B"))
+        raw = json.dumps(
+            {
+                "keep": [],
+                "reject": [],
+                "merge": [{"ids": ["A"], "canonical": "A"}],
+            }
+        )
+        apply_reduce_decision(store, raw, ["A", "B"])
+        self.assertIn("A", store.kept)
+        self.assertIn("B", store.kept)
+        self.assertFalse(store.merged_into)
+        self._assert_known_identities(store)
 
 
 class ReducerTerminationTests(unittest.TestCase):
