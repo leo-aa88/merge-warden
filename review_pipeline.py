@@ -190,6 +190,15 @@ def _unique_id(prefix: str, used: set[str]) -> str:
         index += 1
 
 
+def canonical_finding_id(chunk_id: str, model_id: str) -> str:
+    """Map a model-local finding ID onto the store's stable identity.
+
+    Map-stage IDs are chunk-local: independent calls routinely reuse ``F1``.
+    The evidence store, reduce, and synthesis operate on ``<chunk-id>/<model-id>``.
+    """
+    return f"{chunk_id}/{model_id}"
+
+
 def ingest_map_result(
     store: EvidenceStore,
     raw: str,
@@ -213,7 +222,6 @@ def ingest_map_result(
     analyses = data.get("chunks")
     if not isinstance(analyses, list):
         analyses = [data]
-    pending_needs: list[tuple[str, object]] = []
     for item in analyses:
         if not isinstance(item, dict):
             continue
@@ -224,8 +232,9 @@ def ingest_map_result(
             continue
         seen_ids.add(chunk_id)
         prefix = chunk_id or batch_tag
+        local_to_global: dict[str, str] = {}
         for finding in item.get("findings") or []:
-            parsed = _parse_finding(finding, prefix, used_finding_ids)
+            parsed = _parse_finding(finding, chunk_id, used_finding_ids, local_to_global)
             if parsed is None:
                 continue
             if chunk_id and f"chunk:{chunk_id}" not in parsed.evidence:
@@ -242,25 +251,23 @@ def ingest_map_result(
                     ContextNeed(path=path, reason="listed as a dependency", from_chunk=chunk_id)
                 )
         for need in item.get("needs_context") or []:
-            pending_needs.append((chunk_id, need))
-    known_finding_ids = set(store.findings)
-    for chunk_id, need in pending_needs:
-        parsed_need = _parse_context_need(need, chunk_id, known_finding_ids)
-        if parsed_need is not None:
-            store.needs_context.append(parsed_need)
+            parsed_need = _parse_context_need(need, chunk_id, local_to_global)
+            if parsed_need is not None:
+                store.needs_context.append(parsed_need)
     return seen_ids
 
 
-def _parse_finding_ids(raw: object, known: set[str] | None = None) -> list[str]:
+def _parse_finding_ids(raw: object, local_to_global: dict[str, str]) -> list[str]:
     if not isinstance(raw, list):
         return []
     ids: list[str] = []
     seen: set[str] = set()
     for value in raw:
-        finding_id = str(value).strip()
-        if not finding_id or finding_id in seen:
+        local_id = str(value).strip()
+        if not local_id or local_id not in local_to_global:
             continue
-        if known is not None and finding_id not in known:
+        finding_id = local_to_global[local_id]
+        if finding_id in seen:
             continue
         seen.add(finding_id)
         ids.append(finding_id)
@@ -270,7 +277,7 @@ def _parse_finding_ids(raw: object, known: set[str] | None = None) -> list[str]:
 def _parse_context_need(
     need: object,
     chunk_id: str,
-    known_finding_ids: set[str],
+    local_to_global: dict[str, str],
 ) -> ContextNeed | None:
     if isinstance(need, str) and need.strip():
         return ContextNeed(path=need.strip(), reason="", from_chunk=chunk_id)
@@ -283,7 +290,7 @@ def _parse_context_need(
         path=path,
         reason=str(need.get("reason") or "").strip(),
         from_chunk=chunk_id,
-        finding_ids=_parse_finding_ids(need.get("finding_ids"), known_finding_ids),
+        finding_ids=_parse_finding_ids(need.get("finding_ids"), local_to_global),
     )
 
 
@@ -293,41 +300,61 @@ def findings_for_context_need(
 ) -> list[Finding]:
     """Resolve findings whose confidence depends on the given context needs.
 
-    Explicit ``finding_ids`` are authoritative. Unknown IDs are ignored. If no
-    usable IDs remain, fall back to findings that originated from the same
-    map chunk. Filename presence in finding prose is not a relationship.
+    Each need is resolved independently, then the results are unioned.
+    Explicit ``finding_ids`` are authoritative for that need. Unknown IDs are
+    ignored. If a need has no usable IDs, fall back to findings that originated
+    from that need's map chunk. Filename presence in finding prose is not a
+    relationship.
     """
-    ids: list[str] = []
-    seen: set[str] = set()
-    for need in needs:
-        for finding_id in need.finding_ids:
-            if finding_id in store.findings and finding_id not in seen:
-                seen.add(finding_id)
-                ids.append(finding_id)
-    if ids:
-        return [store.findings[finding_id] for finding_id in ids]
-    origin_chunks = {need.from_chunk for need in needs if need.from_chunk}
-    if not origin_chunks:
-        return []
     related: list[Finding] = []
-    for finding in store.findings.values():
-        if any(f"chunk:{chunk_id}" in finding.evidence for chunk_id in origin_chunks):
-            related.append(finding)
+    seen: set[str] = set()
+
+    def add(finding: Finding) -> None:
+        if finding.id in seen:
+            return
+        seen.add(finding.id)
+        related.append(finding)
+
+    for need in needs:
+        resolved = False
+        for finding_id in need.finding_ids:
+            finding = store.findings.get(finding_id)
+            if finding is None:
+                continue
+            resolved = True
+            add(finding)
+        if resolved:
+            continue
+        if not need.from_chunk:
+            continue
+        marker = f"chunk:{need.from_chunk}"
+        for finding in store.findings.values():
+            if marker in finding.evidence:
+                add(finding)
     return related
 
 
-def _parse_finding(raw: object, prefix: str, used: set[str]) -> Finding | None:
+def _parse_finding(
+    raw: object,
+    chunk_id: str,
+    used: set[str],
+    local_to_global: dict[str, str],
+) -> Finding | None:
     if not isinstance(raw, dict):
         return None
     body = str(raw.get("body") or "").strip()
     if not body:
         return None
     requested = str(raw.get("id") or "").strip()
-    if requested and requested not in used:
-        finding_id = requested
-        used.add(requested)
+    if requested:
+        finding_id = canonical_finding_id(chunk_id, requested)
+        if finding_id in used:
+            finding_id = _unique_id(f"{chunk_id}/F", used)
+        else:
+            used.add(finding_id)
+        local_to_global.setdefault(requested, finding_id)
     else:
-        finding_id = _unique_id(f"{prefix}:F", used)
+        finding_id = _unique_id(f"{chunk_id}/F", used)
     try:
         line_raw = raw.get("line")
         line = int(line_raw) if line_raw is not None and str(line_raw).strip() != "" else None

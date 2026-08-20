@@ -70,6 +70,9 @@ Rules:
 * confidence is CONFIRMED, LIKELY, or QUESTION.
 * side is RIGHT or LEFT when a line is given.
 * needs_context paths should be files from the index when possible.
+* Finding IDs are local to the chunk that emits them. Independent chunks may
+  reuse F1, F2, .... finding_ids on needs_context refer to findings in the
+  same chunk object, not to findings from other map calls.
 * Every needs_context entry that exists to validate a candidate finding must
   list that finding's ID in finding_ids.
 * Multiple finding IDs may reference the same context request.

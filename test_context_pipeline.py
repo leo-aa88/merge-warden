@@ -40,6 +40,7 @@ from review_pipeline import (
     Finding,
     PipelineStats,
     apply_reduce_decision,
+    canonical_finding_id,
     findings_as_review,
     findings_for_context_need,
     format_map_user_message,
@@ -49,6 +50,23 @@ from review_pipeline import (
     plan_requests,
     run_hierarchical_review,
 )
+
+FOO_MAP_CHUNK = "diff:src/foo.c:1"
+
+
+def _fid(model_id: str, chunk_id: str = FOO_MAP_CHUNK) -> str:
+    return canonical_finding_id(chunk_id, model_id)
+
+
+def _by_local_id(store: EvidenceStore, model_id: str) -> Finding:
+    suffix = f"/{model_id}"
+    matches = [item for item in store.findings.values() if item.id.endswith(suffix)]
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected exactly one finding for local id {model_id!r}, "
+            f"got {[item.id for item in matches]}"
+        )
+    return matches[0]
 
 
 def _pr(**overrides) -> dict:
@@ -356,6 +374,7 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("# APPROVE", prompt)
         self.assertIn('"finding_ids"', prompt)
         self.assertIn("list that finding's ID in finding_ids", prompt)
+        self.assertIn("Finding IDs are local to the chunk", prompt)
 
     def test_reduce_keeps_original_finding_bodies(self) -> None:
         store = EvidenceStore()
@@ -488,7 +507,7 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertTrue(coverage.complete)
         self.assertEqual(review["event"], "REQUEST_CHANGES")
-        self.assertEqual(store.findings["F1"].body, "original evidence body")
+        self.assertEqual(_by_local_id(store, "F1").body, "original evidence body")
         self.assertGreaterEqual(stats.map_calls, 1)
         self.assertEqual(stats.synthesis_calls, 1)
 
@@ -591,7 +610,9 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertTrue(coverage.complete)
         self.assertIn("validation", stages)
-        self.assertIn("F18", store.findings)
+        self.assertEqual(
+            _by_local_id(store, "F18").body, "owns_string is ignored before free"
+        )
         self.assertGreaterEqual(stats.validation_calls, 1)
         self.assertEqual(review["event"], "REQUEST_CHANGES")
 
@@ -615,6 +636,9 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(ingest_map_result(store, raw, batch, "M1"), {"diff:a:1"})
         self.assertEqual(len(store.findings), 2)
+        self.assertNotIn("F1", store.findings)
+        self.assertEqual(store.findings[_fid("F1", "diff:a:1")].body, "one")
+        self.assertEqual(store.findings[_fid("F2", "diff:a:1")].body, "two")
 
     def test_incomplete_coverage_body_lists_chunks(self) -> None:
         corpus = build_review_corpus(_inputs(diff="+x\n"))
@@ -941,7 +965,7 @@ class ValidationAcknowledgementTests(unittest.TestCase):
         fake = self._model(validation="first")
         review, coverage, store, stats = self._run(corpus, fake)
         self.assertTrue(coverage.complete)
-        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
         self.assertLess(stats.validation_chunks, 3)
         self.assertLess(stats.validation_chunks_acknowledged, len(matching))
         self.assertEqual(review["event"], "COMMENT")
@@ -951,7 +975,7 @@ class ValidationAcknowledgementTests(unittest.TestCase):
         fake = self._model(validation="all")
         review, coverage, store, stats = self._run(corpus, fake)
         self.assertTrue(coverage.complete)
-        self.assertNotIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertNotIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
         self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
         self.assertEqual(review["event"], "COMMENT")
 
@@ -969,14 +993,14 @@ class ValidationAcknowledgementTests(unittest.TestCase):
         _review, coverage, result_store, stats = self._run(corpus, fake)
         self.assertTrue(coverage.complete)
         self.assertEqual(stats.validation_chunks_acknowledged, 0)
-        self.assertIn(INCOMPLETE_FOO, result_store.findings["F17"].evidence)
+        self.assertIn(INCOMPLETE_FOO, result_store.findings[_fid("F17")].evidence)
 
     def test_malformed_validation_json_marks_incomplete(self) -> None:
         corpus, matching = _header_validation_corpus(3)
         fake = self._model(validation="malformed")
         _review, coverage, store, stats = self._run(corpus, fake)
         self.assertTrue(coverage.complete)
-        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
         self.assertEqual(stats.validation_chunks_acknowledged, 0)
         self.assertEqual(stats.validation_chunks, 0)
         self.assertTrue(any("non-JSON evidence" in note for note in stats.notes))
@@ -987,7 +1011,7 @@ class ValidationAcknowledgementTests(unittest.TestCase):
         fake = self._model(validation="first-then-rest")
         _review, coverage, store, stats = self._run(corpus, fake)
         self.assertTrue(coverage.complete)
-        self.assertNotIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertNotIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
         self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
         self.assertEqual(fake.state["validation_calls"], 2)
         self.assertEqual(VALIDATION_MISSING_CHUNK_RETRIES, 1)
@@ -1002,7 +1026,7 @@ class ValidationAcknowledgementTests(unittest.TestCase):
         fake = self._model(validation="first")
         _review, coverage, store, stats = self._run(corpus, fake)
         self.assertTrue(coverage.complete)
-        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
         self.assertEqual(stats.validation_chunks_acknowledged, 2)
         self.assertLess(stats.validation_chunks_acknowledged, len(matching))
         self.assertTrue(any("did not acknowledge 1 chunk" in note for note in stats.notes))
@@ -1017,15 +1041,15 @@ class ValidationAcknowledgementTests(unittest.TestCase):
         self.assertEqual(stats.validation_calls, 1)
         self.assertEqual(stats.validation_calls, fake.state["validation_calls"])
         self.assertLess(stats.validation_chunks_acknowledged, len(matching))
-        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
         self.assertTrue(any("validation call limit reached" in note for note in stats.notes))
 
     def test_synthesis_sees_incomplete_validation_marker(self) -> None:
         corpus, _matching = _header_validation_corpus(3)
         fake = self._model(validation="malformed")
         _review, _coverage, store, _stats = self._run(corpus, fake)
-        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
-        self.assertEqual(store.findings["F17"].confidence, "LIKELY")
+        self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
+        self.assertEqual(store.findings[_fid("F17")].confidence, "LIKELY")
         self.assertTrue(fake.synthesis_messages)
         synthesis_user = fake.synthesis_messages[0]
         self.assertIn(INCOMPLETE_FOO, synthesis_user)
@@ -1044,7 +1068,7 @@ class ValidationAcknowledgementTests(unittest.TestCase):
         self.assertTrue(coverage.complete)
         self.assertTrue(stats.coverage_complete)
         self.assertEqual(stats.synthesis_calls, 1)
-        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
         self.assertLess(stats.validation_chunks_acknowledged, len(matching))
 
 
@@ -1116,7 +1140,7 @@ class ContextNeedOwnershipTests(unittest.TestCase):
             }
         )
         self.assertEqual(ingest_map_result(store, raw, batch, "M1"), {"diff:src/foo.c:1"})
-        self.assertEqual(store.needs_context[0].finding_ids, ["F17"])
+        self.assertEqual(store.needs_context[0].finding_ids, [_fid("F17")])
         self.assertEqual(store.needs_context[0].from_chunk, "diff:src/foo.c:1")
 
     def test_ingest_drops_unknown_finding_ids(self) -> None:
@@ -1140,7 +1164,7 @@ class ContextNeedOwnershipTests(unittest.TestCase):
             }
         )
         ingest_map_result(store, raw, batch, "M1")
-        self.assertEqual(store.needs_context[0].finding_ids, ["F17"])
+        self.assertEqual(store.needs_context[0].finding_ids, [_fid("F17")])
 
     def test_context_need_marks_finding_without_filename_in_body(self) -> None:
         corpus, _matching = _header_validation_corpus(2)
@@ -1158,8 +1182,8 @@ class ContextNeedOwnershipTests(unittest.TestCase):
         )
         _review, coverage, store, _stats = _run_hierarchical(corpus, fake)
         self.assertTrue(coverage.complete)
-        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
-        self.assertNotIn("include/foo.h", store.findings["F17"].body)
+        self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
+        self.assertNotIn("include/foo.h", store.findings[_fid("F17")].body)
 
     def test_multiple_findings_may_depend_on_one_context_request(self) -> None:
         corpus, _matching = _header_validation_corpus(2)
@@ -1187,10 +1211,10 @@ class ContextNeedOwnershipTests(unittest.TestCase):
             validation=lambda _user, _ids: "definitely not JSON",
         )
         _review, _coverage, store, _stats = _run_hierarchical(corpus, fake)
-        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
-        self.assertIn(INCOMPLETE_FOO, store.findings["F18"].evidence)
-        self.assertNotIn("include/foo.h", store.findings["F17"].body)
-        self.assertNotIn("include/foo.h", store.findings["F18"].body)
+        self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
+        self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F18")].evidence)
+        self.assertNotIn("include/foo.h", store.findings[_fid("F17")].body)
+        self.assertNotIn("include/foo.h", store.findings[_fid("F18")].body)
 
     def test_unrelated_finding_is_not_contaminated(self) -> None:
         map_chunk = _chunk(
@@ -1249,10 +1273,10 @@ class ContextNeedOwnershipTests(unittest.TestCase):
         )
         _review, coverage, store, _stats = _run_hierarchical(corpus, fake)
         self.assertTrue(coverage.complete)
-        self.assertIn("validation:incomplete:a.h", store.findings["F1"].evidence)
-        self.assertNotIn("validation:incomplete:a.h", store.findings["F2"].evidence)
-        self.assertNotIn("validation:incomplete:b.h", store.findings["F1"].evidence)
-        self.assertNotIn("validation:incomplete:b.h", store.findings["F2"].evidence)
+        self.assertIn("validation:incomplete:a.h", store.findings[_fid("F1")].evidence)
+        self.assertNotIn("validation:incomplete:a.h", store.findings[_fid("F2")].evidence)
+        self.assertNotIn("validation:incomplete:b.h", store.findings[_fid("F1")].evidence)
+        self.assertNotIn("validation:incomplete:b.h", store.findings[_fid("F2")].evidence)
 
     def test_missing_finding_ids_falls_back_to_originating_chunk(self) -> None:
         corpus, _matching = _header_validation_corpus(2)
@@ -1284,8 +1308,8 @@ class ContextNeedOwnershipTests(unittest.TestCase):
         )
         _review, _coverage, store, _stats = _run_hierarchical(corpus, fake)
         self.assertEqual(store.needs_context[0].finding_ids, [])
-        self.assertIn(INCOMPLETE_FOO, store.findings["F1"].evidence)
-        self.assertIn(INCOMPLETE_FOO, store.findings["F2"].evidence)
+        self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F1")].evidence)
+        self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F2")].evidence)
 
     def test_invalid_finding_id_does_not_crash(self) -> None:
         corpus, _matching = _header_validation_corpus(2)
@@ -1304,7 +1328,7 @@ class ContextNeedOwnershipTests(unittest.TestCase):
         _review, coverage, store, _stats = _run_hierarchical(corpus, fake)
         self.assertTrue(coverage.complete)
         self.assertEqual(store.needs_context[0].finding_ids, [])
-        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
 
     def test_successful_validation_produces_no_incomplete_marker(self) -> None:
         corpus, matching = _header_validation_corpus(2)
@@ -1322,8 +1346,8 @@ class ContextNeedOwnershipTests(unittest.TestCase):
         )
         _review, coverage, store, stats = _run_hierarchical(corpus, fake)
         self.assertTrue(coverage.complete)
-        self.assertNotIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
-        self.assertNotIn("include/foo.h", store.findings["F17"].body)
+        self.assertNotIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
+        self.assertNotIn("include/foo.h", store.findings[_fid("F17")].body)
         self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
 
     def test_findings_for_context_need_prefers_explicit_ids(self) -> None:
@@ -1358,6 +1382,94 @@ class ContextNeedOwnershipTests(unittest.TestCase):
         ]
         related = findings_for_context_need(store, needs)
         self.assertEqual([item.id for item in related], ["F17"])
+
+    def test_duplicate_local_finding_ids_resolve_context_need_to_same_chunk_finding(
+        self,
+    ) -> None:
+        store = EvidenceStore()
+        chunk_a = _chunk("diff:a.c:1", "a.c", "+bug a\n", kind="diff")
+        chunk_b = _chunk("diff:b.c:1", "b.c", "+bug b\n", kind="diff")
+        raw_a = json.dumps(
+            {
+                "chunks": [
+                    {
+                        "chunk_id": chunk_a.id,
+                        "findings": [
+                            {"id": "F1", "body": "Bug A", "severity": "MAJOR"}
+                        ],
+                    }
+                ]
+            }
+        )
+        raw_b = json.dumps(
+            {
+                "chunks": [
+                    {
+                        "chunk_id": chunk_b.id,
+                        "findings": [
+                            {"id": "F1", "body": "Bug B", "severity": "MAJOR"}
+                        ],
+                        "needs_context": [
+                            {
+                                "path": "b.h",
+                                "reason": "Need the declaration for Bug B",
+                                "finding_ids": ["F1"],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        self.assertEqual(ingest_map_result(store, raw_a, [chunk_a], "M1"), {chunk_a.id})
+        self.assertEqual(ingest_map_result(store, raw_b, [chunk_b], "M2"), {chunk_b.id})
+        id_a = _fid("F1", chunk_a.id)
+        id_b = _fid("F1", chunk_b.id)
+        self.assertEqual(set(store.findings), {id_a, id_b})
+        self.assertEqual(store.findings[id_a].body, "Bug A")
+        self.assertEqual(store.findings[id_b].body, "Bug B")
+        self.assertEqual(store.needs_context[0].finding_ids, [id_b])
+        related = findings_for_context_need(store, store.needs_context)
+        self.assertEqual([item.id for item in related], [id_b])
+        self.assertEqual(related[0].body, "Bug B")
+
+    def test_explicit_and_fallback_needs_for_same_path_are_both_resolved(self) -> None:
+        store = EvidenceStore()
+        store.findings["F1"] = Finding(
+            id="F1",
+            severity="MAJOR",
+            path="a.c",
+            side="RIGHT",
+            line=1,
+            body="Bug from chunk A",
+            confidence="LIKELY",
+            evidence=["chunk:diff:a.c:1"],
+        )
+        store.findings["F2"] = Finding(
+            id="F2",
+            severity="MAJOR",
+            path="b.c",
+            side="RIGHT",
+            line=1,
+            body="Bug from chunk B",
+            confidence="QUESTION",
+            evidence=["chunk:diff:b.c:1"],
+        )
+        needs = [
+            rp.ContextNeed(
+                path="common.h",
+                reason="Need the shared contract for Bug A",
+                from_chunk="diff:a.c:1",
+                finding_ids=["F1"],
+            ),
+            rp.ContextNeed(
+                path="common.h",
+                reason="Need the shared contract for Bug B",
+                from_chunk="diff:b.c:1",
+                finding_ids=[],
+            ),
+        ]
+        related = findings_for_context_need(store, needs)
+        self.assertEqual({item.id for item in related}, {"F1", "F2"})
 
 
 class ValidationAttemptBudgetTests(unittest.TestCase):
@@ -1457,7 +1569,7 @@ class ValidationAttemptBudgetTests(unittest.TestCase):
         )
         for index, path in enumerate(paths, 1):
             marker = f"validation:incomplete:{path}"
-            self.assertIn(marker, store.findings[f"F{index}"].evidence)
+            self.assertIn(marker, store.findings[_fid(f"F{index}")].evidence)
 
     def test_successful_and_failed_calls_both_consume_budget(self) -> None:
         corpus, paths = self._paths_corpus(4)
@@ -1505,7 +1617,7 @@ class ValidationAttemptBudgetTests(unittest.TestCase):
         self.assertEqual(stats.validation_attempts, 2)
         self.assertEqual(stats.validation_calls, 2)
         self.assertLess(stats.validation_chunks_acknowledged, len(matching))
-        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
         self.assertTrue(
             any("validation call limit reached" in note for note in stats.notes)
         )
@@ -1538,7 +1650,7 @@ class ValidationAttemptBudgetTests(unittest.TestCase):
         self.assertEqual(stats.validation_attempts, 1)
         self.assertEqual(stats.validation_calls_succeeded, 1)
         self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
-        self.assertNotIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertNotIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
 
 
 class ReducerTerminationTests(unittest.TestCase):
@@ -1855,7 +1967,7 @@ class SerializedRequestBudgetTests(unittest.TestCase):
         self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
         self.assertEqual(stats.validation_chunks_sent, len(matching))
         self.assertEqual(stats.validation_chunks, len(matching))
-        self.assertEqual(store.findings["F17"].confidence, "LIKELY")
+        self.assertEqual(store.findings[_fid("F17")].confidence, "LIKELY")
         self.assertEqual(review["event"], "REQUEST_CHANGES")
 
     def test_validation_call_cap_is_enforced(self) -> None:
@@ -1923,8 +2035,8 @@ class SerializedRequestBudgetTests(unittest.TestCase):
             for chunk_id in _chunk_ids_in_prompt(message)
         }
         self.assertLess(len(seen), len(matching))
-        self.assertIn("validation:incomplete:include/foo.h", store.findings["F17"].evidence)
-        self.assertEqual(store.findings["F17"].confidence, "LIKELY")
+        self.assertIn("validation:incomplete:include/foo.h", store.findings[_fid("F17")].evidence)
+        self.assertEqual(store.findings[_fid("F17")].confidence, "LIKELY")
         self.assertEqual(review["event"], "COMMENT")
         self.assertIn("LIKELY", recorder.synthesis_messages[0])
         self.assertIn("validation:incomplete:include/foo.h", recorder.synthesis_messages[0])
@@ -2004,7 +2116,7 @@ class SerializedRequestBudgetTests(unittest.TestCase):
         for message in recorder.validation_messages:
             self.assertLessEqual(len(message), limit)
         self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
-        self.assertNotIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertNotIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
         self.assertEqual(review["event"], "COMMENT")
 
     def test_map_and_validation_keep_chunk_tails(self) -> None:
