@@ -77,6 +77,12 @@ inputs:
     description: Post the GitHub review and inline comments after generating it.
     required: false
     default: "true"
+  skip-if-missing-key:
+    description: >
+      If true, skip the review when the provider API key is unset instead of
+      failing the job.
+    required: false
+    default: "false"
 
 outputs:
   markdown-path:
@@ -85,11 +91,23 @@ outputs:
   json-path:
     description: Path to the GitHub review JSON payload.
     value: ${{ steps.review.outputs.json-path }}
+  generated-event:
+    description: Review event produced by the model (APPROVE, COMMENT, or REQUEST_CHANGES).
+    value: ${{ steps.review.outputs.generated-event }}
+  generated-comment-count:
+    description: Inline comments in the generated payload, before GitHub accepts the review.
+    value: ${{ steps.review.outputs.generated-comment-count }}
+  posted-event:
+    description: Review event GitHub actually accepted. Empty when post is false.
+    value: ${{ steps.review.outputs.posted-event }}
+  posted-comment-count:
+    description: Inline comments GitHub actually accepted. Empty when post is false.
+    value: ${{ steps.review.outputs.posted-comment-count }}
   comment-count:
-    description: Number of inline comments in the payload.
+    description: Posted inline comment count when posting, otherwise the generated count.
     value: ${{ steps.review.outputs.comment-count }}
   event:
-    description: GitHub review event (APPROVE, COMMENT, or REQUEST_CHANGES).
+    description: Posted review event when posting, otherwise the generated event.
     value: ${{ steps.review.outputs.event }}
 
 runs:
@@ -123,6 +141,7 @@ runs:
         PR_NUMBER: ${{ inputs.pr-number }}
         HEAD_REF: ${{ inputs.head-ref }}
         POST: ${{ inputs.post }}
+        SKIP_IF_MISSING_KEY: ${{ inputs.skip-if-missing-key }}
         PROMPT_FILE: ${{ inputs.prompt-file }}
         ACTION_PATH: ${{ github.action_path }}
       shell: bash
@@ -135,6 +154,9 @@ runs:
         extra=()
         if [ "${POST}" = "true" ]; then
           extra+=(--post)
+        fi
+        if [ "${SKIP_IF_MISSING_KEY}" = "true" ]; then
+          extra+=(--skip-if-missing-key)
         fi
         python3 "${ACTION_PATH}/merge_warden.py" \
           --pr "${PR_NUMBER}" \
