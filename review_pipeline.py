@@ -395,48 +395,123 @@ def _parse_contract(raw: object, prefix: str, used: set[str]) -> Contract | None
     return Contract(id=contract_id, text=text)
 
 
+def _reduce_keep_ids(keep: object, allowed: set[str]) -> list[str]:
+    if not isinstance(keep, list):
+        return []
+    ids: list[str] = []
+    seen: set[str] = set()
+    for item in keep:
+        finding_id = str(item).strip()
+        if not finding_id or finding_id not in allowed or finding_id in seen:
+            continue
+        seen.add(finding_id)
+        ids.append(finding_id)
+    return ids
+
+
+def _reduce_reject_map(reject: object, allowed: set[str]) -> dict[str, str]:
+    if not isinstance(reject, list):
+        return {}
+    rejected: dict[str, str] = {}
+    for item in reject:
+        if isinstance(item, str):
+            finding_id, reason = item.strip(), "rejected by reducer"
+        elif isinstance(item, dict):
+            finding_id = str(item.get("id") or "").strip()
+            reason = str(item.get("reason") or "rejected by reducer").strip()
+        else:
+            continue
+        if finding_id and finding_id in allowed:
+            rejected[finding_id] = reason
+    return rejected
+
+
+def _reduce_merge_ops(
+    merge: object, allowed: set[str]
+) -> list[tuple[list[str], str]]:
+    if not isinstance(merge, list):
+        return []
+    ops: list[tuple[list[str], str]] = []
+    for item in merge:
+        if not isinstance(item, dict):
+            continue
+        raw_ids = item.get("ids") or []
+        if not isinstance(raw_ids, list):
+            continue
+        ids = list(
+            dict.fromkeys(
+                str(value).strip() for value in raw_ids if str(value).strip()
+            )
+        )
+        canonical = str(item.get("canonical") or (ids[0] if ids else "")).strip()
+        if len(ids) < 2:
+            continue
+        if any(finding_id not in allowed for finding_id in ids):
+            continue
+        if canonical not in allowed or canonical not in ids:
+            continue
+        ops.append((ids, canonical))
+    claimed: dict[str, int] = {}
+    overlapping: set[int] = set()
+    for index, (ids, _canonical) in enumerate(ops):
+        for finding_id in ids:
+            previous = claimed.get(finding_id)
+            if previous is not None and previous != index:
+                overlapping.add(previous)
+                overlapping.add(index)
+            else:
+                claimed[finding_id] = index
+    return [op for index, op in enumerate(ops) if index not in overlapping]
+
+
 def apply_reduce_decision(store: EvidenceStore, raw: str, group_ids: list[str]) -> bool:
+    """Apply untrusted reducer JSON to ``store``.
+
+    Mutations are limited to ``group_ids``. Invalid keep/reject/merge
+    instructions are ignored and do not count as mentioning those findings,
+    so unresolved group members default to KEEP.
+
+    A finding may not be both rejected and kept, or both rejected and
+    merged, in the same response. Overlapping merges are also ignored.
+    Those conflicts fail safe to KEEP.
+    """
     data = _maybe_json_object(raw)
     if data is None:
         for finding_id in group_ids:
             store.kept.add(finding_id)
         return False
-    keep = data.get("keep") or []
-    reject = data.get("reject") or []
-    merge = data.get("merge") or []
+    allowed = set(group_ids)
+    keep_ids = _reduce_keep_ids(data.get("keep"), allowed)
+    reject_map = _reduce_reject_map(data.get("reject"), allowed)
+    merge_ops = _reduce_merge_ops(data.get("merge"), allowed)
+    keep_set = set(keep_ids)
+    reject_set = set(reject_map)
+    merge_members: set[str] = set()
+    for ids, _canonical in merge_ops:
+        merge_members.update(ids)
+    # KEEP+REJECT or REJECT+MERGE on the same ID is contradictory; ignore
+    # those actions so the finding is unresolved and defaults to KEEP.
+    conflict_ids = (keep_set & reject_set) | (reject_set & merge_members)
     mentioned: set[str] = set()
-    if isinstance(keep, list):
-        for item in keep:
-            finding_id = str(item).strip()
-            if finding_id:
-                store.kept.add(finding_id)
-                mentioned.add(finding_id)
-    if isinstance(reject, list):
-        for item in reject:
-            if isinstance(item, str):
-                finding_id, reason = item.strip(), "rejected by reducer"
-            elif isinstance(item, dict):
-                finding_id = str(item.get("id") or "").strip()
-                reason = str(item.get("reason") or "rejected by reducer").strip()
-            else:
-                continue
-            if finding_id:
-                store.rejected[finding_id] = reason
-                mentioned.add(finding_id)
-    if isinstance(merge, list):
-        for item in merge:
-            if not isinstance(item, dict):
-                continue
-            ids = [str(value).strip() for value in (item.get("ids") or []) if str(value).strip()]
-            canonical = str(item.get("canonical") or (ids[0] if ids else "")).strip()
-            if not canonical or not ids:
-                continue
-            store.kept.add(canonical)
-            mentioned.add(canonical)
-            for finding_id in ids:
-                mentioned.add(finding_id)
-                if finding_id != canonical:
-                    store.merged_into[finding_id] = canonical
+    for finding_id in keep_ids:
+        if finding_id in conflict_ids:
+            continue
+        store.kept.add(finding_id)
+        mentioned.add(finding_id)
+    for finding_id, reason in reject_map.items():
+        if finding_id in conflict_ids:
+            continue
+        store.rejected[finding_id] = reason
+        mentioned.add(finding_id)
+    for ids, canonical in merge_ops:
+        if any(finding_id in conflict_ids for finding_id in ids):
+            continue
+        store.kept.add(canonical)
+        mentioned.add(canonical)
+        for finding_id in ids:
+            mentioned.add(finding_id)
+            if finding_id != canonical:
+                store.merged_into[finding_id] = canonical
     for finding_id in group_ids:
         if finding_id not in mentioned:
             store.kept.add(finding_id)
