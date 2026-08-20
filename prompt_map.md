@@ -55,7 +55,8 @@ Reply with JSON only:
       "needs_context": [
         {
           "path": "include/foo.h",
-          "reason": "Need the ownership contract for NativeResult"
+          "reason": "Need the ownership contract for NativeResult",
+          "finding_ids": ["F1"]
         }
       ]
     }
@@ -69,4 +70,9 @@ Rules:
 * confidence is CONFIRMED, LIKELY, or QUESTION.
 * side is RIGHT or LEFT when a line is given.
 * needs_context paths should be files from the index when possible.
+* Every needs_context entry that exists to validate a candidate finding must
+  list that finding's ID in finding_ids.
+* Multiple finding IDs may reference the same context request.
+* Use an empty finding_ids list only when the requested context is genuinely
+  architectural/general rather than required to determine a candidate finding.
 * Do not rewrite the PR and do not produce the final review.
