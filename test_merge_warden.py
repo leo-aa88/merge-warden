@@ -19,6 +19,49 @@ from unittest import mock
 import merge_warden as mw
 
 
+def _chunk_ids_in_prompt(user: str) -> list[str]:
+    ids: list[str] = []
+    prefix = "## CHUNK id="
+    marker = " kind="
+    for line in user.splitlines():
+        if not line.startswith(prefix):
+            continue
+        rest = line[len(prefix) :]
+        if marker in rest:
+            ids.append(rest.split(marker, 1)[0])
+        else:
+            ids.append(rest.split()[0] if rest else "")
+    return ids
+
+
+def _pipeline_model_response(
+    system_prompt: str,
+    user_message: str,
+    final: dict | None = None,
+) -> str:
+    if "merge-warden-map" in system_prompt:
+        return json.dumps(
+            {
+                "chunks": [
+                    {
+                        "chunk_id": chunk_id,
+                        "findings": [],
+                        "contracts": [],
+                        "dependencies": [],
+                        "needs_context": [],
+                    }
+                    for chunk_id in _chunk_ids_in_prompt(user_message)
+                ]
+            }
+        )
+    if "merge-warden-reduce" in system_prompt:
+        return json.dumps({"keep": [], "reject": [], "merge": []})
+    return json.dumps(
+        final
+        or {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+    )
+
+
 class ProviderResolutionTests(unittest.TestCase):
     def test_aliases(self) -> None:
         self.assertEqual(mw.resolve_provider("grok"), "xai")
@@ -502,12 +545,14 @@ class ActionOutputTests(unittest.TestCase):
                                 with mock.patch.object(
                                     mw,
                                     "call_model",
-                                    return_value=json.dumps(
+                                    side_effect=lambda _p, system, user, _m, _k: _pipeline_model_response(
+                                        system,
+                                        user,
                                         {
                                             "event": "APPROVE",
                                             "body": "# APPROVE\n",
                                             "comments": [],
-                                        }
+                                        },
                                     ),
                                 ):
                                     with mock.patch.object(
@@ -596,12 +641,8 @@ class StaleHeadTests(unittest.TestCase):
                                     with mock.patch.object(
                                         mw,
                                         "call_model",
-                                        return_value=json.dumps(
-                                            {
-                                                "event": "COMMENT",
-                                                "body": "# COMMENT\n",
-                                                "comments": [],
-                                            }
+                                        side_effect=lambda _p, system, user, _m, _k: _pipeline_model_response(
+                                            system, user
                                         ),
                                     ):
                                         with mock.patch.object(
@@ -638,12 +679,8 @@ class StaleHeadTests(unittest.TestCase):
                                     with mock.patch.object(
                                         mw,
                                         "call_model",
-                                        return_value=json.dumps(
-                                            {
-                                                "event": "COMMENT",
-                                                "body": "# COMMENT\n",
-                                                "comments": [],
-                                            }
+                                        side_effect=lambda _p, system, user, _m, _k: _pipeline_model_response(
+                                            system, user
                                         ),
                                     ) as call_model:
                                         rc = mw.generate_review(args, "o/r")
@@ -874,12 +911,10 @@ class PromptInjectionTests(unittest.TestCase):
         ) -> str:
             captured["system"].append(system_prompt)
             captured["user"].append(user_message)
-            if "merge-warden-map" in system_prompt:
-                return json.dumps({"chunks": []})
-            if "merge-warden-reduce" in system_prompt:
-                return json.dumps({"keep": [], "reject": [], "merge": []})
-            return json.dumps(
-                {"event": "COMMENT", "body": "# COMMENT\n\nReviewed.\n", "comments": []}
+            return _pipeline_model_response(
+                system_prompt,
+                user_message,
+                {"event": "COMMENT", "body": "# COMMENT\n\nReviewed.\n", "comments": []},
             )
 
         pr = {
