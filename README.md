@@ -38,8 +38,10 @@ untrusted PR code is never executed.
 Do not resolve the PR from `head_sha` alone. GitHub's commit-association API
 searches the *base* repository, so a fork commit often has no linked PR even
 when the triggering run was a `pull_request` event. `workflow_run.pull_requests`
-is also frequently empty. Look up `HEAD_OWNER:HEAD_BRANCH` on the base repo
-instead (or use `leo-aa88/merge-warden/resolve-pr`, which does this for you).
+is also frequently empty. Use `leo-aa88/merge-warden/resolve-pr`, which tries
+`workflow_run.pull_requests[0]`, then `HEAD_OWNER:HEAD_BRANCH`, then the head
+SHA. Pin **both** `resolve-pr` and `merge-warden` to the same commit SHA;
+moving `v1` does not update SHA-pinned workflows.
 
 ```yaml
 name: Merge Warden
@@ -67,49 +69,12 @@ jobs:
 
       - name: Resolve pull request
         id: pr
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          HEAD_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
-          PR_FROM_EVENT: ${{ github.event.workflow_run.pull_requests[0].number }}
-        run: |
-          set -euo pipefail
+        uses: leo-aa88/merge-warden/resolve-pr@PINNED_SHA
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-          pr_number=""
-          if [[ "${PR_FROM_EVENT:-}" =~ ^[0-9]+$ ]]; then
-            pr_number="${PR_FROM_EVENT}"
-          fi
-
-          # First try resolving by fork-owner + branch.
-          if [ -z "$pr_number" ]; then
-            pr_number="$(
-              gh api --method GET \
-                "repos/${GITHUB_REPOSITORY}/pulls" \
-                -f state=open \
-                -f head="${HEAD_OWNER}:${HEAD_BRANCH}" \
-                --jq '.[0].number // empty'
-            )"
-          fi
-
-          # Fallback for same-repository PRs / unusual cases.
-          if [ -z "$pr_number" ]; then
-            pr_number="$(
-              gh api \
-                "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/pulls" \
-                --jq '.[0].number // empty'
-            )"
-          fi
-
-          if [ -z "$pr_number" ]; then
-            echo "::error::Could not resolve PR for ${HEAD_OWNER}:${HEAD_BRANCH} (${HEAD_SHA})"
-            exit 1
-          fi
-
-          echo "Resolved PR #${pr_number}"
-          echo "number=${pr_number}" >> "$GITHUB_OUTPUT"
-
-      - uses: leo-aa88/merge-warden@v1
+      - name: Review PR
+        uses: leo-aa88/merge-warden@PINNED_SHA
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           xai-api-key: ${{ secrets.XAI_API_KEY }}
@@ -119,6 +84,8 @@ jobs:
             CONTRIBUTING.md
             docs/ARCHITECTURE.md
 ```
+
+Replace `PINNED_SHA` with the same commit in both steps.
 
 ### ChatGPT, Claude, or Gemini
 
@@ -184,10 +151,13 @@ with `git show`.
 
 Injected after the system prompt: architectural docs, issue bodies, PR
 description, the complete diff, a commentable line map, and a budgeted sample
-of numbered changed-file contents. The assembled user message is capped at
-450k characters so large PRs keep the diff instead of dumping every file
-twice. That material is treated as untrusted data, not as instructions to
-the reviewer.
+of numbered changed-file contents. Each of those untrusted sections has its
+own character budget (70k docs, 30k PR body, 30k issues, 250k diff, 30k
+commentable map). The suffix and diff are reserved first so a huge README
+cannot evict the patch or the `Reply with JSON only` instruction. The
+assembled user message is capped at 450k characters. That material is treated
+as untrusted data, not as instructions to the reviewer.
 
 Provider HTTP calls retry transient failures (disconnects, timeouts,
-HTTP 429/5xx) a few times with exponential backoff.
+HTTP 429/5xx) a few times with exponential backoff. HTTP 429 honors
+`Retry-After` when present, capped at 60 seconds.

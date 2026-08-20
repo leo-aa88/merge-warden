@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import email.message
 import http.client
 import io
 import json
@@ -539,12 +540,20 @@ class HttpPostRetryTests(unittest.TestCase):
         response.__exit__ = mock.Mock(return_value=False)
         return response
 
-    def _http_error(self, code: int, body: bytes = b"unavailable") -> urllib.error.HTTPError:
+    def _http_error(
+        self,
+        code: int,
+        body: bytes = b"unavailable",
+        retry_after: str | None = None,
+    ) -> urllib.error.HTTPError:
+        hdrs = email.message.Message()
+        if retry_after is not None:
+            hdrs["Retry-After"] = retry_after
         return urllib.error.HTTPError(
             "https://example.test/v1",
             code,
             "error",
-            hdrs=None,
+            hdrs=hdrs,
             fp=io.BytesIO(body),
         )
 
@@ -583,13 +592,39 @@ class HttpPostRetryTests(unittest.TestCase):
     def test_retries_http_429(self) -> None:
         side_effects = [self._http_error(429, b"rate limited"), self._response()]
         with mock.patch("urllib.request.urlopen", side_effect=side_effects):
-            with mock.patch("time.sleep"):
+            with mock.patch("time.sleep") as sleep:
                 data = mw.http_post_json(
                     "https://example.test/v1",
                     {"a": 1},
                     {"h": "v"},
                 )
         self.assertEqual(data, {"ok": True})
+        sleep.assert_called_once_with(1)
+
+    def test_http_429_honors_retry_after(self) -> None:
+        side_effects = [
+            self._http_error(429, b"rate limited", retry_after="12"),
+            self._response(),
+        ]
+        with mock.patch("urllib.request.urlopen", side_effect=side_effects):
+            with mock.patch("time.sleep") as sleep:
+                data = mw.http_post_json(
+                    "https://example.test/v1",
+                    {"a": 1},
+                    {"h": "v"},
+                )
+        self.assertEqual(data, {"ok": True})
+        sleep.assert_called_once_with(12)
+
+    def test_retry_after_is_capped(self) -> None:
+        side_effects = [
+            self._http_error(429, b"rate limited", retry_after="3600"),
+            self._response(),
+        ]
+        with mock.patch("urllib.request.urlopen", side_effect=side_effects):
+            with mock.patch("time.sleep") as sleep:
+                mw.http_post_json("https://example.test/v1", {"a": 1}, {"h": "v"})
+        sleep.assert_called_once_with(60)
 
     def test_does_not_retry_http_400(self) -> None:
         with mock.patch(
@@ -708,6 +743,51 @@ class PromptBudgetTests(unittest.TestCase):
         self.assertIn("# Complete diff", message)
         self.assertLessEqual(len(message), mw.MAX_USER_CHARS)
         self.assertIn("untrusted", message.lower())
+
+    def test_huge_arch_docs_cannot_evict_diff_or_suffix(self) -> None:
+        pr = {
+            "number": 223,
+            "title": "enormous",
+            "body": "PRBODY" + ("p" * 80_000),
+            "url": "https://example.test/pr/223",
+            "author": {"login": "dev"},
+            "baseRefName": "main",
+            "headRefName": "feat",
+            "headRefOid": "abc123",
+            "labels": [],
+            "closingIssuesReferences": [],
+        }
+        files = [
+            {
+                "filename": "src/parser.c",
+                "status": "modified",
+                "patch": "@@ -1,1 +1,1 @@\n-old\n+new\n",
+            }
+        ]
+        marker = "UNIQUE_DIFF_MARKER"
+        diff = marker + "\n" + ("d" * 10_000)
+
+        with mock.patch.object(mw, "collect_arch_docs", return_value="ARCH" * 80_000):
+            with mock.patch.object(mw, "collect_issue_bodies", return_value="ISSUE" * 40_000):
+                with mock.patch.object(mw, "git_show", return_value="body\n" * 50_000):
+                    message = mw.build_user_message(
+                        repo="o/r",
+                        pr=pr,
+                        files=files,
+                        diff=diff,
+                        head_ref="pr-head",
+                        commentable=mw.commentable_by_path(files),
+                    )
+        self.assertIn(marker, message)
+        self.assertIn("Reply with JSON only", message)
+        self.assertLessEqual(len(message), mw.MAX_USER_CHARS)
+        self.assertLess(message.count("ARCH"), 80_000)
+        self.assertIn(mw.USER_MESSAGE_SUFFIX, message)
+
+    def test_truncate_stays_within_limit(self) -> None:
+        text = mw.truncate("x" * 1000, 100, "label")
+        self.assertLessEqual(len(text), 100)
+        self.assertIn("truncated", text)
 
 
 class MissingKeyTests(unittest.TestCase):
