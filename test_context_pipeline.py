@@ -34,6 +34,8 @@ from review_pipeline import (
     MAX_REDUCE_ROUNDS,
     MAX_VALIDATION_CALLS,
     REDUCE_GROUP_SIZE,
+    SYNTHESIS_SUFFIX,
+    VALIDATION_MISSING_CHUNK_RETRIES,
     EvidenceStore,
     Finding,
     PipelineStats,
@@ -806,6 +808,222 @@ class MapAcknowledgementTests(unittest.TestCase):
         self.assertIsNone(ingest_map_result(EvidenceStore(), "not json", batch, "M1"))
 
 
+INCOMPLETE_FOO = "validation:incomplete:include/foo.h"
+
+
+def _header_validation_corpus(parts: int = 3) -> tuple[ReviewCorpus, list[ContextChunk]]:
+    map_chunk = _chunk(
+        "diff:src/foo.c:1",
+        "src/foo.c",
+        "+#include \"include/foo.h\"\n",
+        kind="diff",
+    )
+    matching = [
+        _chunk(
+            f"file:include/foo.h:{index}",
+            "include/foo.h",
+            f"/* part {index} */\nint field_{index};\n",
+        )
+        for index in range(1, parts + 1)
+    ]
+    corpus = _synthetic_corpus(
+        [map_chunk, *matching],
+        index="Changed files:\n- src/foo.c +1 -0\n- include/foo.h +4 -0\n",
+    )
+    return corpus, matching
+
+
+def _likely_foo_finding() -> dict:
+    return {
+        "id": "F17",
+        "severity": "MAJOR",
+        "path": "src/foo.c",
+        "side": "RIGHT",
+        "line": 1,
+        "body": "Need include/foo.h to decide correctness",
+        "confidence": "LIKELY",
+        "evidence": [],
+    }
+
+
+class ValidationAcknowledgementTests(unittest.TestCase):
+    def _run(self, corpus: ReviewCorpus, fake, **kwargs):
+        defaults = dict(
+            corpus=corpus,
+            synthesis_prompt="synth",
+            map_prompt="<!-- merge-warden-map -->",
+            reduce_prompt="<!-- merge-warden-reduce -->",
+            call_model=fake,
+            commentable_section="(none)\n",
+            max_map_request_chars=80_000,
+            max_reduce_request_chars=80_000,
+            map_overhead_chars=100,
+        )
+        defaults.update(kwargs)
+        return run_hierarchical_review(**defaults)
+
+    def _model(self, *, validation: str = "all"):
+        """Map/reduce/synthesis stub with a validation acknowledgement policy.
+
+        validation:
+            "all"            acknowledge every supplied chunk id
+            "first"          acknowledge only the first supplied id each call
+            "first-then-rest" first call acks one id; later calls ack the rest
+            "malformed"      return non-JSON
+            "hallucinate"    acknowledge an id that was not supplied
+        """
+        validation_messages: list[str] = []
+        synthesis_messages: list[str] = []
+        state = {"validation_calls": 0}
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                ids = _chunk_ids_in_prompt(user)
+                if "Context requests" in user:
+                    validation_messages.append(user)
+                    state["validation_calls"] += 1
+                    if validation == "malformed":
+                        return "definitely not JSON"
+                    if validation == "hallucinate":
+                        return _map_chunks_json(["NOT_REAL"])
+                    if validation == "first":
+                        return _map_chunks_json(ids[:1])
+                    if validation == "first-then-rest":
+                        if state["validation_calls"] == 1:
+                            return _map_chunks_json(ids[:1])
+                        return _map_chunks_json(ids)
+                    return _map_chunks_json(ids)
+                extras: dict = {}
+                if not validation_messages:
+                    extras["findings"] = [_likely_foo_finding()]
+                    extras["needs_context"] = [
+                        {"path": "include/foo.h", "reason": "cross-context check"}
+                    ]
+                return _map_chunks_json(ids, **extras)
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": ["F17"], "reject": [], "merge": []})
+            synthesis_messages.append(user)
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        fake.validation_messages = validation_messages  # type: ignore[attr-defined]
+        fake.synthesis_messages = synthesis_messages  # type: ignore[attr-defined]
+        fake.state = state  # type: ignore[attr-defined]
+        return fake
+
+    def test_partial_validation_acknowledgement_marks_incomplete(self) -> None:
+        corpus, matching = _header_validation_corpus(3)
+        fake = self._model(validation="first")
+        review, coverage, store, stats = self._run(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertLess(stats.validation_chunks, 3)
+        self.assertLess(stats.validation_chunks_acknowledged, len(matching))
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_complete_validation_acknowledgement_succeeds(self) -> None:
+        corpus, matching = _header_validation_corpus(3)
+        fake = self._model(validation="all")
+        review, coverage, store, stats = self._run(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertNotIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_hallucinated_validation_ids_do_not_count(self) -> None:
+        corpus, matching = _header_validation_corpus(2)
+        fake = self._model(validation="hallucinate")
+        store = EvidenceStore()
+        raw = json.dumps(
+            {"chunks": [{"chunk_id": "NOT_REAL", "findings": [{"id": "F9", "body": "nope"}]}]}
+        )
+        acknowledged = ingest_map_result(store, raw, matching, "V1")
+        self.assertEqual(acknowledged, set())
+        self.assertEqual(store.findings, {})
+
+        _review, coverage, result_store, stats = self._run(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.validation_chunks_acknowledged, 0)
+        self.assertIn(INCOMPLETE_FOO, result_store.findings["F17"].evidence)
+
+    def test_malformed_validation_json_marks_incomplete(self) -> None:
+        corpus, matching = _header_validation_corpus(3)
+        fake = self._model(validation="malformed")
+        _review, coverage, store, stats = self._run(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertEqual(stats.validation_chunks_acknowledged, 0)
+        self.assertEqual(stats.validation_chunks, 0)
+        self.assertTrue(any("non-JSON evidence" in note for note in stats.notes))
+        self.assertEqual(len(matching), 3)
+
+    def test_retry_recovers_omitted_validation_chunks(self) -> None:
+        corpus, matching = _header_validation_corpus(3)
+        fake = self._model(validation="first-then-rest")
+        _review, coverage, store, stats = self._run(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertNotIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
+        self.assertEqual(fake.state["validation_calls"], 2)
+        self.assertEqual(VALIDATION_MISSING_CHUNK_RETRIES, 1)
+        self.assertTrue(any("retrying once" in note for note in stats.notes))
+        first_ids = set(_chunk_ids_in_prompt(fake.validation_messages[0]))
+        retry_ids = set(_chunk_ids_in_prompt(fake.validation_messages[1]))
+        self.assertEqual(first_ids, {chunk.id for chunk in matching})
+        self.assertEqual(retry_ids, {chunk.id for chunk in matching[1:]})
+
+    def test_retry_still_failing_leaves_incompleteness(self) -> None:
+        corpus, matching = _header_validation_corpus(3)
+        fake = self._model(validation="first")
+        _review, coverage, store, stats = self._run(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertEqual(stats.validation_chunks_acknowledged, 2)
+        self.assertLess(stats.validation_chunks_acknowledged, len(matching))
+        self.assertTrue(any("did not acknowledge 1 chunk" in note for note in stats.notes))
+        self.assertTrue(any(matching[2].id in note for note in stats.notes))
+
+    def test_validation_call_cap_wins_over_retry(self) -> None:
+        corpus, matching = _header_validation_corpus(3)
+        fake = self._model(validation="first")
+        with mock.patch.object(rp, "MAX_VALIDATION_CALLS", 1):
+            _review, coverage, store, stats = self._run(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.validation_calls, 1)
+        self.assertEqual(stats.validation_calls, fake.state["validation_calls"])
+        self.assertLess(stats.validation_chunks_acknowledged, len(matching))
+        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertTrue(any("validation call limit reached" in note for note in stats.notes))
+
+    def test_synthesis_sees_incomplete_validation_marker(self) -> None:
+        corpus, _matching = _header_validation_corpus(3)
+        fake = self._model(validation="malformed")
+        _review, _coverage, store, _stats = self._run(corpus, fake)
+        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertEqual(store.findings["F17"].confidence, "LIKELY")
+        self.assertTrue(fake.synthesis_messages)
+        synthesis_user = fake.synthesis_messages[0]
+        self.assertIn(INCOMPLETE_FOO, synthesis_user)
+        self.assertIn("validation:incomplete:", SYNTHESIS_SUFFIX)
+        self.assertIn("Do not escalate that finding to CONFIRMED", SYNTHESIS_SUFFIX)
+        self.assertIn("Do not escalate that finding to CONFIRMED", synthesis_user)
+        prompt = mw.DEFAULT_PROMPT.read_text(encoding="utf-8")
+        self.assertIn("validation:incomplete:", prompt)
+        self.assertIn("unresolved cross-context dependency", prompt)
+        self.assertIn("not successfully validated", prompt)
+
+    def test_primary_coverage_unaffected_by_incomplete_validation(self) -> None:
+        corpus, matching = _header_validation_corpus(3)
+        fake = self._model(validation="hallucinate")
+        _review, coverage, store, stats = self._run(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertTrue(stats.coverage_complete)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertLess(stats.validation_chunks_acknowledged, len(matching))
+
+
 class ReducerTerminationTests(unittest.TestCase):
     def test_reducer_terminates_when_all_findings_survive(self) -> None:
         store = EvidenceStore()
@@ -1117,6 +1335,8 @@ class SerializedRequestBudgetTests(unittest.TestCase):
             self.assertLessEqual(len(message), limit)
         self.assertIn("UNIQUE_CONTEXT_TAIL_999", "\n".join(recorder.validation_messages))
         self.assertIn("UNIQUE_CONTEXT_TAIL_999", matching[-1].text)
+        self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
+        self.assertEqual(stats.validation_chunks_sent, len(matching))
         self.assertEqual(stats.validation_chunks, len(matching))
         self.assertEqual(store.findings["F17"].confidence, "LIKELY")
         self.assertEqual(review["event"], "REQUEST_CHANGES")
@@ -1191,6 +1411,84 @@ class SerializedRequestBudgetTests(unittest.TestCase):
         self.assertEqual(review["event"], "COMMENT")
         self.assertIn("LIKELY", recorder.synthesis_messages[0])
         self.assertIn("validation:incomplete:include/foo.h", recorder.synthesis_messages[0])
+
+    def test_validation_retry_messages_stay_within_budget(self) -> None:
+        map_chunk = _chunk(
+            "diff:src/foo.c:1",
+            "src/foo.c",
+            "+#include \"include/foo.h\"\nUNIQUE_MAP_TAIL\n",
+            kind="diff",
+        )
+        matching = [
+            _chunk(
+                f"file:include/foo.h:{index}",
+                "include/foo.h",
+                f"/* part {index} */\nUNIQUE_CONTEXT_TAIL_{index}\n" + ("H" * 350),
+            )
+            for index in range(1, 5)
+        ]
+        corpus = _synthetic_corpus(
+            [map_chunk, *matching],
+            index="Changed files:\n- include/foo.h +4 -0\n",
+        )
+        related = [
+            Finding(
+                id="F17",
+                severity="BLOCKING",
+                path="src/foo.c",
+                side="RIGHT",
+                line=1,
+                body="Need include/foo.h ownership contract",
+                confidence="LIKELY",
+                evidence=["chunk:diff:src/foo.c:1"],
+            )
+        ]
+        need = rp.ContextNeed(path="include/foo.h", reason="ownership contract")
+        limit, plan = self._validation_budget(corpus, matching, need, related)
+        self.assertFalse(plan.oversized)
+        self.assertGreater(len(plan.batches), 1)
+
+        recorder = _ReviewRecorder(
+            findings=[
+                {
+                    "id": "F17",
+                    "severity": "BLOCKING",
+                    "path": "src/foo.c",
+                    "side": "RIGHT",
+                    "line": 1,
+                    "body": "Need include/foo.h ownership contract",
+                    "confidence": "LIKELY",
+                    "evidence": [],
+                }
+            ],
+            needs_context=[{"path": "include/foo.h", "reason": "ownership contract"}],
+        )
+        state = {"n": 0}
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system and "Context requests" in user:
+                ids = _chunk_ids_in_prompt(user)
+                recorder.validation_messages.append(user)
+                state["n"] += 1
+                if state["n"] == 1:
+                    return _map_chunks_json(ids[:1])
+                return _map_chunks_json(ids)
+            return recorder(system, user)
+
+        review, coverage, store, stats = self._run(
+            corpus,
+            fake,
+            max_map_request_chars=limit,
+            map_overhead_chars=1,
+        )
+        self.assertTrue(coverage.complete)
+        self.assertGreater(len(recorder.validation_messages), 1)
+        self.assertGreaterEqual(state["n"], 2)
+        for message in recorder.validation_messages:
+            self.assertLessEqual(len(message), limit)
+        self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
+        self.assertNotIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertEqual(review["event"], "COMMENT")
 
     def test_map_and_validation_keep_chunk_tails(self) -> None:
         chunks = [
