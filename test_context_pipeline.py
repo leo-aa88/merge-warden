@@ -41,6 +41,7 @@ from review_pipeline import (
     PipelineStats,
     apply_reduce_decision,
     findings_as_review,
+    findings_for_context_need,
     format_map_user_message,
     format_validation_user_message,
     hierarchical_reduce,
@@ -353,6 +354,8 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("Do not make a merge decision", prompt)
         self.assertIn("merge-warden-map", prompt)
         self.assertNotIn("# APPROVE", prompt)
+        self.assertIn('"finding_ids"', prompt)
+        self.assertIn("list that finding's ID in finding_ids", prompt)
 
     def test_reduce_keeps_original_finding_bodies(self) -> None:
         store = EvidenceStore()
@@ -541,6 +544,7 @@ class PipelineTests(unittest.TestCase):
                         {
                             "path": "stdrot_api.h",
                             "reason": "Need ownership contract for NativeResult",
+                            "finding_ids": ["F17"],
                         }
                     ],
                 )
@@ -840,10 +844,26 @@ def _likely_foo_finding() -> dict:
         "path": "src/foo.c",
         "side": "RIGHT",
         "line": 1,
-        "body": "Need include/foo.h to decide correctness",
+        "body": "The returned pointer may outlive its owner.",
         "confidence": "LIKELY",
         "evidence": [],
     }
+
+
+def _run_hierarchical(corpus: ReviewCorpus, fake, **kwargs):
+    defaults = dict(
+        corpus=corpus,
+        synthesis_prompt="synth",
+        map_prompt="<!-- merge-warden-map -->",
+        reduce_prompt="<!-- merge-warden-reduce -->",
+        call_model=fake,
+        commentable_section="(none)\n",
+        max_map_request_chars=80_000,
+        max_reduce_request_chars=80_000,
+        map_overhead_chars=100,
+    )
+    defaults.update(kwargs)
+    return run_hierarchical_review(**defaults)
 
 
 class ValidationAcknowledgementTests(unittest.TestCase):
@@ -897,7 +917,11 @@ class ValidationAcknowledgementTests(unittest.TestCase):
                 if not validation_messages:
                     extras["findings"] = [_likely_foo_finding()]
                     extras["needs_context"] = [
-                        {"path": "include/foo.h", "reason": "cross-context check"}
+                        {
+                            "path": "include/foo.h",
+                            "reason": "cross-context check",
+                            "finding_ids": ["F17"],
+                        }
                     ]
                 return _map_chunks_json(ids, **extras)
             if "merge-warden-reduce" in system:
@@ -1022,6 +1046,499 @@ class ValidationAcknowledgementTests(unittest.TestCase):
         self.assertEqual(stats.synthesis_calls, 1)
         self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
         self.assertLess(stats.validation_chunks_acknowledged, len(matching))
+
+
+class ContextNeedOwnershipTests(unittest.TestCase):
+    def _map_then(
+        self,
+        corpus: ReviewCorpus,
+        *,
+        findings: list[dict],
+        needs_context: list,
+        validation,
+        synthesis_event: str = "COMMENT",
+    ):
+        validation_messages: list[str] = []
+        synthesis_messages: list[str] = []
+        mapped = {"done": False}
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                ids = _chunk_ids_in_prompt(user)
+                if "Context requests" in user:
+                    validation_messages.append(user)
+                    return validation(user, ids)
+                extras: dict = {}
+                if not mapped["done"]:
+                    extras["findings"] = findings
+                    extras["needs_context"] = needs_context
+                    mapped["done"] = True
+                return _map_chunks_json(ids, **extras)
+            if "merge-warden-reduce" in system:
+                return json.dumps(
+                    {
+                        "keep": [item["id"] for item in findings],
+                        "reject": [],
+                        "merge": [],
+                    }
+                )
+            synthesis_messages.append(user)
+            return json.dumps(
+                {
+                    "event": synthesis_event,
+                    "body": f"# {synthesis_event}\n",
+                    "comments": [],
+                }
+            )
+
+        fake.validation_messages = validation_messages  # type: ignore[attr-defined]
+        fake.synthesis_messages = synthesis_messages  # type: ignore[attr-defined]
+        return fake
+
+    def test_ingest_stores_finding_ids(self) -> None:
+        store = EvidenceStore()
+        batch = [_chunk("diff:src/foo.c:1", "src/foo.c", "+x\n", kind="diff")]
+        raw = json.dumps(
+            {
+                "chunks": [
+                    {
+                        "chunk_id": "diff:src/foo.c:1",
+                        "findings": [_likely_foo_finding()],
+                        "needs_context": [
+                            {
+                                "path": "include/foo.h",
+                                "reason": "Need ownership declaration",
+                                "finding_ids": ["F17", "F17", ""],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        self.assertEqual(ingest_map_result(store, raw, batch, "M1"), {"diff:src/foo.c:1"})
+        self.assertEqual(store.needs_context[0].finding_ids, ["F17"])
+        self.assertEqual(store.needs_context[0].from_chunk, "diff:src/foo.c:1")
+
+    def test_ingest_drops_unknown_finding_ids(self) -> None:
+        store = EvidenceStore()
+        batch = [_chunk("diff:src/foo.c:1", "src/foo.c", "+x\n", kind="diff")]
+        raw = json.dumps(
+            {
+                "chunks": [
+                    {
+                        "chunk_id": "diff:src/foo.c:1",
+                        "findings": [_likely_foo_finding()],
+                        "needs_context": [
+                            {
+                                "path": "include/foo.h",
+                                "reason": "Need ownership declaration",
+                                "finding_ids": ["DOES_NOT_EXIST", "F17"],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        ingest_map_result(store, raw, batch, "M1")
+        self.assertEqual(store.needs_context[0].finding_ids, ["F17"])
+
+    def test_context_need_marks_finding_without_filename_in_body(self) -> None:
+        corpus, _matching = _header_validation_corpus(2)
+        fake = self._map_then(
+            corpus,
+            findings=[_likely_foo_finding()],
+            needs_context=[
+                {
+                    "path": "include/foo.h",
+                    "reason": "Need ownership declaration",
+                    "finding_ids": ["F17"],
+                }
+            ],
+            validation=lambda _user, _ids: "definitely not JSON",
+        )
+        _review, coverage, store, _stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertNotIn("include/foo.h", store.findings["F17"].body)
+
+    def test_multiple_findings_may_depend_on_one_context_request(self) -> None:
+        corpus, _matching = _header_validation_corpus(2)
+        findings = [
+            _likely_foo_finding(),
+            {
+                "id": "F18",
+                "severity": "MAJOR",
+                "path": "src/foo.c",
+                "body": "Caller may free a borrowed buffer.",
+                "confidence": "QUESTION",
+                "evidence": [],
+            },
+        ]
+        fake = self._map_then(
+            corpus,
+            findings=findings,
+            needs_context=[
+                {
+                    "path": "include/foo.h",
+                    "reason": "Need ownership declaration",
+                    "finding_ids": ["F17", "F18"],
+                }
+            ],
+            validation=lambda _user, _ids: "definitely not JSON",
+        )
+        _review, _coverage, store, _stats = _run_hierarchical(corpus, fake)
+        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertIn(INCOMPLETE_FOO, store.findings["F18"].evidence)
+        self.assertNotIn("include/foo.h", store.findings["F17"].body)
+        self.assertNotIn("include/foo.h", store.findings["F18"].body)
+
+    def test_unrelated_finding_is_not_contaminated(self) -> None:
+        map_chunk = _chunk(
+            "diff:src/foo.c:1",
+            "src/foo.c",
+            "+use both headers\n",
+            kind="diff",
+        )
+        a_chunk = _chunk("file:a.h:1", "a.h", "int a_contract;\n")
+        b_chunk = _chunk("file:b.h:1", "b.h", "int b_contract;\n")
+        corpus = _synthetic_corpus(
+            [map_chunk, a_chunk, b_chunk],
+            index="Changed files:\n- src/foo.c +1 -0\n- a.h +1 -0\n- b.h +1 -0\n",
+        )
+        findings = [
+            {
+                "id": "F1",
+                "severity": "MAJOR",
+                "path": "src/foo.c",
+                "body": "Pointer lifetime is unclear.",
+                "confidence": "LIKELY",
+                "evidence": [],
+            },
+            {
+                "id": "F2",
+                "severity": "MAJOR",
+                "path": "src/foo.c",
+                "body": "Conversion may overflow; see a.h comments.",
+                "confidence": "LIKELY",
+                "evidence": [],
+            },
+        ]
+
+        def validation(user: str, ids: list[str]) -> str:
+            header = user.split("# Additional chunks", 1)[0]
+            if "`a.h`" in header:
+                return "definitely not JSON"
+            return _map_chunks_json(ids)
+
+        fake = self._map_then(
+            corpus,
+            findings=findings,
+            needs_context=[
+                {
+                    "path": "a.h",
+                    "reason": "Need a.h contract",
+                    "finding_ids": ["F1"],
+                },
+                {
+                    "path": "b.h",
+                    "reason": "Need b.h contract",
+                    "finding_ids": ["F2"],
+                },
+            ],
+            validation=validation,
+        )
+        _review, coverage, store, _stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertIn("validation:incomplete:a.h", store.findings["F1"].evidence)
+        self.assertNotIn("validation:incomplete:a.h", store.findings["F2"].evidence)
+        self.assertNotIn("validation:incomplete:b.h", store.findings["F1"].evidence)
+        self.assertNotIn("validation:incomplete:b.h", store.findings["F2"].evidence)
+
+    def test_missing_finding_ids_falls_back_to_originating_chunk(self) -> None:
+        corpus, _matching = _header_validation_corpus(2)
+        findings = [
+            {
+                "id": "F1",
+                "severity": "MAJOR",
+                "path": "src/foo.c",
+                "body": "First candidate defect.",
+                "confidence": "LIKELY",
+                "evidence": [],
+            },
+            {
+                "id": "F2",
+                "severity": "MAJOR",
+                "path": "src/foo.c",
+                "body": "Second candidate defect.",
+                "confidence": "QUESTION",
+                "evidence": [],
+            },
+        ]
+        fake = self._map_then(
+            corpus,
+            findings=findings,
+            needs_context=[
+                {"path": "include/foo.h", "reason": "Need ownership declaration"}
+            ],
+            validation=lambda _user, _ids: "definitely not JSON",
+        )
+        _review, _coverage, store, _stats = _run_hierarchical(corpus, fake)
+        self.assertEqual(store.needs_context[0].finding_ids, [])
+        self.assertIn(INCOMPLETE_FOO, store.findings["F1"].evidence)
+        self.assertIn(INCOMPLETE_FOO, store.findings["F2"].evidence)
+
+    def test_invalid_finding_id_does_not_crash(self) -> None:
+        corpus, _matching = _header_validation_corpus(2)
+        fake = self._map_then(
+            corpus,
+            findings=[_likely_foo_finding()],
+            needs_context=[
+                {
+                    "path": "include/foo.h",
+                    "reason": "Need ownership declaration",
+                    "finding_ids": ["DOES_NOT_EXIST"],
+                }
+            ],
+            validation=lambda _user, _ids: "definitely not JSON",
+        )
+        _review, coverage, store, _stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(store.needs_context[0].finding_ids, [])
+        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+
+    def test_successful_validation_produces_no_incomplete_marker(self) -> None:
+        corpus, matching = _header_validation_corpus(2)
+        fake = self._map_then(
+            corpus,
+            findings=[_likely_foo_finding()],
+            needs_context=[
+                {
+                    "path": "include/foo.h",
+                    "reason": "Need ownership declaration",
+                    "finding_ids": ["F17"],
+                }
+            ],
+            validation=lambda _user, ids: _map_chunks_json(ids),
+        )
+        _review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertNotIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertNotIn("include/foo.h", store.findings["F17"].body)
+        self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
+
+    def test_findings_for_context_need_prefers_explicit_ids(self) -> None:
+        store = EvidenceStore()
+        store.findings["F17"] = Finding(
+            id="F17",
+            severity="MAJOR",
+            path="src/foo.c",
+            side="RIGHT",
+            line=1,
+            body="The returned pointer may outlive its owner.",
+            confidence="LIKELY",
+            evidence=["chunk:diff:src/foo.c:1"],
+        )
+        store.findings["F18"] = Finding(
+            id="F18",
+            severity="MAJOR",
+            path="src/foo.c",
+            side="RIGHT",
+            line=2,
+            body="Unrelated candidate that mentions include/foo.h in prose.",
+            confidence="LIKELY",
+            evidence=["chunk:diff:src/foo.c:1"],
+        )
+        needs = [
+            rp.ContextNeed(
+                path="include/foo.h",
+                reason="Need ownership declaration",
+                from_chunk="diff:src/foo.c:1",
+                finding_ids=["F17", "DOES_NOT_EXIST"],
+            )
+        ]
+        related = findings_for_context_need(store, needs)
+        self.assertEqual([item.id for item in related], ["F17"])
+
+
+class ValidationAttemptBudgetTests(unittest.TestCase):
+    def _paths_corpus(self, count: int) -> tuple[ReviewCorpus, list[str]]:
+        paths = [f"include/h{index}.h" for index in range(1, count + 1)]
+        chunks = [
+            _chunk("diff:src/foo.c:1", "src/foo.c", "+int main(void);\n", kind="diff")
+        ]
+        for path in paths:
+            chunks.append(_chunk(f"file:{path}:1", path, f"/* {path} */\nint field;\n"))
+        corpus = _synthetic_corpus(
+            chunks,
+            index="Changed files:\n- src/foo.c +1 -0\n",
+        )
+        return corpus, paths
+
+    def _owned_findings(self, paths: list[str]) -> tuple[list[dict], list[dict]]:
+        findings = [
+            {
+                "id": f"F{index}",
+                "severity": "MAJOR",
+                "path": "src/foo.c",
+                "body": f"Candidate {index} may violate an ownership contract.",
+                "confidence": "LIKELY",
+                "evidence": [],
+            }
+            for index in range(1, len(paths) + 1)
+        ]
+        needs = [
+            {
+                "path": path,
+                "reason": "Need the ownership contract",
+                "finding_ids": [f"F{index}"],
+            }
+            for index, path in enumerate(paths, 1)
+        ]
+        return findings, needs
+
+    def _pipeline_fake(
+        self,
+        *,
+        findings: list[dict],
+        needs_context: list,
+        on_validation,
+    ):
+        state = {"map": 0, "validation": 0}
+        validation_messages: list[str] = []
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                ids = _chunk_ids_in_prompt(user)
+                if "Context requests" in user:
+                    validation_messages.append(user)
+                    state["validation"] += 1
+                    return on_validation(state["validation"], user, ids)
+                extras: dict = {}
+                if state["map"] == 0:
+                    extras["findings"] = findings
+                    extras["needs_context"] = needs_context
+                state["map"] += 1
+                return _map_chunks_json(ids, **extras)
+            if "merge-warden-reduce" in system:
+                return json.dumps(
+                    {
+                        "keep": [item["id"] for item in findings],
+                        "reject": [],
+                        "merge": [],
+                    }
+                )
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        fake.state = state  # type: ignore[attr-defined]
+        fake.validation_messages = validation_messages  # type: ignore[attr-defined]
+        return fake
+
+    def test_provider_failures_consume_validation_budget(self) -> None:
+        corpus, paths = self._paths_corpus(4)
+        findings, needs = self._owned_findings(paths)
+
+        def on_validation(_n: int, _user: str, _ids: list[str]) -> str:
+            raise RuntimeError("dead provider")
+
+        fake = self._pipeline_fake(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+        with mock.patch.object(rp, "MAX_VALIDATION_CALLS", 3):
+            _review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(fake.state["validation"], 3)
+        self.assertEqual(stats.validation_attempts, 3)
+        self.assertEqual(stats.validation_calls, 3)
+        self.assertEqual(stats.validation_calls_succeeded, 0)
+        self.assertTrue(
+            any("validation call limit reached" in note for note in stats.notes)
+        )
+        for index, path in enumerate(paths, 1):
+            marker = f"validation:incomplete:{path}"
+            self.assertIn(marker, store.findings[f"F{index}"].evidence)
+
+    def test_successful_and_failed_calls_both_consume_budget(self) -> None:
+        corpus, paths = self._paths_corpus(4)
+        findings, needs = self._owned_findings(paths)
+
+        def on_validation(n: int, _user: str, ids: list[str]) -> str:
+            if n == 2:
+                raise RuntimeError("dead provider")
+            return _map_chunks_json(ids)
+
+        fake = self._pipeline_fake(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+        with mock.patch.object(rp, "MAX_VALIDATION_CALLS", 3):
+            _review, coverage, _store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(fake.state["validation"], 3)
+        self.assertEqual(stats.validation_attempts, 3)
+        self.assertEqual(stats.validation_calls, 3)
+        self.assertEqual(stats.validation_calls_succeeded, 2)
+
+    def test_missing_chunk_retries_consume_the_same_budget(self) -> None:
+        corpus, matching = _header_validation_corpus(3)
+        findings = [_likely_foo_finding()]
+        needs = [
+            {
+                "path": "include/foo.h",
+                "reason": "Need ownership declaration",
+                "finding_ids": ["F17"],
+            }
+        ]
+
+        def on_validation(_n: int, _user: str, ids: list[str]) -> str:
+            return _map_chunks_json(ids[:1])
+
+        fake = self._pipeline_fake(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+        with mock.patch.object(rp, "MAX_VALIDATION_CALLS", 2), mock.patch.object(
+            rp, "VALIDATION_MISSING_CHUNK_RETRIES", 5
+        ):
+            _review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(fake.state["validation"], 2)
+        self.assertEqual(stats.validation_attempts, 2)
+        self.assertEqual(stats.validation_calls, 2)
+        self.assertLess(stats.validation_chunks_acknowledged, len(matching))
+        self.assertIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
+        self.assertTrue(
+            any("validation call limit reached" in note for note in stats.notes)
+        )
+
+    def test_http_retries_inside_one_call_count_as_one_attempt(self) -> None:
+        corpus, matching = _header_validation_corpus(1)
+        findings = [_likely_foo_finding()]
+        needs = [
+            {
+                "path": "include/foo.h",
+                "reason": "Need ownership declaration",
+                "finding_ids": ["F17"],
+            }
+        ]
+        http = {"n": 0}
+
+        def on_validation(_n: int, _user: str, ids: list[str]) -> str:
+            # Transport-level retries stay inside one logical provider call.
+            for _ in range(3):
+                http["n"] += 1
+            return _map_chunks_json(ids)
+
+        fake = self._pipeline_fake(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+        _review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(http["n"], 3)
+        self.assertEqual(fake.state["validation"], 1)
+        self.assertEqual(stats.validation_attempts, 1)
+        self.assertEqual(stats.validation_calls_succeeded, 1)
+        self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
+        self.assertNotIn(INCOMPLETE_FOO, store.findings["F17"].evidence)
 
 
 class ReducerTerminationTests(unittest.TestCase):

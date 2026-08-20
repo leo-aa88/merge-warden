@@ -74,6 +74,7 @@ class ContextNeed:
     path: str
     reason: str
     from_chunk: str = ""
+    finding_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -103,7 +104,8 @@ class EvidenceStore:
 @dataclass
 class PipelineStats:
     map_calls: int = 0
-    validation_calls: int = 0
+    validation_attempts: int = 0
+    validation_calls_succeeded: int = 0
     validation_requests: int = 0
     validation_chunks_sent: int = 0
     validation_chunks_acknowledged: int = 0
@@ -114,6 +116,11 @@ class PipelineStats:
     total_chars: int = 0
     coverage_complete: bool = False
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def validation_calls(self) -> int:
+        """Logical validation provider invocations attempted, including failures."""
+        return self.validation_attempts
 
     @property
     def validation_chunks(self) -> int:
@@ -206,6 +213,7 @@ def ingest_map_result(
     analyses = data.get("chunks")
     if not isinstance(analyses, list):
         analyses = [data]
+    pending_needs: list[tuple[str, object]] = []
     for item in analyses:
         if not isinstance(item, dict):
             continue
@@ -234,24 +242,78 @@ def ingest_map_result(
                     ContextNeed(path=path, reason="listed as a dependency", from_chunk=chunk_id)
                 )
         for need in item.get("needs_context") or []:
-            if isinstance(need, str) and need.strip():
-                store.needs_context.append(
-                    ContextNeed(path=need.strip(), reason="", from_chunk=chunk_id)
-                )
-                continue
-            if not isinstance(need, dict):
-                continue
-            path = str(need.get("path") or "").strip()
-            if not path:
-                continue
-            store.needs_context.append(
-                ContextNeed(
-                    path=path,
-                    reason=str(need.get("reason") or "").strip(),
-                    from_chunk=chunk_id,
-                )
-            )
+            pending_needs.append((chunk_id, need))
+    known_finding_ids = set(store.findings)
+    for chunk_id, need in pending_needs:
+        parsed_need = _parse_context_need(need, chunk_id, known_finding_ids)
+        if parsed_need is not None:
+            store.needs_context.append(parsed_need)
     return seen_ids
+
+
+def _parse_finding_ids(raw: object, known: set[str] | None = None) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    ids: list[str] = []
+    seen: set[str] = set()
+    for value in raw:
+        finding_id = str(value).strip()
+        if not finding_id or finding_id in seen:
+            continue
+        if known is not None and finding_id not in known:
+            continue
+        seen.add(finding_id)
+        ids.append(finding_id)
+    return ids
+
+
+def _parse_context_need(
+    need: object,
+    chunk_id: str,
+    known_finding_ids: set[str],
+) -> ContextNeed | None:
+    if isinstance(need, str) and need.strip():
+        return ContextNeed(path=need.strip(), reason="", from_chunk=chunk_id)
+    if not isinstance(need, dict):
+        return None
+    path = str(need.get("path") or "").strip()
+    if not path:
+        return None
+    return ContextNeed(
+        path=path,
+        reason=str(need.get("reason") or "").strip(),
+        from_chunk=chunk_id,
+        finding_ids=_parse_finding_ids(need.get("finding_ids"), known_finding_ids),
+    )
+
+
+def findings_for_context_need(
+    store: EvidenceStore,
+    needs: list[ContextNeed],
+) -> list[Finding]:
+    """Resolve findings whose confidence depends on the given context needs.
+
+    Explicit ``finding_ids`` are authoritative. Unknown IDs are ignored. If no
+    usable IDs remain, fall back to findings that originated from the same
+    map chunk. Filename presence in finding prose is not a relationship.
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+    for need in needs:
+        for finding_id in need.finding_ids:
+            if finding_id in store.findings and finding_id not in seen:
+                seen.add(finding_id)
+                ids.append(finding_id)
+    if ids:
+        return [store.findings[finding_id] for finding_id in ids]
+    origin_chunks = {need.from_chunk for need in needs if need.from_chunk}
+    if not origin_chunks:
+        return []
+    related: list[Finding] = []
+    for finding in store.findings.values():
+        if any(f"chunk:{chunk_id}" in finding.evidence for chunk_id in origin_chunks):
+            related.append(finding)
+    return related
 
 
 def _parse_finding(raw: object, prefix: str, used: set[str]) -> Finding | None:
@@ -598,11 +660,13 @@ def _call(
         raise RequestTooLarge(
             f"{kind} request is {len(user_message)} characters; limit is {max_chars}"
         )
+    if kind == "validation":
+        stats.validation_attempts += 1
     raw = call_model(system_prompt, user_message)
     if kind == "map":
         stats.map_calls += 1
     elif kind == "validation":
-        stats.validation_calls += 1
+        stats.validation_calls_succeeded += 1
     elif kind == "reduce":
         stats.reduce_calls += 1
     elif kind == "synthesis":
@@ -862,13 +926,9 @@ def run_validation_pass(
         ]
         if not extra:
             continue
-        related = [
-            finding
-            for finding in store.findings.values()
-            if path in finding.body or path in (finding.path or "") or path in " ".join(finding.evidence)
-        ]
         related_needs = [item for item in store.needs_context if item.path == path]
-        if stats.validation_calls >= MAX_VALIDATION_CALLS:
+        related = findings_for_context_need(store, related_needs)
+        if stats.validation_attempts >= MAX_VALIDATION_CALLS:
             record_limit_reached()
             _mark_incomplete_validation(store, related, path)
             continue
@@ -888,7 +948,7 @@ def run_validation_pass(
         for attempt in range(VALIDATION_MISSING_CHUNK_RETRIES + 1):
             if not remaining:
                 break
-            if stats.validation_calls >= MAX_VALIDATION_CALLS:
+            if stats.validation_attempts >= MAX_VALIDATION_CALLS:
                 record_limit_reached()
                 break
             plan = plan_requests(remaining, render_validation, max_request_chars)
@@ -901,7 +961,7 @@ def run_validation_pass(
                     f"configured request limit of {max_request_chars} characters; skipped"
                 )
             for batch_index, request in enumerate(plan.batches, 1):
-                if stats.validation_calls >= MAX_VALIDATION_CALLS:
+                if stats.validation_attempts >= MAX_VALIDATION_CALLS:
                     record_limit_reached()
                     break
                 try:
