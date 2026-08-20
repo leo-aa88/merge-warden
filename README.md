@@ -35,6 +35,12 @@ only if the review should be optional.
 `workflow_run` runs on the default branch, so secrets work for fork PRs and
 untrusted PR code is never executed.
 
+Do not resolve the PR from `head_sha` alone. GitHub's commit-association API
+searches the *base* repository, so a fork commit often has no linked PR even
+when the triggering run was a `pull_request` event. `workflow_run.pull_requests`
+is also frequently empty. Look up `HEAD_OWNER:HEAD_BRANCH` on the base repo
+instead (or use `leo-aa88/merge-warden/resolve-pr`, which does this for you).
+
 ```yaml
 name: Merge Warden
 
@@ -59,14 +65,49 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - id: pr
+      - name: Resolve pull request
+        id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
+          PR_FROM_EVENT: ${{ github.event.workflow_run.pull_requests[0].number }}
         run: |
-          num="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/pulls" \
-            --jq '.[0].number // empty')"
-          echo "number=${num}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          pr_number=""
+          if [[ "${PR_FROM_EVENT:-}" =~ ^[0-9]+$ ]]; then
+            pr_number="${PR_FROM_EVENT}"
+          fi
+
+          # First try resolving by fork-owner + branch.
+          if [ -z "$pr_number" ]; then
+            pr_number="$(
+              gh api --method GET \
+                "repos/${GITHUB_REPOSITORY}/pulls" \
+                -f state=open \
+                -f head="${HEAD_OWNER}:${HEAD_BRANCH}" \
+                --jq '.[0].number // empty'
+            )"
+          fi
+
+          # Fallback for same-repository PRs / unusual cases.
+          if [ -z "$pr_number" ]; then
+            pr_number="$(
+              gh api \
+                "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/pulls" \
+                --jq '.[0].number // empty'
+            )"
+          fi
+
+          if [ -z "$pr_number" ]; then
+            echo "::error::Could not resolve PR for ${HEAD_OWNER}:${HEAD_BRANCH} (${HEAD_SHA})"
+            exit 1
+          fi
+
+          echo "Resolved PR #${pr_number}"
+          echo "number=${pr_number}" >> "$GITHUB_OUTPUT"
 
       - uses: leo-aa88/merge-warden@v1
         with:

@@ -1,0 +1,47 @@
+name: Resolve pull request
+description: >
+  Resolve the pull request that triggered a workflow_run. Fork PRs are
+  looked up by head owner and branch because the commit-association API
+  searches the base repository and often returns nothing for fork SHAs.
+author: Leonardo Araujo
+
+inputs:
+  github-token:
+    description: Token that can list pull requests.
+    required: false
+    default: ${{ github.token }}
+  pr-from-event:
+    description: github.event.workflow_run.pull_requests[0].number when present.
+    required: false
+    default: ${{ github.event.workflow_run.pull_requests[0].number }}
+  head-sha:
+    description: github.event.workflow_run.head_sha
+    required: false
+    default: ${{ github.event.workflow_run.head_sha }}
+  head-branch:
+    description: github.event.workflow_run.head_branch
+    required: false
+    default: ${{ github.event.workflow_run.head_branch }}
+  head-owner:
+    description: github.event.workflow_run.head_repository.owner.login
+    required: false
+    default: ${{ github.event.workflow_run.head_repository.owner.login }}
+
+outputs:
+  number:
+    description: Resolved pull request number.
+    value: ${{ steps.pr.outputs.number }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve pull request
+      id: pr
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_FROM_EVENT: ${{ inputs.pr-from-event }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        HEAD_BRANCH: ${{ inputs.head-branch }}
+        HEAD_OWNER: ${{ inputs.head-owner }}
+      shell: bash
+      run: bash "${GITHUB_ACTION_PATH}/resolve_pr.sh"
