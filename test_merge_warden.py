@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -246,6 +247,8 @@ class InlineCommentLocationTests(unittest.TestCase):
         self.assertEqual(len(comments), 1)
         self.assertEqual(comments[0]["path"], "parser.c")
         self.assertEqual(comments[0]["line"], 11)
+        self.assertEqual(set(comments[0]), {"path", "side", "line", "body"})
+        self.assertNotIn("subject_type", comments[0])
 
 
 class ReviewJsonTests(unittest.TestCase):
@@ -314,6 +317,106 @@ class PostReviewTests(unittest.TestCase):
             )
         self.assertEqual(event, "COMMENT")
         self.assertEqual(posted, [comments[0]])
+
+    def test_all_inline_comments_dropped_posts_summary_only(self) -> None:
+        comments = [
+            {"path": "parser.c", "line": 10, "body": "one"},
+            {"path": "parser.c", "line": 11, "body": "two"},
+            {"path": "parser.c", "line": 12, "body": "three"},
+            {"path": "README.md", "line": 1, "body": "four"},
+        ]
+        calls: list[dict] = []
+
+        def fake_gh_api(method: str, path: str, payload: dict | None = None, paginate: bool = False):
+            if payload is not None:
+                calls.append(
+                    {
+                        "event": payload.get("event"),
+                        "comment_count": len(payload.get("comments") or []),
+                        "has_comments_key": "comments" in payload,
+                    }
+                )
+            if payload and payload.get("comments"):
+                raise mw.CommandError("422 Unprocessable Entity")
+            return {"id": 1}
+
+        with mock.patch.object(mw, "gh_api", side_effect=fake_gh_api), mock.patch.object(
+            mw, "delete_previous_comments"
+        ):
+            event, posted = mw.post_review(
+                "o/r",
+                "224",
+                {
+                    "commit_id": "abc",
+                    "event": "REQUEST_CHANGES",
+                    "body": "# REQUEST CHANGES\n",
+                    "comments": comments,
+                },
+            )
+        self.assertEqual(event, "COMMENT")
+        self.assertEqual(posted, [])
+        self.assertEqual(
+            [(call["event"], call["comment_count"], call["has_comments_key"]) for call in calls],
+            [
+                ("REQUEST_CHANGES", 4, True),
+                ("COMMENT", 4, True),
+                ("COMMENT", 3, True),
+                ("COMMENT", 2, True),
+                ("COMMENT", 1, True),
+                ("COMMENT", 0, False),
+            ],
+        )
+
+
+class GitHubErrorFormattingTests(unittest.TestCase):
+    def test_github_422_json_is_preserved(self) -> None:
+        detail = mw.format_api_error_body(
+            json.dumps(
+                {
+                    "message": 'Invalid request.\n\nFor \'items\', "subject_type" is not a permitted key.',
+                    "status": "422",
+                    "errors": [
+                        {
+                            "resource": "PullRequestReview",
+                            "field": "comments[0].subject_type",
+                            "code": "invalid",
+                            "message": "unexpected field",
+                        }
+                    ],
+                }
+            ),
+            "gh: Unprocessable Entity (HTTP 422)",
+        )
+        self.assertIn("422", detail)
+        self.assertIn("subject_type", detail)
+        self.assertIn("unexpected field", detail)
+        self.assertNotEqual(detail, "gh: Unprocessable Entity (HTTP 422)")
+
+    def test_run_surfaces_github_validation_body(self) -> None:
+        payload = {
+            "message": "Validation Failed",
+            "status": "422",
+            "errors": [
+                {
+                    "field": "comments[0].subject_type",
+                    "message": "unexpected field",
+                }
+            ],
+        }
+        fake = subprocess.CompletedProcess(
+            args=["gh", "api", "--method", "POST", "repos/o/r/pulls/224/reviews"],
+            returncode=1,
+            stdout=json.dumps(payload),
+            stderr="gh: Unprocessable Entity (HTTP 422)",
+        )
+        with mock.patch("subprocess.run", return_value=fake):
+            with self.assertRaises(mw.CommandError) as ctx:
+                mw.run(["gh", "api", "--method", "POST", "repos/o/r/pulls/224/reviews"])
+        text = str(ctx.exception)
+        self.assertIn("422", text)
+        self.assertIn("Validation Failed", text)
+        self.assertIn("comments[0].subject_type", text)
+        self.assertIn("unexpected field", text)
 
 
 class ActionOutputTests(unittest.TestCase):
