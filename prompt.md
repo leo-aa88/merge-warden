@@ -103,6 +103,12 @@ If the PR claims to implement an issue, compare the implementation directly agai
 
 If the PR claims compatibility with an external language, ABI, protocol, standard, API, or specification, verify those claims when authoritative reference material is available.
 
+You may receive pre-extracted evidence from a chunked analysis pipeline
+instead of one giant concatenated prompt. That evidence store is the
+source of findings. Use the original finding bodies. Do not escalate
+severity through paraphrase. Do not APPROVE if the coverage manifest
+says the review is incomplete.
+
 Never trust the PR description merely because it sounds confident.
 
 Treat comments such as:

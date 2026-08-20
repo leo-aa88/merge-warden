@@ -61,7 +61,7 @@ jobs:
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
       issues: read
@@ -156,13 +156,42 @@ with `git show`.
 - `comment-count` — `posted-comment-count` when posting, otherwise `generated-comment-count`
 
 Injected after the system prompt: architectural docs, issue bodies, PR
-description, the complete diff, a commentable line map, and a budgeted sample
-of numbered changed-file contents. Each of those untrusted sections has its
-own character budget (70k docs, 30k PR body, 30k issues, 250k diff, 30k
-commentable map). The suffix and diff are reserved first so a huge README
-cannot evict the patch or the `Reply with JSON only` instruction. The
-assembled user message is capped at 450k characters. That material is treated
-as untrusted data, not as instructions to the reviewer.
+description, the complete diff, a commentable line map, and numbered
+changed-file contents. That material is treated as untrusted data, not as
+instructions to the reviewer.
+
+Merge Warden does **not** truncate the PR to fit a context window. It builds
+a complete context corpus, splits it at semantic boundaries (diff hunks,
+headings, source line ranges), packs those chunks into bounded map calls
+(~225k characters each), extracts structured evidence, runs a targeted
+cross-chunk validation pass when analyses request more context, then
+hierarchically reduces finding IDs (without rewriting their original bodies)
+and synthesizes the GitHub review.
+
+Binary and generated files can be excluded, but that exclusion is explicit in
+the PR index. If reviewable context exceeds `MERGE_WARDEN_MAX_TOTAL_REVIEW_CHARS`
+(default 10 MB) or `MERGE_WARDEN_MAX_CONTEXT_CHUNKS` (default 64 after
+coalescing), or if any reviewable chunk is not analyzed, Merge Warden posts
+`COMMENT` and **does not approve**. It will not silently drop the tail of a
+diff and then emit `# APPROVE`.
+
+Each map/reduce call is capped around 225k characters so provider connections
+stay reliable. The total source size is not artificially bounded by those
+per-call budgets. Large PRs make several model calls and may need a higher
+job `timeout-minutes` than the 20-minute example above.
+
+Optional environment overrides:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MERGE_WARDEN_MAX_MAP_REQUEST_CHARS` | 225000 | Per map-call budget |
+| `MERGE_WARDEN_MAX_REDUCE_REQUEST_CHARS` | 225000 | Per reduce/synthesis-call budget |
+| `MERGE_WARDEN_MAX_SINGLE_CHUNK_CHARS` | 100000 | Max size of one context chunk |
+| `MERGE_WARDEN_MAX_TOTAL_REVIEW_CHARS` | 10000000 | Hard cap on reviewable source text |
+| `MERGE_WARDEN_MAX_CONTEXT_CHUNKS` | 64 | Hard cap on coalesced reviewable chunks |
+
+GitHub review bodies and inline comments still have posting size limits
+(60k / 8k). Those are GitHub API limits, not source truncation.
 
 Provider HTTP calls retry transient failures (disconnects, timeouts,
 HTTP 429/5xx) a few times with exponential backoff. HTTP 429 honors

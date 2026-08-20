@@ -498,28 +498,24 @@ class ActionOutputTests(unittest.TestCase):
                         with mock.patch.object(
                             mw, "run", return_value=mock.Mock(returncode=0, stdout="", stderr="")
                         ):
-                            with mock.patch.object(mw, "collect_arch_docs", return_value=""):
-                                with mock.patch.object(mw, "collect_issue_bodies", return_value=""):
+                            with mock.patch.object(mw, "load_arch_docs", return_value=[]):
+                                with mock.patch.object(
+                                    mw,
+                                    "call_model",
+                                    return_value=json.dumps(
+                                        {
+                                            "event": "APPROVE",
+                                            "body": "# APPROVE\n",
+                                            "comments": [],
+                                        }
+                                    ),
+                                ):
                                     with mock.patch.object(
-                                        mw, "collect_changed_files", return_value=""
+                                        mw,
+                                        "post_review",
+                                        return_value=("COMMENT", []),
                                     ):
-                                        with mock.patch.object(
-                                            mw,
-                                            "call_model",
-                                            return_value=json.dumps(
-                                                {
-                                                    "event": "APPROVE",
-                                                    "body": "# APPROVE\n",
-                                                    "comments": [],
-                                                }
-                                            ),
-                                        ):
-                                            with mock.patch.object(
-                                                mw,
-                                                "post_review",
-                                                return_value=("COMMENT", []),
-                                            ):
-                                                rc = mw.generate_review(args, "o/r")
+                                        rc = mw.generate_review(args, "o/r")
             values = dict(
                 line.split("=", 1) for line in output_path.read_text(encoding="utf-8").splitlines()
             )
@@ -596,38 +592,32 @@ class StaleHeadTests(unittest.TestCase):
                                 "run",
                                 return_value=mock.Mock(returncode=0, stdout="", stderr=""),
                             ):
-                                with mock.patch.object(mw, "collect_arch_docs", return_value=""):
+                                with mock.patch.object(mw, "load_arch_docs", return_value=[]):
                                     with mock.patch.object(
-                                        mw, "collect_issue_bodies", return_value=""
+                                        mw,
+                                        "call_model",
+                                        return_value=json.dumps(
+                                            {
+                                                "event": "COMMENT",
+                                                "body": "# COMMENT\n",
+                                                "comments": [],
+                                            }
+                                        ),
                                     ):
                                         with mock.patch.object(
-                                            mw, "collect_changed_files", return_value=""
+                                            mw,
+                                            "current_pr_head_oid",
+                                            return_value="sha-b",
                                         ):
                                             with mock.patch.object(
-                                                mw,
-                                                "call_model",
-                                                return_value=json.dumps(
-                                                    {
-                                                        "event": "COMMENT",
-                                                        "body": "# COMMENT\n",
-                                                        "comments": [],
-                                                    }
-                                                ),
-                                            ):
-                                                with mock.patch.object(
-                                                    mw,
-                                                    "current_pr_head_oid",
-                                                    return_value="sha-b",
-                                                ):
-                                                    with mock.patch.object(
-                                                        mw, "post_review"
-                                                    ) as post:
-                                                        rc = mw.generate_review(args, "o/r")
-                                                        payload = json.loads(
-                                                            Path(args.json_output).read_text(
-                                                                encoding="utf-8"
-                                                            )
-                                                        )
+                                                mw, "post_review"
+                                            ) as post:
+                                                rc = mw.generate_review(args, "o/r")
+                                                payload = json.loads(
+                                                    Path(args.json_output).read_text(
+                                                        encoding="utf-8"
+                                                    )
+                                                )
         self.assertEqual(rc, 0)
         post.assert_not_called()
         self.assertEqual(payload["commit_id"], "sha-a")
@@ -644,27 +634,21 @@ class StaleHeadTests(unittest.TestCase):
                                 "run",
                                 return_value=mock.Mock(returncode=0, stdout="", stderr=""),
                             ):
-                                with mock.patch.object(mw, "collect_arch_docs", return_value=""):
+                                with mock.patch.object(mw, "load_arch_docs", return_value=[]):
                                     with mock.patch.object(
-                                        mw, "collect_issue_bodies", return_value=""
-                                    ):
-                                        with mock.patch.object(
-                                            mw, "collect_changed_files", return_value=""
-                                        ):
-                                            with mock.patch.object(
-                                                mw,
-                                                "call_model",
-                                                return_value=json.dumps(
-                                                    {
-                                                        "event": "COMMENT",
-                                                        "body": "# COMMENT\n",
-                                                        "comments": [],
-                                                    }
-                                                ),
-                                            ) as call_model:
-                                                rc = mw.generate_review(args, "o/r")
+                                        mw,
+                                        "call_model",
+                                        return_value=json.dumps(
+                                            {
+                                                "event": "COMMENT",
+                                                "body": "# COMMENT\n",
+                                                "comments": [],
+                                            }
+                                        ),
+                                    ) as call_model:
+                                        rc = mw.generate_review(args, "o/r")
         self.assertEqual(rc, 0)
-        call_model.assert_called_once()
+        self.assertGreaterEqual(call_model.call_count, 2)
 
 
 class LinkedIssueCapTests(unittest.TestCase):
@@ -830,116 +814,13 @@ class HttpPostRetryTests(unittest.TestCase):
 
 
 class PromptBudgetTests(unittest.TestCase):
-    def test_user_char_ceiling_is_reduced(self) -> None:
-        self.assertEqual(mw.MAX_USER_CHARS, 450_000)
-        self.assertLess(mw.MAX_USER_CHARS, 1_200_000)
-
-    def test_changed_files_respect_budget(self) -> None:
-        files = [
-            {"filename": "a.c", "status": "modified"},
-            {"filename": "b.c", "status": "modified"},
-            {"filename": "c.c", "status": "modified"},
-        ]
-
-        def fake_show(_ref: str, path: str) -> str:
-            return f"{path}\n" + ("x" * 8_000)
-
-        with mock.patch.object(mw, "git_show", side_effect=fake_show):
-            text = mw.collect_changed_files("pr-head", files, budget=2_500)
-        self.assertLessEqual(len(text), 2_800)
-        self.assertIn("### `a.c`", text)
-        self.assertLess(text.count("x"), 2_500)
-
-    def test_zero_budget_omits_file_bodies(self) -> None:
-        files = [{"filename": "huge.c", "status": "modified"}]
-        with mock.patch.object(mw, "git_show") as show:
-            text = mw.collect_changed_files("pr-head", files, budget=0)
-        show.assert_not_called()
-        self.assertIn("omitted", text)
-        self.assertIn("complete diff", text)
-
-    def test_build_user_message_keeps_diff_when_files_are_huge(self) -> None:
-        pr = {
-            "number": 223,
-            "title": "enormous",
-            "body": "rewrite",
-            "url": "https://example.test/pr/223",
-            "author": {"login": "dev"},
-            "baseRefName": "main",
-            "headRefName": "feat",
-            "headRefOid": "abc123",
-            "labels": [],
-            "closingIssuesReferences": [],
-        }
-        files = [
-            {
-                "filename": f"src/file_{index:03d}.c",
-                "status": "modified",
-                "patch": "@@ -1,1 +1,1 @@\n-old\n+new\n",
-            }
-            for index in range(40)
-        ]
-        marker = "UNIQUE_COMPLETE_DIFF_MARKER"
-        diff = marker + "\n" + ("d" * 80_000)
-
-        def fake_show(_ref: str, path: str) -> str:
-            return f"// {path}\n" + ("body\n" * 20_000)
-
-        with mock.patch.object(mw, "collect_arch_docs", return_value="(docs)\n"):
-            with mock.patch.object(mw, "collect_issue_bodies", return_value="(issues)\n"):
-                with mock.patch.object(mw, "git_show", side_effect=fake_show):
-                    message = mw.build_user_message(
-                        repo="o/r",
-                        pr=pr,
-                        files=files,
-                        diff=diff,
-                        head_ref="pr-head",
-                        commentable=mw.commentable_by_path(files),
-                    )
-        self.assertIn(marker, message)
-        self.assertIn("# Complete diff", message)
-        self.assertLessEqual(len(message), mw.MAX_USER_CHARS)
-        self.assertIn("untrusted", message.lower())
-
-    def test_huge_arch_docs_cannot_evict_diff_or_suffix(self) -> None:
-        pr = {
-            "number": 223,
-            "title": "enormous",
-            "body": "PRBODY" + ("p" * 80_000),
-            "url": "https://example.test/pr/223",
-            "author": {"login": "dev"},
-            "baseRefName": "main",
-            "headRefName": "feat",
-            "headRefOid": "abc123",
-            "labels": [],
-            "closingIssuesReferences": [],
-        }
-        files = [
-            {
-                "filename": "src/parser.c",
-                "status": "modified",
-                "patch": "@@ -1,1 +1,1 @@\n-old\n+new\n",
-            }
-        ]
-        marker = "UNIQUE_DIFF_MARKER"
-        diff = marker + "\n" + ("d" * 10_000)
-
-        with mock.patch.object(mw, "collect_arch_docs", return_value="ARCH" * 80_000):
-            with mock.patch.object(mw, "collect_issue_bodies", return_value="ISSUE" * 40_000):
-                with mock.patch.object(mw, "git_show", return_value="body\n" * 50_000):
-                    message = mw.build_user_message(
-                        repo="o/r",
-                        pr=pr,
-                        files=files,
-                        diff=diff,
-                        head_ref="pr-head",
-                        commentable=mw.commentable_by_path(files),
-                    )
-        self.assertIn(marker, message)
-        self.assertIn("Reply with JSON only", message)
-        self.assertLessEqual(len(message), mw.MAX_USER_CHARS)
-        self.assertLess(message.count("ARCH"), 80_000)
-        self.assertIn(mw.USER_MESSAGE_SUFFIX, message)
+    def test_request_budgets_are_per_call_not_source_truncation(self) -> None:
+        self.assertEqual(mw.MAX_MAP_REQUEST_CHARS, 225_000)
+        self.assertEqual(mw.MAX_REDUCE_REQUEST_CHARS, 225_000)
+        self.assertEqual(mw.MAX_SINGLE_CHUNK_CHARS, 100_000)
+        self.assertEqual(mw.MAX_TOTAL_REVIEW_CHARS, 10_000_000)
+        self.assertEqual(mw.MAX_CONTEXT_CHUNKS, 64)
+        self.assertLess(mw.MAX_MAP_REQUEST_CHARS, mw.MAX_TOTAL_REVIEW_CHARS)
 
     def test_truncate_stays_within_limit(self) -> None:
         text = mw.truncate("x" * 1000, 100, "label")
@@ -982,7 +863,7 @@ class PromptInjectionTests(unittest.TestCase):
 
     def test_injection_in_pr_body_does_not_alter_system_instructions(self) -> None:
         prompt = Path(mw.DEFAULT_PROMPT).read_text(encoding="utf-8")
-        captured: dict[str, str] = {}
+        captured: dict[str, list[str]] = {"system": [], "user": []}
 
         def fake_call_model(
             provider: str,
@@ -991,8 +872,12 @@ class PromptInjectionTests(unittest.TestCase):
             model: str,
             api_key: str,
         ) -> str:
-            captured["system"] = system_prompt
-            captured["user"] = user_message
+            captured["system"].append(system_prompt)
+            captured["user"].append(user_message)
+            if "merge-warden-map" in system_prompt:
+                return json.dumps({"chunks": []})
+            if "merge-warden-reduce" in system_prompt:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
             return json.dumps(
                 {"event": "COMMENT", "body": "# COMMENT\n\nReviewed.\n", "comments": []}
             )
@@ -1029,21 +914,21 @@ class PromptInjectionTests(unittest.TestCase):
                             "run",
                             return_value=mock.Mock(returncode=0, stdout="", stderr=""),
                         ):
-                            with mock.patch.object(mw, "collect_arch_docs", return_value=""):
-                                with mock.patch.object(mw, "collect_issue_bodies", return_value=""):
-                                    with mock.patch.object(
-                                        mw, "collect_changed_files", return_value=""
-                                    ):
-                                        with mock.patch.object(
-                                            mw, "call_model", side_effect=fake_call_model
-                                        ):
-                                            rc = mw.generate_review(args, "o/r")
+                            with mock.patch.object(mw, "load_arch_docs", return_value=[]):
+                                with mock.patch.object(
+                                    mw, "call_model", side_effect=fake_call_model
+                                ):
+                                    rc = mw.generate_review(args, "o/r")
         self.assertEqual(rc, 0)
-        self.assertEqual(captured["system"], prompt)
-        self.assertIn(self.INJECTION, captured["user"])
-        self.assertIn("untrusted", captured["user"].lower())
-        self.assertTrue(captured["user"].startswith(mw.UNTRUSTED_CONTEXT_BANNER[:40]))
-        self.assertNotIn(self.INJECTION, captured["system"])
+        self.assertTrue(captured["system"])
+        self.assertTrue(captured["user"])
+        self.assertTrue(all(self.INJECTION not in item for item in captured["system"]))
+        self.assertTrue(any(self.INJECTION in item for item in captured["user"]))
+        self.assertTrue(
+            any(item.startswith(mw.UNTRUSTED_CONTEXT_BANNER[:40]) for item in captured["user"])
+        )
+        self.assertIn(prompt, captured["system"])
+        self.assertNotIn(self.INJECTION, prompt)
 
 
 if __name__ == "__main__":
