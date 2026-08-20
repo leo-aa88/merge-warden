@@ -99,6 +99,8 @@ class EvidenceStore:
 class PipelineStats:
     map_calls: int = 0
     validation_calls: int = 0
+    validation_requests: int = 0
+    validation_chunks: int = 0
     reduce_calls: int = 0
     synthesis_calls: int = 0
     batches: int = 0
@@ -115,6 +117,23 @@ class PipelineStats:
             f"{self.reduce_calls} reduce call(s), {self.synthesis_calls} synthesis call(s), "
             f"coverage {coverage}._"
         )
+
+
+@dataclass
+class ModelRequestBatch:
+    chunks: list[ContextChunk]
+    message: str
+    chars: int
+
+
+@dataclass
+class RequestPlan:
+    batches: list[ModelRequestBatch] = field(default_factory=list)
+    oversized: list[ContextChunk] = field(default_factory=list)
+
+
+class RequestTooLarge(RuntimeError):
+    """A serialized model request exceeded the configured character budget."""
 
 
 def load_prompt(path: Path | str) -> str:
@@ -401,6 +420,64 @@ def format_validation_user_message(
     )
 
 
+def plan_requests(
+    chunks: list[ContextChunk],
+    render_message: Callable[[list[ContextChunk]], str],
+    max_chars: int,
+) -> RequestPlan:
+    """Split chunks so each rendered request fits ``max_chars``.
+
+    Packing uses the actual serialized message, not an overhead estimate.
+    Chunks whose rendered message cannot fit even alone are returned in
+    ``oversized`` rather than truncated or sent anyway.
+    """
+    if not chunks:
+        return RequestPlan()
+    if max_chars <= 0:
+        return RequestPlan(oversized=list(chunks))
+
+    batches: list[ModelRequestBatch] = []
+    oversized: list[ContextChunk] = []
+    current: list[ContextChunk] = []
+    current_message = ""
+
+    for chunk in chunks:
+        candidate = current + [chunk]
+        message = render_message(candidate)
+        if len(message) <= max_chars:
+            current = candidate
+            current_message = message
+            continue
+        if current:
+            batches.append(
+                ModelRequestBatch(
+                    chunks=list(current),
+                    message=current_message,
+                    chars=len(current_message),
+                )
+            )
+            current = []
+            current_message = ""
+            message = render_message([chunk])
+            if len(message) <= max_chars:
+                current = [chunk]
+                current_message = message
+            else:
+                oversized.append(chunk)
+            continue
+        oversized.append(chunk)
+
+    if current:
+        batches.append(
+            ModelRequestBatch(
+                chunks=list(current),
+                message=current_message,
+                chars=len(current_message),
+            )
+        )
+    return RequestPlan(batches=batches, oversized=oversized)
+
+
 def format_reduce_user_message(
     findings: list[Finding],
     contracts: list[Contract],
@@ -504,7 +581,12 @@ def _call(
     user_message: str,
     stats: PipelineStats,
     kind: str,
+    max_chars: int | None = None,
 ) -> str:
+    if max_chars is not None and len(user_message) > max_chars:
+        raise RequestTooLarge(
+            f"{kind} request is {len(user_message)} characters; limit is {max_chars}"
+        )
     raw = call_model(system_prompt, user_message)
     if kind == "map":
         stats.map_calls += 1
@@ -602,7 +684,7 @@ def hierarchical_reduce(
         ]
 
 
-def _run_map_batch(
+def _map_fitted_batch(
     *,
     corpus: ReviewCorpus,
     batch: list[ContextChunk],
@@ -611,8 +693,9 @@ def _run_map_batch(
     call_model: CallModel,
     stats: PipelineStats,
     batch_tag: str,
+    max_request_chars: int,
 ) -> list[ContextChunk]:
-    """Map a batch and retry omitted chunk IDs once.
+    """Map a request that already fits the serialized size budget.
 
     Coverage is based on explicit acknowledgements of the IDs present in the
     map prompt (``chunk.id``), including coalesced IDs. Unacknowledged chunks
@@ -625,13 +708,27 @@ def _run_map_batch(
     for attempt in range(attempts):
         if not remaining:
             break
+        user_message = format_map_user_message(corpus, remaining)
         print(
             f"Map batch {current_tag}: {len(remaining)} chunk(s), "
-            f"{sum(chunk.size for chunk in remaining)} chars"
+            f"{sum(chunk.size for chunk in remaining)} chunk chars, "
+            f"{len(user_message)} request chars"
         )
-        user_message = format_map_user_message(corpus, remaining)
+        if len(user_message) > max_request_chars:
+            stats.notes.append(
+                f"map batch {current_tag} exceeded {max_request_chars} characters; "
+                "chunks left uncovered"
+            )
+            break
         try:
-            raw = _call(call_model, map_prompt, user_message, stats, "map")
+            raw = _call(
+                call_model,
+                map_prompt,
+                user_message,
+                stats,
+                "map",
+                max_chars=max_request_chars,
+            )
         except Exception as exc:
             stats.notes.append(f"map batch {current_tag} failed: {exc}")
             break
@@ -655,6 +752,62 @@ def _run_map_batch(
     return analyzed
 
 
+def _run_map_batch(
+    *,
+    corpus: ReviewCorpus,
+    batch: list[ContextChunk],
+    store: EvidenceStore,
+    map_prompt: str,
+    call_model: CallModel,
+    stats: PipelineStats,
+    batch_tag: str,
+    max_request_chars: int,
+) -> list[ContextChunk]:
+    """Split ``batch`` to the actual serialized request budget, then map it."""
+    plan = plan_requests(
+        batch,
+        lambda chunks: format_map_user_message(corpus, chunks),
+        max_request_chars,
+    )
+    stats.batches += len(plan.batches)
+    for chunk in plan.oversized:
+        stats.notes.append(
+            f"Merge Warden could not analyze chunk {chunk.id} within the "
+            f"configured request limit of {max_request_chars} characters; "
+            "left uncovered"
+        )
+    analyzed: list[ContextChunk] = []
+    split = len(plan.batches) > 1 or bool(plan.oversized)
+    for sub_index, request in enumerate(plan.batches, 1):
+        tag = f"{batch_tag}.{sub_index}" if split else batch_tag
+        analyzed.extend(
+            _map_fitted_batch(
+                corpus=corpus,
+                batch=request.chunks,
+                store=store,
+                map_prompt=map_prompt,
+                call_model=call_model,
+                stats=stats,
+                batch_tag=tag,
+                max_request_chars=max_request_chars,
+            )
+        )
+    return analyzed
+
+
+def _mark_incomplete_validation(
+    store: EvidenceStore,
+    related: list[Finding],
+    path: str,
+) -> None:
+    marker = f"validation:incomplete:{path}"
+    for finding in related:
+        if finding.confidence not in {"QUESTION", "LIKELY"}:
+            continue
+        if marker not in finding.evidence:
+            finding.evidence.append(marker)
+
+
 def run_validation_pass(
     corpus: ReviewCorpus,
     store: EvidenceStore,
@@ -666,7 +819,18 @@ def run_validation_pass(
     if not store.needs_context:
         return
     seen_paths: set[str] = set()
-    calls = 0
+    limit_note_added = False
+
+    def record_limit_reached() -> None:
+        nonlocal limit_note_added
+        if limit_note_added:
+            return
+        stats.notes.append(
+            "validation call limit reached; some requested cross-context "
+            "checks were not completed"
+        )
+        limit_note_added = True
+
     for need in store.needs_context:
         path = need.path
         if not path or path in seen_paths:
@@ -685,23 +849,47 @@ def run_validation_pass(
             if path in finding.body or path in (finding.path or "") or path in " ".join(finding.evidence)
         ]
         related_needs = [item for item in store.needs_context if item.path == path]
-        payload = format_validation_user_message(corpus, related_needs, extra, related[:12])
-        if len(payload) > max_request_chars:
-            packed = pack_chunks(extra, max(max_request_chars // 2, 1))
-            extra = packed[0] if packed else extra[:1]
-            payload = format_validation_user_message(corpus, related_needs, extra, related[:12])
-        try:
-            raw = _call(call_model, map_prompt, payload, stats, "validation")
-        except Exception as exc:
-            stats.notes.append(f"validation for {path} failed: {exc}")
+        if stats.validation_calls >= MAX_VALIDATION_CALLS:
+            record_limit_reached()
+            _mark_incomplete_validation(store, related, path)
             continue
-        ingest_map_result(store, raw, extra, f"val:{path}")
-        calls += 1
-        if calls >= MAX_VALIDATION_CALLS:
-            stats.notes.append(
-                f"stopped after {MAX_VALIDATION_CALLS} validation calls"
+
+        stats.validation_requests += 1
+        related_for_prompt = related[:12]
+
+        def render_validation(batch: list[ContextChunk]) -> str:
+            return format_validation_user_message(
+                corpus, related_needs, batch, related_for_prompt
             )
-            return
+
+        plan = plan_requests(extra, render_validation, max_request_chars)
+        sent_ids: set[str] = set()
+        for chunk in plan.oversized:
+            stats.notes.append(
+                f"validation chunk {chunk.id} for {path} cannot fit the "
+                f"configured request limit of {max_request_chars} characters; skipped"
+            )
+        for batch_index, request in enumerate(plan.batches, 1):
+            if stats.validation_calls >= MAX_VALIDATION_CALLS:
+                record_limit_reached()
+                break
+            try:
+                raw = _call(
+                    call_model,
+                    map_prompt,
+                    request.message,
+                    stats,
+                    "validation",
+                    max_chars=max_request_chars,
+                )
+            except Exception as exc:
+                stats.notes.append(f"validation for {path} failed: {exc}")
+                continue
+            ingest_map_result(store, raw, request.chunks, f"val:{path}:{batch_index}")
+            sent_ids.update(chunk.id for chunk in request.chunks)
+            stats.validation_chunks += len(request.chunks)
+        if len(sent_ids) != len(extra):
+            _mark_incomplete_validation(store, related, path)
 
 
 def run_hierarchical_review(
@@ -732,36 +920,13 @@ def run_hierarchical_review(
         }
         return review, coverage, store, stats
 
+    # Overhead is a packing hint only. Actual serialized requests are split
+    # and bounded in `_run_map_batch` before every provider call.
     payload_limit = max(max_map_request_chars - map_overhead_chars, 1)
-    batches = pack_chunks(corpus.reviewable_chunks, payload_limit)
-    stats.batches = len(batches)
+    packed = pack_chunks(corpus.reviewable_chunks, payload_limit)
     analyzed: list[ContextChunk] = []
 
-    for index, batch in enumerate(batches, 1):
-        user_message = format_map_user_message(corpus, batch)
-        if len(user_message) > max_map_request_chars:
-            # Packing is by chunk text; index/overhead can still overflow.
-            # Split the batch rather than truncate chunk text.
-            smaller = pack_chunks(batch, max(payload_limit // 2, 1))
-            if len(smaller) == 1 and len(user_message) > max_map_request_chars:
-                stats.notes.append(
-                    f"map batch {index} exceeded {max_map_request_chars} characters "
-                    "even after splitting; chunks left uncovered"
-                )
-                continue
-            for sub_index, sub in enumerate(smaller, 1):
-                analyzed.extend(
-                    _run_map_batch(
-                        corpus=corpus,
-                        batch=sub,
-                        store=store,
-                        map_prompt=map_prompt,
-                        call_model=call_model,
-                        stats=stats,
-                        batch_tag=f"{index}.{sub_index}/{len(batches)}",
-                    )
-                )
-            continue
+    for index, batch in enumerate(packed, 1):
         analyzed.extend(
             _run_map_batch(
                 corpus=corpus,
@@ -770,7 +935,8 @@ def run_hierarchical_review(
                 map_prompt=map_prompt,
                 call_model=call_model,
                 stats=stats,
-                batch_tag=f"{index}/{len(batches)}",
+                batch_tag=f"{index}/{len(packed)}",
+                max_request_chars=max_map_request_chars,
             )
         )
 

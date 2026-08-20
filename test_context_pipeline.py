@@ -12,9 +12,11 @@ from pathlib import Path
 from unittest import mock
 
 import merge_warden as mw
+import review_pipeline as rp
 from context_pipeline import (
     ContextChunk,
     CorpusInputs,
+    ReviewCorpus,
     build_coverage,
     build_review_corpus,
     chunk_diff,
@@ -30,14 +32,18 @@ from context_pipeline import (
 )
 from review_pipeline import (
     MAX_REDUCE_ROUNDS,
+    MAX_VALIDATION_CALLS,
     REDUCE_GROUP_SIZE,
     EvidenceStore,
     Finding,
     PipelineStats,
     apply_reduce_decision,
     findings_as_review,
+    format_map_user_message,
+    format_validation_user_message,
     hierarchical_reduce,
     ingest_map_result,
+    plan_requests,
     run_hierarchical_review,
 )
 
@@ -126,6 +132,72 @@ def _inputs(**overrides) -> CorpusInputs:
     )
     values.update(overrides)
     return CorpusInputs(**values)
+
+
+def _synthetic_corpus(
+    chunks: list[ContextChunk],
+    *,
+    index: str = "Changed files:\n- src/foo.c +1 -0\n",
+    purpose: str = "Title: test\n",
+) -> ReviewCorpus:
+    coverage = build_coverage(chunks)
+    reset_uncovered(coverage, chunks)
+    return ReviewCorpus(
+        chunks=chunks,
+        coverage=coverage,
+        index=index,
+        purpose_summary=purpose,
+        total_chars=sum(chunk.size for chunk in chunks),
+    )
+
+
+def _chunk(chunk_id: str, source: str, text: str, kind: str = "file") -> ContextChunk:
+    return ContextChunk(id=chunk_id, kind=kind, source=source, text=text)
+
+
+class _ReviewRecorder:
+    """Acknowledge every supplied chunk and record dispatched user messages."""
+
+    def __init__(
+        self,
+        *,
+        findings: list[dict] | None = None,
+        needs_context: list | None = None,
+        synthesis_event: str = "COMMENT",
+        synthesis_body: str = "# COMMENT\n\nNo defects.\n",
+    ) -> None:
+        self.map_messages: list[str] = []
+        self.validation_messages: list[str] = []
+        self.synthesis_messages: list[str] = []
+        self.findings = findings
+        self.needs_context = needs_context
+        self.synthesis_event = synthesis_event
+        self.synthesis_body = synthesis_body
+
+    def __call__(self, system: str, user: str) -> str:
+        if "merge-warden-map" in system:
+            ids = _chunk_ids_in_prompt(user)
+            if "Context requests" in user:
+                self.validation_messages.append(user)
+                return _map_chunks_json(ids)
+            self.map_messages.append(user)
+            extras: dict = {}
+            if not self.map_messages[1:]:
+                if self.findings:
+                    extras["findings"] = self.findings
+                if self.needs_context:
+                    extras["needs_context"] = self.needs_context
+            return _map_chunks_json(ids, **extras)
+        if "merge-warden-reduce" in system:
+            return json.dumps({"keep": [], "reject": [], "merge": []})
+        self.synthesis_messages.append(user)
+        return json.dumps(
+            {
+                "event": self.synthesis_event,
+                "body": self.synthesis_body,
+                "comments": [],
+            }
+        )
 
 
 class SplitTests(unittest.TestCase):
@@ -815,6 +887,364 @@ class ReducerTerminationTests(unittest.TestCase):
         self.assertTrue(kept)
         self.assertGreater(len(kept), REDUCE_GROUP_SIZE)
         self.assertLess(len(kept), count)
+
+
+class RequestPlannerTests(unittest.TestCase):
+    def test_plan_requests_splits_on_rendered_size(self) -> None:
+        chunks = [_chunk(f"c{i}", "a.c", f"CHUNK-{i}-" + ("x" * 40)) for i in range(4)]
+
+        def render(batch: list[ContextChunk]) -> str:
+            return "HDR" + "".join(item.text for item in batch)
+
+        overhead = 3
+        limit = overhead + 90
+        plan = plan_requests(chunks, render, limit)
+        packed = [item for batch in plan.batches for item in batch.chunks]
+        self.assertEqual([chunk.id for chunk in packed], [chunk.id for chunk in chunks])
+        self.assertFalse(plan.oversized)
+        self.assertGreater(len(plan.batches), 1)
+        for batch in plan.batches:
+            self.assertLessEqual(batch.chars, limit)
+            self.assertEqual(batch.chars, len(batch.message))
+            self.assertEqual(batch.message, render(batch.chunks))
+
+    def test_plan_requests_reports_single_chunk_overflow(self) -> None:
+        chunk = _chunk("too-big", "a.c", "y" * 50)
+        plan = plan_requests([chunk], lambda batch: "".join(item.text for item in batch), 10)
+        self.assertEqual(plan.batches, [])
+        self.assertEqual([item.id for item in plan.oversized], ["too-big"])
+
+
+class SerializedRequestBudgetTests(unittest.TestCase):
+    def _run(self, corpus: ReviewCorpus, recorder: _ReviewRecorder, **kwargs):
+        defaults = dict(
+            corpus=corpus,
+            synthesis_prompt="synth",
+            map_prompt="<!-- merge-warden-map -->",
+            reduce_prompt="<!-- merge-warden-reduce -->",
+            call_model=recorder,
+            commentable_section="(none)\n",
+            max_map_request_chars=80_000,
+            max_reduce_request_chars=80_000,
+            map_overhead_chars=100,
+        )
+        defaults.update(kwargs)
+        return run_hierarchical_review(**defaults)
+
+    def _validation_budget(
+        self,
+        corpus: ReviewCorpus,
+        matching: list[ContextChunk],
+        need: rp.ContextNeed,
+        related: list[Finding],
+    ) -> tuple[int, rp.RequestPlan]:
+        map_one = max(
+            len(format_map_user_message(corpus, [chunk]))
+            for chunk in corpus.reviewable_chunks
+        )
+        val_one = max(
+            len(format_validation_user_message(corpus, [need], [chunk], related))
+            for chunk in matching
+        )
+        # Map ingest appends chunk:<id> evidence, which slightly grows later
+        # validation prompts relative to a hand-built related finding.
+        limit = max(map_one, val_one) + 256
+        plan = plan_requests(
+            matching,
+            lambda batch: format_validation_user_message(corpus, [need], batch, related),
+            limit,
+        )
+        return limit, plan
+
+    def test_serialized_map_message_never_exceeds_budget(self) -> None:
+        chunks = [
+            _chunk(
+                f"file:src/p{i}.c:1",
+                f"src/very/long/path/name/module_{i}/file.c",
+                f"int f{i}(void) {{ return {i}; }}\nUNIQUE_MAP_{i}\n" + ("A" * 120),
+            )
+            for i in range(6)
+        ]
+        index = "Changed files:\n" + "\n".join(
+            f"{i}. src/very/long/path/name/module_{i}/file.c +10 -2"
+            for i in range(40)
+        ) + "\n"
+        corpus = _synthetic_corpus(chunks, index=index)
+        reviewable = corpus.reviewable_chunks
+        single_max = max(len(format_map_user_message(corpus, [chunk])) for chunk in reviewable)
+        combined = len(format_map_user_message(corpus, reviewable))
+        self.assertGreater(combined, single_max)
+        recorder = _ReviewRecorder()
+        review, coverage, _store, _stats = self._run(
+            corpus,
+            recorder,
+            max_map_request_chars=single_max,
+            map_overhead_chars=24_000,
+        )
+        self.assertTrue(coverage.complete)
+        self.assertTrue(recorder.map_messages)
+        for message in recorder.map_messages:
+            self.assertLessEqual(len(message), single_max)
+        supplied = [chunk_id for message in recorder.map_messages for chunk_id in _chunk_ids_in_prompt(message)]
+        self.assertEqual(set(supplied), {chunk.id for chunk in reviewable})
+        self.assertEqual(len(supplied), len(reviewable))
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_wrong_overhead_estimate_still_enforces_serialized_budget(self) -> None:
+        corpus = build_review_corpus(_inputs(diff="+ok\n+more\n", pr=_pr(body="small")))
+        corpus.index = "Changed files:\n" + "\n".join(
+            f"{i}. src/very/long/directory/name/file_{i:04d}.c +10 -2"
+            for i in range(80)
+        ) + "\n"
+        reviewable = corpus.reviewable_chunks
+        self.assertGreaterEqual(len(reviewable), 2)
+        single_max = max(len(format_map_user_message(corpus, [chunk])) for chunk in reviewable)
+        combined = len(format_map_user_message(corpus, reviewable))
+        self.assertGreater(combined, single_max)
+        recorder = _ReviewRecorder()
+        review, coverage, _store, stats = self._run(
+            corpus,
+            recorder,
+            max_map_request_chars=single_max,
+            map_overhead_chars=1,
+        )
+        self.assertTrue(coverage.complete)
+        self.assertTrue(recorder.map_messages)
+        for message in recorder.map_messages:
+            self.assertLessEqual(len(message), single_max)
+        self.assertGreaterEqual(stats.map_calls, 2)
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_single_chunk_overflow_fails_closed_without_truncation(self) -> None:
+        chunk = _chunk(
+            "file:huge.c:1",
+            "huge.c",
+            "UNIQUE_CONTEXT_TAIL_999\n" + ("z" * 80),
+        )
+        corpus = _synthetic_corpus([chunk], index=("I" * 4000) + "\n", purpose="purpose\n")
+        message = format_map_user_message(corpus, [chunk])
+        limit = len(message) - 25
+        self.assertGreater(limit, 0)
+        self.assertGreater(len(message), limit)
+        recorder = _ReviewRecorder()
+        review, coverage, _store, stats = self._run(
+            corpus,
+            recorder,
+            max_map_request_chars=limit,
+            map_overhead_chars=1,
+        )
+        self.assertFalse(coverage.complete)
+        self.assertIn(chunk.id, coverage.uncovered_chunk_ids)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertIn("No approval decision was produced", review["body"])
+        self.assertEqual(recorder.map_messages, [])
+        self.assertEqual(stats.map_calls, 0)
+        self.assertEqual(stats.synthesis_calls, 0)
+        self.assertTrue(any(chunk.id in note for note in stats.notes))
+        self.assertNotIn("truncated", chunk.text)
+        joined = "\n".join(recorder.map_messages)
+        self.assertNotIn("UNIQUE_CONTEXT_TAIL_999", joined)
+
+    def test_validation_uses_all_matching_chunks_across_batches(self) -> None:
+        map_chunk = _chunk(
+            "diff:src/foo.c:1",
+            "src/foo.c",
+            "+#include \"include/foo.h\"\nUNIQUE_MAP_TAIL\n",
+            kind="diff",
+        )
+        matching = [
+            _chunk(
+                f"file:include/foo.h:{index}",
+                "include/foo.h",
+                f"/* part {index} */\nUNIQUE_CONTEXT_TAIL_{index}\n" + ("H" * 350),
+            )
+            for index in range(1, 5)
+        ]
+        matching[-1] = _chunk(
+            "file:include/foo.h:4",
+            "include/foo.h",
+            "/* part 4 */\nUNIQUE_CONTEXT_TAIL_999\n" + ("H" * 350),
+        )
+        corpus = _synthetic_corpus([map_chunk, *matching], index="Changed files:\n- include/foo.h +4 -0\n")
+        recorder = _ReviewRecorder(
+            findings=[
+                {
+                    "id": "F17",
+                    "severity": "BLOCKING",
+                    "path": "src/foo.c",
+                    "side": "RIGHT",
+                    "line": 1,
+                    "body": "Need include/foo.h ownership contract",
+                    "confidence": "LIKELY",
+                    "evidence": [],
+                }
+            ],
+            needs_context=[{"path": "include/foo.h", "reason": "ownership contract"}],
+            synthesis_event="REQUEST_CHANGES",
+            synthesis_body="# REQUEST CHANGES\n",
+        )
+        related = [
+            Finding(
+                id="F17",
+                severity="BLOCKING",
+                path="src/foo.c",
+                side="RIGHT",
+                line=1,
+                body="Need include/foo.h ownership contract",
+                confidence="LIKELY",
+                evidence=["chunk:diff:src/foo.c:1"],
+            )
+        ]
+        need = rp.ContextNeed(path="include/foo.h", reason="ownership contract")
+        limit, plan = self._validation_budget(corpus, matching, need, related)
+        self.assertFalse(plan.oversized)
+        self.assertGreater(len(plan.batches), 1)
+        review, coverage, store, stats = self._run(
+            corpus,
+            recorder,
+            max_map_request_chars=limit,
+            map_overhead_chars=1,
+        )
+        self.assertTrue(coverage.complete)
+        self.assertGreater(len(recorder.validation_messages), 1)
+        seen = {
+            chunk_id
+            for message in recorder.validation_messages
+            for chunk_id in _chunk_ids_in_prompt(message)
+        }
+        self.assertEqual(seen, {chunk.id for chunk in matching})
+        for message in recorder.validation_messages:
+            self.assertLessEqual(len(message), limit)
+        self.assertIn("UNIQUE_CONTEXT_TAIL_999", "\n".join(recorder.validation_messages))
+        self.assertIn("UNIQUE_CONTEXT_TAIL_999", matching[-1].text)
+        self.assertEqual(stats.validation_chunks, len(matching))
+        self.assertEqual(store.findings["F17"].confidence, "LIKELY")
+        self.assertEqual(review["event"], "REQUEST_CHANGES")
+
+    def test_validation_call_cap_is_enforced(self) -> None:
+        map_chunk = _chunk(
+            "diff:src/foo.c:1",
+            "src/foo.c",
+            "+#include \"include/foo.h\"\n",
+            kind="diff",
+        )
+        matching = [
+            _chunk(
+                f"file:include/foo.h:{index}",
+                "include/foo.h",
+                f"/* part {index} */\n" + ("V" * 400),
+            )
+            for index in range(1, 5)
+        ]
+        corpus = _synthetic_corpus([map_chunk, *matching])
+        recorder = _ReviewRecorder(
+            findings=[
+                {
+                    "id": "F17",
+                    "severity": "MAJOR",
+                    "path": "src/foo.c",
+                    "body": "Need include/foo.h to decide correctness",
+                    "confidence": "LIKELY",
+                    "evidence": [],
+                }
+            ],
+            needs_context=[{"path": "include/foo.h", "reason": "cross-context check"}],
+        )
+        related = [
+            Finding(
+                id="F17",
+                severity="MAJOR",
+                path="src/foo.c",
+                side="RIGHT",
+                line=1,
+                body="Need include/foo.h to decide correctness",
+                confidence="LIKELY",
+                evidence=["chunk:diff:src/foo.c:1"],
+            )
+        ]
+        need = rp.ContextNeed(path="include/foo.h", reason="cross-context check")
+        limit, plan = self._validation_budget(corpus, matching, need, related)
+        self.assertFalse(plan.oversized)
+        self.assertGreater(len(plan.batches), 2)
+        self.assertEqual(MAX_VALIDATION_CALLS, 8)
+        with mock.patch.object(rp, "MAX_VALIDATION_CALLS", 2):
+            review, coverage, store, stats = self._run(
+                corpus,
+                recorder,
+                max_map_request_chars=limit,
+                map_overhead_chars=1,
+            )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.validation_calls, 2)
+        self.assertLess(stats.validation_calls, len(matching))
+        self.assertTrue(
+            any("validation call limit reached" in note for note in stats.notes)
+        )
+        seen = {
+            chunk_id
+            for message in recorder.validation_messages
+            for chunk_id in _chunk_ids_in_prompt(message)
+        }
+        self.assertLess(len(seen), len(matching))
+        self.assertIn("validation:incomplete:include/foo.h", store.findings["F17"].evidence)
+        self.assertEqual(store.findings["F17"].confidence, "LIKELY")
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertIn("LIKELY", recorder.synthesis_messages[0])
+        self.assertIn("validation:incomplete:include/foo.h", recorder.synthesis_messages[0])
+
+    def test_map_and_validation_keep_chunk_tails(self) -> None:
+        chunks = [
+            _chunk("file:a.c:1", "a.c", "head-a\nUNIQUE_CONTEXT_TAIL_A\n" + ("a" * 200)),
+            _chunk("file:b.c:1", "b.c", "head-b\nUNIQUE_CONTEXT_TAIL_999\n" + ("b" * 200)),
+            _chunk("file:c.h:1", "c.h", "head-c\nUNIQUE_CONTEXT_TAIL_C\n" + ("c" * 200)),
+        ]
+        corpus = _synthetic_corpus(chunks, index=("N" * 400) + "\n")
+        single_max = max(len(format_map_user_message(corpus, [chunk])) for chunk in chunks)
+        combined = len(format_map_user_message(corpus, chunks))
+        self.assertGreater(combined, single_max)
+        recorder = _ReviewRecorder(
+            findings=[
+                {
+                    "id": "F1",
+                    "severity": "MINOR",
+                    "path": "a.c",
+                    "body": "Check c.h for contract",
+                    "confidence": "QUESTION",
+                    "evidence": [],
+                }
+            ],
+            needs_context=[{"path": "c.h", "reason": "contract"}],
+        )
+        _review, coverage, _store, _stats = self._run(
+            corpus,
+            recorder,
+            max_map_request_chars=single_max,
+            map_overhead_chars=1,
+        )
+        self.assertTrue(coverage.complete)
+        dispatched = "\n".join(recorder.map_messages + recorder.validation_messages)
+        self.assertIn("UNIQUE_CONTEXT_TAIL_999", dispatched)
+        self.assertIn("UNIQUE_CONTEXT_TAIL_C", dispatched)
+        self.assertNotIn("[truncated]", dispatched)
+        for message in recorder.map_messages + recorder.validation_messages:
+            self.assertLessEqual(len(message), single_max)
+
+    def test_incomplete_coverage_behavior_unchanged_when_chunk_cannot_fit(self) -> None:
+        corpus = build_review_corpus(_inputs(diff="+ok\n", pr=_pr(body="small")))
+        first = corpus.reviewable_chunks[0]
+        corpus.index = ("Q" * 8000) + "\n"
+        message = format_map_user_message(corpus, [first])
+        recorder = _ReviewRecorder()
+        review, coverage, _store, _stats = self._run(
+            corpus,
+            recorder,
+            max_map_request_chars=max(len(message) - 100, 50),
+            map_overhead_chars=1,
+        )
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertIn("No approval decision was produced", review["body"])
+        self.assertIn("could not complete a full review", review["body"])
 
 
 class GenerateReviewPipelineTests(unittest.TestCase):
