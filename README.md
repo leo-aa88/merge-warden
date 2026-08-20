@@ -183,6 +183,11 @@ with `git show`.
 - `comment-count` — `posted-comment-count` when posting, otherwise `generated-comment-count`
 
 Injected after the system prompt: architectural docs, issue bodies, PR
-description, complete diff, commentable line map, and numbered changed-file
-contents. That material is treated as untrusted data, not as instructions to
+description, the complete diff, a commentable line map, and a budgeted sample
+of numbered changed-file contents. The assembled user message is capped at
+450k characters so large PRs keep the diff instead of dumping every file
+twice. That material is treated as untrusted data, not as instructions to
 the reviewer.
+
+Provider HTTP calls retry transient failures (disconnects, timeouts,
+HTTP 429/5xx) a few times with exponential backoff.

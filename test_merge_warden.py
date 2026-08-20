@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import http.client
+import io
 import json
 import os
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -526,6 +529,185 @@ class ActionOutputTests(unittest.TestCase):
         self.assertEqual(values["event"], "COMMENT")
         self.assertIn("generated `APPROVE`", markdown)
         self.assertIn("posted `COMMENT`", markdown)
+
+
+class HttpPostRetryTests(unittest.TestCase):
+    def _response(self, body: bytes = b'{"ok": true}'):
+        response = mock.Mock()
+        response.read.return_value = body
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        return response
+
+    def _http_error(self, code: int, body: bytes = b"unavailable") -> urllib.error.HTTPError:
+        return urllib.error.HTTPError(
+            "https://example.test/v1",
+            code,
+            "error",
+            hdrs=None,
+            fp=io.BytesIO(body),
+        )
+
+    def test_retries_remote_disconnected_then_succeeds(self) -> None:
+        side_effects = [
+            http.client.RemoteDisconnected(
+                "Remote end closed connection without response"
+            ),
+            self._response(),
+        ]
+        with mock.patch("urllib.request.urlopen", side_effect=side_effects) as urlopen:
+            with mock.patch("time.sleep") as sleep:
+                data = mw.http_post_json(
+                    "https://example.test/v1",
+                    {"a": 1},
+                    {"Authorization": "Bearer x"},
+                    label="xAI",
+                )
+        self.assertEqual(data, {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_retries_http_503_then_succeeds(self) -> None:
+        side_effects = [self._http_error(503), self._response()]
+        with mock.patch("urllib.request.urlopen", side_effect=side_effects):
+            with mock.patch("time.sleep") as sleep:
+                data = mw.http_post_json(
+                    "https://example.test/v1",
+                    {"a": 1},
+                    {"h": "v"},
+                    label="xAI",
+                )
+        self.assertEqual(data, {"ok": True})
+        sleep.assert_called_once_with(1)
+
+    def test_retries_http_429(self) -> None:
+        side_effects = [self._http_error(429, b"rate limited"), self._response()]
+        with mock.patch("urllib.request.urlopen", side_effect=side_effects):
+            with mock.patch("time.sleep"):
+                data = mw.http_post_json(
+                    "https://example.test/v1",
+                    {"a": 1},
+                    {"h": "v"},
+                )
+        self.assertEqual(data, {"ok": True})
+
+    def test_does_not_retry_http_400(self) -> None:
+        with mock.patch(
+            "urllib.request.urlopen", side_effect=self._http_error(400, b"bad request")
+        ):
+            with mock.patch("time.sleep") as sleep:
+                with self.assertRaises(RuntimeError) as ctx:
+                    mw.http_post_json(
+                        "https://example.test/v1",
+                        {"a": 1},
+                        {"h": "v"},
+                        label="xAI",
+                    )
+        self.assertIn("HTTP 400", str(ctx.exception))
+        sleep.assert_not_called()
+
+    def test_gives_up_after_attempts(self) -> None:
+        error = urllib.error.URLError("timed out")
+        with mock.patch("urllib.request.urlopen", side_effect=error) as urlopen:
+            with mock.patch("time.sleep") as sleep:
+                with self.assertRaises(RuntimeError) as ctx:
+                    mw.http_post_json(
+                        "https://example.test/v1",
+                        {"a": 1},
+                        {"h": "v"},
+                        label="xAI",
+                        attempts=3,
+                    )
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+        self.assertIn("after 3 attempts", str(ctx.exception))
+
+    def test_urlerror_reason_remote_disconnected_is_retried(self) -> None:
+        wrapped = urllib.error.URLError(
+            http.client.RemoteDisconnected("Remote end closed connection without response")
+        )
+        with mock.patch("urllib.request.urlopen", side_effect=[wrapped, self._response()]):
+            with mock.patch("time.sleep"):
+                data = mw.http_post_json(
+                    "https://example.test/v1",
+                    {"a": 1},
+                    {"h": "v"},
+                )
+        self.assertEqual(data, {"ok": True})
+
+
+class PromptBudgetTests(unittest.TestCase):
+    def test_user_char_ceiling_is_reduced(self) -> None:
+        self.assertEqual(mw.MAX_USER_CHARS, 450_000)
+        self.assertLess(mw.MAX_USER_CHARS, 1_200_000)
+
+    def test_changed_files_respect_budget(self) -> None:
+        files = [
+            {"filename": "a.c", "status": "modified"},
+            {"filename": "b.c", "status": "modified"},
+            {"filename": "c.c", "status": "modified"},
+        ]
+
+        def fake_show(_ref: str, path: str) -> str:
+            return f"{path}\n" + ("x" * 8_000)
+
+        with mock.patch.object(mw, "git_show", side_effect=fake_show):
+            text = mw.collect_changed_files("pr-head", files, budget=2_500)
+        self.assertLessEqual(len(text), 2_800)
+        self.assertIn("### `a.c`", text)
+        self.assertLess(text.count("x"), 2_500)
+
+    def test_zero_budget_omits_file_bodies(self) -> None:
+        files = [{"filename": "huge.c", "status": "modified"}]
+        with mock.patch.object(mw, "git_show") as show:
+            text = mw.collect_changed_files("pr-head", files, budget=0)
+        show.assert_not_called()
+        self.assertIn("omitted", text)
+        self.assertIn("complete diff", text)
+
+    def test_build_user_message_keeps_diff_when_files_are_huge(self) -> None:
+        pr = {
+            "number": 223,
+            "title": "enormous",
+            "body": "rewrite",
+            "url": "https://example.test/pr/223",
+            "author": {"login": "dev"},
+            "baseRefName": "main",
+            "headRefName": "feat",
+            "headRefOid": "abc123",
+            "labels": [],
+            "closingIssuesReferences": [],
+        }
+        files = [
+            {
+                "filename": f"src/file_{index:03d}.c",
+                "status": "modified",
+                "patch": "@@ -1,1 +1,1 @@\n-old\n+new\n",
+            }
+            for index in range(40)
+        ]
+        marker = "UNIQUE_COMPLETE_DIFF_MARKER"
+        diff = marker + "\n" + ("d" * 80_000)
+
+        def fake_show(_ref: str, path: str) -> str:
+            return f"// {path}\n" + ("body\n" * 20_000)
+
+        with mock.patch.object(mw, "collect_arch_docs", return_value="(docs)\n"):
+            with mock.patch.object(mw, "collect_issue_bodies", return_value="(issues)\n"):
+                with mock.patch.object(mw, "git_show", side_effect=fake_show):
+                    message = mw.build_user_message(
+                        repo="o/r",
+                        pr=pr,
+                        files=files,
+                        diff=diff,
+                        head_ref="pr-head",
+                        commentable=mw.commentable_by_path(files),
+                    )
+        self.assertIn(marker, message)
+        self.assertIn("# Complete diff", message)
+        self.assertLessEqual(len(message), mw.MAX_USER_CHARS)
+        self.assertIn("untrusted", message.lower())
 
 
 class MissingKeyTests(unittest.TestCase):
