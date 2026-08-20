@@ -532,6 +532,163 @@ class ActionOutputTests(unittest.TestCase):
         self.assertIn("posted `COMMENT`", markdown)
 
 
+class StaleHeadTests(unittest.TestCase):
+    PR = {
+        "number": 199,
+        "title": "t",
+        "body": "b",
+        "url": "https://example.test/pr/199",
+        "author": {"login": "a"},
+        "baseRefName": "main",
+        "headRefName": "feat",
+        "headRefOid": "sha-a",
+        "labels": [],
+        "closingIssuesReferences": [],
+    }
+
+    def _args(self, tmp: str, **overrides):
+        values = dict(
+            provider="xai",
+            model="grok-4.6",
+            prompt_file=str(mw.DEFAULT_PROMPT),
+            pr="199",
+            head_ref="pr-head",
+            output=str(Path(tmp) / "merge-warden.md"),
+            json_output=str(Path(tmp) / "merge-warden.json"),
+            post=False,
+            skip_if_missing_key=False,
+            expected_head_sha="sha-a",
+        )
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_skips_when_pr_head_moved_before_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp, expected_head_sha="sha-a")
+            pr = {**self.PR, "headRefOid": "sha-b"}
+            with mock.patch.dict(os.environ, {"XAI_API_KEY": "sk"}):
+                with mock.patch.object(mw, "gh_json", return_value=pr):
+                    with mock.patch.object(mw, "call_model") as call_model:
+                        rc = mw.generate_review(args, "o/r")
+        self.assertEqual(rc, 0)
+        call_model.assert_not_called()
+
+    def test_skips_when_fetched_ref_does_not_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp)
+            with mock.patch.dict(os.environ, {"XAI_API_KEY": "sk"}):
+                with mock.patch.object(mw, "gh_json", return_value=self.PR):
+                    with mock.patch.object(mw, "local_head_sha", return_value="sha-b"):
+                        with mock.patch.object(mw, "call_model") as call_model:
+                            rc = mw.generate_review(args, "o/r")
+        self.assertEqual(rc, 0)
+        call_model.assert_not_called()
+
+    def test_skips_post_when_pr_moves_during_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp, post=True)
+            with mock.patch.dict(os.environ, {"XAI_API_KEY": "sk"}):
+                with mock.patch.object(mw, "gh_json", return_value=self.PR):
+                    with mock.patch.object(mw, "local_head_sha", return_value="sha-a"):
+                        with mock.patch.object(mw, "collect_pr_files", return_value=[]):
+                            with mock.patch.object(
+                                mw,
+                                "run",
+                                return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+                            ):
+                                with mock.patch.object(mw, "collect_arch_docs", return_value=""):
+                                    with mock.patch.object(
+                                        mw, "collect_issue_bodies", return_value=""
+                                    ):
+                                        with mock.patch.object(
+                                            mw, "collect_changed_files", return_value=""
+                                        ):
+                                            with mock.patch.object(
+                                                mw,
+                                                "call_model",
+                                                return_value=json.dumps(
+                                                    {
+                                                        "event": "COMMENT",
+                                                        "body": "# COMMENT\n",
+                                                        "comments": [],
+                                                    }
+                                                ),
+                                            ):
+                                                with mock.patch.object(
+                                                    mw,
+                                                    "current_pr_head_oid",
+                                                    return_value="sha-b",
+                                                ):
+                                                    with mock.patch.object(
+                                                        mw, "post_review"
+                                                    ) as post:
+                                                        rc = mw.generate_review(args, "o/r")
+                                                        payload = json.loads(
+                                                            Path(args.json_output).read_text(
+                                                                encoding="utf-8"
+                                                            )
+                                                        )
+        self.assertEqual(rc, 0)
+        post.assert_not_called()
+        self.assertEqual(payload["commit_id"], "sha-a")
+
+    def test_reviews_when_expected_sha_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp, post=False)
+            with mock.patch.dict(os.environ, {"XAI_API_KEY": "sk"}):
+                with mock.patch.object(mw, "gh_json", return_value=self.PR):
+                    with mock.patch.object(mw, "local_head_sha", return_value="sha-a"):
+                        with mock.patch.object(mw, "collect_pr_files", return_value=[]):
+                            with mock.patch.object(
+                                mw,
+                                "run",
+                                return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+                            ):
+                                with mock.patch.object(mw, "collect_arch_docs", return_value=""):
+                                    with mock.patch.object(
+                                        mw, "collect_issue_bodies", return_value=""
+                                    ):
+                                        with mock.patch.object(
+                                            mw, "collect_changed_files", return_value=""
+                                        ):
+                                            with mock.patch.object(
+                                                mw,
+                                                "call_model",
+                                                return_value=json.dumps(
+                                                    {
+                                                        "event": "COMMENT",
+                                                        "body": "# COMMENT\n",
+                                                        "comments": [],
+                                                    }
+                                                ),
+                                            ) as call_model:
+                                                rc = mw.generate_review(args, "o/r")
+        self.assertEqual(rc, 0)
+        call_model.assert_called_once()
+
+
+class LinkedIssueCapTests(unittest.TestCase):
+    def test_issue_fanout_is_capped_before_github_calls(self) -> None:
+        body = " ".join(f"#{index}" for index in range(1, 51))
+        calls: list[list[str]] = []
+
+        def fake_gh_json(args: list[str]):
+            calls.append(args)
+            return {
+                "number": int(args[2]),
+                "title": "t",
+                "body": "b",
+                "state": "open",
+                "labels": [],
+            }
+
+        with mock.patch.object(mw, "gh_json", side_effect=fake_gh_json):
+            text = mw.collect_issue_bodies("o/r", body, [])
+        self.assertEqual(len(calls), mw.MAX_LINKED_ISSUES)
+        self.assertEqual(mw.MAX_LINKED_ISSUES, 20)
+        self.assertIn("capped at 20", text)
+
+
 class HttpPostRetryTests(unittest.TestCase):
     def _response(self, body: bytes = b'{"ok": true}'):
         response = mock.Mock()

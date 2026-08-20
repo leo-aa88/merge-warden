@@ -19,8 +19,10 @@ Run it **after CI passes**, and **only on pull requests**. The action does not
 trigger itself — wrap it in a workflow in the consuming repo.
 
 ```yaml
-- uses: leo-aa88/merge-warden@v1
+- uses: leo-aa88/merge-warden@PINNED_SHA
 ```
+
+Pin the commit. The moving `v1` tag may lag `main`.
 
 ## Usage
 
@@ -79,13 +81,16 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           xai-api-key: ${{ secrets.XAI_API_KEY }}
           pr-number: ${{ steps.pr.outputs.number }}
+          expected-head-sha: ${{ github.event.workflow_run.head_sha }}
           arch-docs: |
             README.md
             CONTRIBUTING.md
             docs/ARCHITECTURE.md
 ```
 
-Replace `PINNED_SHA` with the same commit in both steps.
+Replace `PINNED_SHA` with the same commit in both steps. `expected-head-sha`
+makes Merge Warden skip if the PR moved after the CI run that triggered
+`workflow_run`. The next successful CI run reviews the new head.
 
 ### ChatGPT, Claude, or Gemini
 
@@ -93,7 +98,7 @@ Swap the provider and the matching API key. Leave `model` unset to use the
 provider default, or set it to a specific model id.
 
 ```yaml
-- uses: leo-aa88/merge-warden@v1
+- uses: leo-aa88/merge-warden@PINNED_SHA
   with:
     github-token: ${{ secrets.GITHUB_TOKEN }}
     provider: openai          # chatgpt, anthropic, claude, google, gemini
@@ -133,6 +138,7 @@ comment-count outputs) rather than assuming the generated event was published.
 | `fetch-head` | no | `true` | Fetch `pull/{n}/head` |
 | `post` | no | `true` | Post the GitHub review |
 | `skip-if-missing-key` | no | `false` | Skip instead of failing when the provider key is unset |
+| `expected-head-sha` | no | | Skip if the PR head is no longer this SHA (`workflow_run.head_sha`) |
 
 The action never executes PR code. It checks out the default branch (caller
 must `actions/checkout`), fetches the PR head as a git ref, and reads files
