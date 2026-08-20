@@ -15,21 +15,28 @@ import merge_warden as mw
 from context_pipeline import (
     ContextChunk,
     CorpusInputs,
+    build_coverage,
     build_review_corpus,
     chunk_diff,
     chunk_text,
     format_char_count,
     incomplete_coverage_body,
     incomplete_limit_body,
+    mark_chunks_covered,
     pack_chunks,
+    reset_uncovered,
     split_on_headings,
     split_text_by_lines,
 )
 from review_pipeline import (
+    MAX_REDUCE_ROUNDS,
+    REDUCE_GROUP_SIZE,
     EvidenceStore,
     Finding,
+    PipelineStats,
     apply_reduce_decision,
     findings_as_review,
+    hierarchical_reduce,
     ingest_map_result,
     run_hierarchical_review,
 )
@@ -50,6 +57,59 @@ def _pr(**overrides) -> dict:
     }
     pr.update(overrides)
     return pr
+
+
+def _chunk_ids_in_prompt(user: str) -> list[str]:
+    ids: list[str] = []
+    prefix = "## CHUNK id="
+    marker = " kind="
+    for line in user.splitlines():
+        if not line.startswith(prefix):
+            continue
+        rest = line[len(prefix) :]
+        if marker in rest:
+            ids.append(rest.split(marker, 1)[0])
+        else:
+            ids.append(rest.split()[0] if rest else "")
+    return ids
+
+
+def _map_chunks_json(
+    chunk_ids: list[str],
+    *,
+    findings: list[dict] | None = None,
+    contracts: list[dict] | None = None,
+    needs_context: list | None = None,
+) -> str:
+    items: list[dict] = []
+    for index, chunk_id in enumerate(chunk_ids):
+        items.append(
+            {
+                "chunk_id": chunk_id,
+                "findings": findings if index == 0 and findings else [],
+                "contracts": contracts if index == 0 and contracts else [],
+                "dependencies": [],
+                "needs_context": needs_context if index == 0 and needs_context else [],
+            }
+        )
+    return json.dumps({"chunks": items})
+
+
+def _finding(finding_id: str, body: str | None = None) -> Finding:
+    return Finding(
+        id=finding_id,
+        severity="MAJOR",
+        path="a.c",
+        side="RIGHT",
+        line=1,
+        body=body or f"defect {finding_id}",
+        confidence="LIKELY",
+    )
+
+
+def _reduce_payload_ids(user: str) -> list[str]:
+    data = json.loads(user[user.find("{") :])
+    return [item["id"] for item in data["findings"]]
 
 
 def _inputs(**overrides) -> CorpusInputs:
@@ -310,29 +370,21 @@ class PipelineTests(unittest.TestCase):
         def fake(system: str, user: str) -> str:
             calls.append(system[:40])
             if "merge-warden-map" in system:
-                return json.dumps(
-                    {
-                        "chunks": [
-                            {
-                                "chunk_id": corpus.reviewable_chunks[0].id,
-                                "findings": [
-                                    {
-                                        "id": "F1",
-                                        "severity": "MAJOR",
-                                        "path": "src/foo.c",
-                                        "side": "RIGHT",
-                                        "line": 1,
-                                        "body": "original evidence body",
-                                        "confidence": "CONFIRMED",
-                                        "evidence": [],
-                                    }
-                                ],
-                                "contracts": [{"id": "C1", "text": "owns_string means free"}],
-                                "dependencies": [],
-                                "needs_context": [],
-                            }
-                        ]
-                    }
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[
+                        {
+                            "id": "F1",
+                            "severity": "MAJOR",
+                            "path": "src/foo.c",
+                            "side": "RIGHT",
+                            "line": 1,
+                            "body": "original evidence body",
+                            "confidence": "CONFIRMED",
+                            "evidence": [],
+                        }
+                    ],
+                    contracts=[{"id": "C1", "text": "owns_string means free"}],
                 )
             if "merge-warden-reduce" in system:
                 return json.dumps({"keep": ["F1"], "reject": [], "merge": []})
@@ -397,61 +449,46 @@ class PipelineTests(unittest.TestCase):
         def fake(system: str, user: str) -> str:
             if "merge-warden-map" in system and "Context requests" not in user:
                 stages.append("map")
-                return json.dumps(
-                    {
-                        "chunks": [
-                            {
-                                "chunk_id": "ignored",
-                                "findings": [
-                                    {
-                                        "id": "F17",
-                                        "severity": "BLOCKING",
-                                        "path": "src/foo.c",
-                                        "side": "RIGHT",
-                                        "line": 1,
-                                        "body": "free of NativeResult string",
-                                        "confidence": "LIKELY",
-                                        "evidence": [],
-                                    }
-                                ],
-                                "contracts": [],
-                                "dependencies": [],
-                                "needs_context": [
-                                    {
-                                        "path": "stdrot_api.h",
-                                        "reason": "Need ownership contract for NativeResult",
-                                    }
-                                ],
-                            }
-                        ]
-                    }
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[
+                        {
+                            "id": "F17",
+                            "severity": "BLOCKING",
+                            "path": "src/foo.c",
+                            "side": "RIGHT",
+                            "line": 1,
+                            "body": "free of NativeResult string",
+                            "confidence": "LIKELY",
+                            "evidence": [],
+                        }
+                    ],
+                    needs_context=[
+                        {
+                            "path": "stdrot_api.h",
+                            "reason": "Need ownership contract for NativeResult",
+                        }
+                    ],
                 )
             if "Context requests" in user:
                 stages.append("validation")
                 self.assertIn("stdrot_api.h", user)
                 self.assertIn("NativeResult", user)
-                return json.dumps(
-                    {
-                        "chunks": [
-                            {
-                                "chunk_id": "val",
-                                "findings": [
-                                    {
-                                        "id": "F18",
-                                        "severity": "BLOCKING",
-                                        "path": "src/foo.c",
-                                        "line": 1,
-                                        "body": "owns_string is ignored before free",
-                                        "confidence": "CONFIRMED",
-                                    }
-                                ],
-                                "contracts": [
-                                    {"id": "C12", "text": "NativeResult owns strings when owns_string=true"}
-                                ],
-                                "needs_context": [],
-                            }
-                        ]
-                    }
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[
+                        {
+                            "id": "F18",
+                            "severity": "BLOCKING",
+                            "path": "src/foo.c",
+                            "line": 1,
+                            "body": "owns_string is ignored before free",
+                            "confidence": "CONFIRMED",
+                        }
+                    ],
+                    contracts=[
+                        {"id": "C12", "text": "NativeResult owns strings when owns_string=true"}
+                    ],
                 )
             if "merge-warden-reduce" in system:
                 stages.append("reduce")
@@ -498,7 +535,7 @@ class PipelineTests(unittest.TestCase):
                 ]
             }
         )
-        self.assertTrue(ingest_map_result(store, raw, batch, "M1"))
+        self.assertEqual(ingest_map_result(store, raw, batch, "M1"), {"diff:a:1"})
         self.assertEqual(len(store.findings), 2)
 
     def test_incomplete_coverage_body_lists_chunks(self) -> None:
@@ -509,6 +546,275 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("`D1`", body)
         review = findings_as_review(EvidenceStore(), body)
         self.assertEqual(review["event"], "COMMENT")
+
+
+class MapAcknowledgementTests(unittest.TestCase):
+    def test_partial_map_response_does_not_cover_entire_batch(self) -> None:
+        corpus = build_review_corpus(_inputs(diff="+ok\n", pr=_pr(body="small")))
+        reviewable = corpus.reviewable_chunks
+        self.assertGreaterEqual(len(reviewable), 2)
+        first_chunk = reviewable[0]
+        second_chunk = reviewable[1]
+        store = EvidenceStore()
+        raw = _map_chunks_json([first_chunk.id])
+        acknowledged = ingest_map_result(store, raw, reviewable, "M1")
+        self.assertEqual(acknowledged, {first_chunk.id})
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                # Acknowledge only the first supplied chunk, including on retry.
+                return _map_chunks_json([first_chunk.id])
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            raise AssertionError("synthesis must not run when coverage is incomplete")
+
+        review, coverage, _store, stats = run_hierarchical_review(
+            corpus=corpus,
+            synthesis_prompt="synth",
+            map_prompt="<!-- merge-warden-map -->",
+            reduce_prompt="<!-- merge-warden-reduce -->",
+            call_model=fake,
+            commentable_section="(none)\n",
+            max_map_request_chars=80_000,
+            max_reduce_request_chars=80_000,
+            map_overhead_chars=100,
+        )
+        self.assertFalse(coverage.complete)
+        self.assertIn(second_chunk.member_ids[0], coverage.uncovered_chunk_ids)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertIn("No approval decision was produced", review["body"])
+        self.assertGreaterEqual(stats.map_calls, 2)
+
+    def test_hallucinated_chunk_ids_do_not_count_toward_coverage(self) -> None:
+        batch = [
+            ContextChunk(id="chunk-1", kind="diff", source="a.c", text="+x\n"),
+            ContextChunk(id="chunk-2", kind="diff", source="b.c", text="+y\n"),
+        ]
+        store = EvidenceStore()
+        raw = json.dumps(
+            {
+                "chunks": [
+                    {
+                        "chunk_id": "definitely-not-a-real-chunk",
+                        "findings": [{"id": "F1", "body": "invented", "severity": "MAJOR"}],
+                    }
+                ]
+            }
+        )
+        acknowledged = ingest_map_result(store, raw, batch, "M1")
+        self.assertEqual(acknowledged, set())
+        self.assertEqual(store.findings, {})
+
+        corpus = build_review_corpus(_inputs(diff="+ok\n", pr=_pr(body="small")))
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                return json.dumps(
+                    {
+                        "chunks": [
+                            {
+                                "chunk_id": "definitely-not-a-real-chunk",
+                                "findings": [],
+                            }
+                        ]
+                    }
+                )
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            raise AssertionError("synthesis must not run when coverage is incomplete")
+
+        review, coverage, _store, _stats = run_hierarchical_review(
+            corpus=corpus,
+            synthesis_prompt="synth",
+            map_prompt="<!-- merge-warden-map -->",
+            reduce_prompt="<!-- merge-warden-reduce -->",
+            call_model=fake,
+            commentable_section="(none)\n",
+            max_map_request_chars=80_000,
+            max_reduce_request_chars=80_000,
+            map_overhead_chars=100,
+        )
+        self.assertFalse(coverage.complete)
+        self.assertTrue(coverage.uncovered_chunk_ids)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertIn("No approval decision was produced", review["body"])
+
+    def test_complete_acknowledgement_still_succeeds(self) -> None:
+        corpus = build_review_corpus(_inputs(diff="@@ -1 +1 @@\n-a\n+b\n"))
+        self.assertGreaterEqual(len(corpus.reviewable_chunks), 1)
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                ids = _chunk_ids_in_prompt(user)
+                self.assertTrue(ids)
+                return _map_chunks_json(ids)
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {
+                    "event": "COMMENT",
+                    "body": "# COMMENT\n\nNo defects.\n",
+                    "comments": [],
+                }
+            )
+
+        review, coverage, _store, stats = run_hierarchical_review(
+            corpus=corpus,
+            synthesis_prompt="synth",
+            map_prompt="<!-- merge-warden-map -->",
+            reduce_prompt="<!-- merge-warden-reduce -->",
+            call_model=fake,
+            commentable_section="(none)\n",
+            max_map_request_chars=80_000,
+            max_reduce_request_chars=80_000,
+            map_overhead_chars=100,
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_coalesced_chunk_acknowledgement_covers_member_ids(self) -> None:
+        coalesced = ContextChunk(
+            id="diff:foo:coalesced",
+            kind="diff",
+            source="foo.c",
+            text="+a\n+b\n",
+            member_ids=["diff:foo:1", "diff:foo:2"],
+        )
+        store = EvidenceStore()
+        raw = _map_chunks_json([coalesced.id])
+        acknowledged = ingest_map_result(store, raw, [coalesced], "M1")
+        self.assertEqual(acknowledged, {coalesced.id})
+
+        coverage = build_coverage([coalesced])
+        reset_uncovered(coverage, [coalesced])
+        analyzed = [chunk for chunk in [coalesced] if chunk.id in acknowledged]
+        mark_chunks_covered(coverage, analyzed)
+        self.assertTrue(coverage.complete)
+        self.assertNotIn("diff:foo:1", coverage.uncovered_chunk_ids)
+        self.assertNotIn("diff:foo:2", coverage.uncovered_chunk_ids)
+
+    def test_retry_can_cover_omitted_chunks(self) -> None:
+        corpus = build_review_corpus(_inputs(diff="+ok\n", pr=_pr(body="small")))
+        reviewable = corpus.reviewable_chunks
+        self.assertGreaterEqual(len(reviewable), 2)
+        first_id = reviewable[0].id
+        map_calls = {"n": 0}
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                map_calls["n"] += 1
+                ids = _chunk_ids_in_prompt(user)
+                if map_calls["n"] == 1:
+                    return _map_chunks_json([first_id])
+                return _map_chunks_json(ids)
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        review, coverage, _store, stats = run_hierarchical_review(
+            corpus=corpus,
+            synthesis_prompt="synth",
+            map_prompt="<!-- merge-warden-map -->",
+            reduce_prompt="<!-- merge-warden-reduce -->",
+            call_model=fake,
+            commentable_section="(none)\n",
+            max_map_request_chars=80_000,
+            max_reduce_request_chars=80_000,
+            map_overhead_chars=100,
+        )
+        self.assertTrue(coverage.complete)
+        self.assertGreaterEqual(stats.map_calls, 2)
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_malformed_map_response_covers_nothing(self) -> None:
+        batch = [ContextChunk(id="chunk-1", kind="diff", source="a.c", text="+x\n")]
+        self.assertIsNone(ingest_map_result(EvidenceStore(), "not json", batch, "M1"))
+
+
+class ReducerTerminationTests(unittest.TestCase):
+    def test_reducer_terminates_when_all_findings_survive(self) -> None:
+        store = EvidenceStore()
+        count = REDUCE_GROUP_SIZE * 2
+        for index in range(1, count + 1):
+            store.findings[f"F{index}"] = _finding(f"F{index}")
+        stats = PipelineStats()
+
+        def keep_all(_system: str, user: str) -> str:
+            ids = _reduce_payload_ids(user)
+            return json.dumps({"keep": ids, "reject": [], "merge": []})
+
+        hierarchical_reduce(store, "<!-- merge-warden-reduce -->", keep_all, 50_000, stats)
+        # Round 1: two groups. Round 2: same two groups, then fixed point.
+        self.assertEqual(stats.reduce_calls, 4)
+        self.assertEqual(
+            {item.id for item in store.kept_findings()},
+            {f"F{index}" for index in range(1, count + 1)},
+        )
+        self.assertTrue(any("fixed point" in note for note in stats.notes))
+
+    def test_reducer_still_merges_and_rejects(self) -> None:
+        store = EvidenceStore()
+        for index in range(1, 11):
+            store.findings[f"F{index}"] = _finding(f"F{index}")
+        stats = PipelineStats()
+
+        def fake(_system: str, user: str) -> str:
+            ids = _reduce_payload_ids(user)
+            if {"F1", "F2", "F3"}.issubset(ids):
+                return json.dumps(
+                    {
+                        "keep": [item for item in ids if item not in {"F1", "F2", "F3"}],
+                        "reject": [{"id": "F3", "reason": "contradicted"}],
+                        "merge": [{"ids": ["F1", "F2"], "canonical": "F1"}],
+                    }
+                )
+            return json.dumps({"keep": ids, "reject": [], "merge": []})
+
+        hierarchical_reduce(store, "<!-- merge-warden-reduce -->", fake, 50_000, stats)
+        kept_ids = {item.id for item in store.kept_findings()}
+        self.assertIn("F1", kept_ids)
+        self.assertNotIn("F2", kept_ids)
+        self.assertNotIn("F3", kept_ids)
+        self.assertEqual(store.merged_into.get("F2"), "F1")
+        self.assertIn("F3", store.rejected)
+        self.assertEqual(len(kept_ids), 8)
+        self.assertGreater(stats.reduce_calls, 0)
+        self.assertLess(stats.reduce_calls, 100)
+
+    def test_reducer_stops_at_max_rounds(self) -> None:
+        store = EvidenceStore()
+        count = REDUCE_GROUP_SIZE + MAX_REDUCE_ROUNDS + 1
+        for index in range(1, count + 1):
+            store.findings[f"F{index}"] = _finding(f"F{index}")
+        stats = PipelineStats()
+        previous_first = {"n": 0}
+
+        def shrink(_system: str, user: str) -> str:
+            ids = _reduce_payload_ids(user)
+            first_num = int(ids[0][1:])
+            new_round = previous_first["n"] == 0 or first_num <= previous_first["n"]
+            previous_first["n"] = first_num
+            if new_round:
+                return json.dumps(
+                    {
+                        "keep": ids[1:],
+                        "reject": [{"id": ids[0], "reason": "cap-test"}],
+                        "merge": [],
+                    }
+                )
+            return json.dumps({"keep": ids, "reject": [], "merge": []})
+
+        hierarchical_reduce(store, "<!-- merge-warden-reduce -->", shrink, 50_000, stats)
+        self.assertTrue(any("stopped after" in note for note in stats.notes))
+        self.assertLessEqual(stats.reduce_calls, MAX_REDUCE_ROUNDS * ((count + REDUCE_GROUP_SIZE - 1) // REDUCE_GROUP_SIZE))
+        self.assertGreater(stats.reduce_calls, 0)
+        kept = store.kept_findings()
+        self.assertTrue(kept)
+        self.assertGreater(len(kept), REDUCE_GROUP_SIZE)
+        self.assertLess(len(kept), count)
 
 
 class GenerateReviewPipelineTests(unittest.TestCase):
