@@ -25,12 +25,6 @@ Then tag a release (`v1`, `v1.0.0`). Consumers reference that repo:
 - uses: OWNER/merge-warden@v1
 ```
 
-Until you split it out, you can still call the in-tree copy:
-
-```yaml
-- uses: Brainrotlang/brainrot/.github/actions/merge-warden@main
-```
-
 ## Usage
 
 Repository secret `XAI_API_KEY` from https://console.x.ai/ is required.
