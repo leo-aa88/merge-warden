@@ -1,7 +1,6 @@
 name: Merge Warden
 description: >
-  Adversarial AI review of a pull request. Posts APPROVE, COMMENT, or
-  REQUEST CHANGES with inline comments on the diff. Run after CI, PR-only.
+  Adversarial AI review of a pull request.
 author: Leonardo Araujo
 
 branding:
