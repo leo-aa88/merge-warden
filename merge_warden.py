@@ -110,6 +110,62 @@ class CommandError(RuntimeError):
     pass
 
 
+def _maybe_json_object(raw: str) -> dict | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    candidates = [text]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        snippet = text[start : end + 1]
+        if snippet not in candidates:
+            candidates.append(snippet)
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def format_api_error_body(stdout: str, stderr: str) -> str:
+    stdout_text = (stdout or "").strip()
+    stderr_text = (stderr or "").strip()
+    for raw in (stdout_text, stderr_text):
+        parsed = _maybe_json_object(raw)
+        if parsed is None:
+            continue
+        formatted = _format_github_error(parsed)
+        if formatted:
+            return formatted
+    return "\n".join(part for part in (stderr_text, stdout_text) if part) or "command failed"
+
+
+def _format_github_error(data: dict) -> str:
+    parts: list[str] = []
+    status = data.get("status")
+    message = re.sub(r"\s+", " ", str(data.get("message") or "")).strip()
+    if status:
+        parts.append(str(status))
+    if message:
+        parts.append(message)
+    for error in data.get("errors") or []:
+        if isinstance(error, str) and error.strip():
+            parts.append(error.strip())
+            continue
+        if not isinstance(error, dict):
+            continue
+        location = error.get("field") or error.get("resource") or ""
+        detail = error.get("message") or error.get("code") or ""
+        piece = ": ".join(str(item) for item in (location, detail) if item)
+        if piece:
+            parts.append(piece)
+    return "\n".join(parts).strip()
+
+
 def run(
     args: list[str],
     *,
@@ -118,8 +174,8 @@ def run(
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(args, text=True, capture_output=True, input=input_text)
     if check and result.returncode != 0:
-        stderr = result.stderr.strip()
-        raise CommandError(f"{' '.join(args)} failed: {stderr or result.stdout.strip()}")
+        detail = format_api_error_body(result.stdout, result.stderr)
+        raise CommandError(f"{' '.join(args)} failed: {detail}")
     return result
 
 
@@ -146,7 +202,9 @@ def gh_api(method: str, path: str, payload: dict | None = None, paginate: bool =
 def gh_api_paginate_items(path: str) -> list[dict]:
     result = run(["gh", "api", "--paginate", path, "--jq", ".[]"], check=False)
     if result.returncode != 0:
-        raise CommandError(result.stderr.strip() or f"failed to paginate {path}")
+        raise CommandError(
+            format_api_error_body(result.stdout, result.stderr) or f"failed to paginate {path}"
+        )
     items: list[dict] = []
     for line in result.stdout.splitlines():
         line = line.strip()
@@ -847,7 +905,6 @@ def build_inline_comments(
             "path": item["path"],
             "side": item["side"],
             "line": item["line"],
-            "subject_type": "line",
             "body": format_inline_body(item["severity"], item["body"]),
         }
         for item in prepared
@@ -955,12 +1012,6 @@ def post_review(repo: str, pr_number: str, payload: dict) -> tuple[str, list[dic
                     )
                     break
                 if not attempt:
-                    break
-                if len(attempt) == 1:
-                    if current_event == "COMMENT":
-                        raise RuntimeError(
-                            f"Failed to post Merge Warden review: {last_error}"
-                        ) from exc
                     break
                 dropped = attempt.pop()
                 print(
