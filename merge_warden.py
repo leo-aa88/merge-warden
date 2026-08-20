@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge Warden: collect PR context, call Grok, post a GitHub review."""
+"""Merge Warden: collect PR context, call an LLM, post a GitHub review."""
 
 from __future__ import annotations
 
@@ -10,12 +10,49 @@ import re
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 MARKER = "<!-- merge-warden -->"
 XAI_URL = "https://api.x.ai/v1/chat/completions"
-DEFAULT_MODEL = "grok-4.6"
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+GEMINI_URL_TEMPLATE = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+)
+ANTHROPIC_VERSION = "2023-06-01"
+ANTHROPIC_MAX_TOKENS = 16384
+DEFAULT_PROVIDER = "xai"
+DEFAULT_MODELS = {
+    "xai": "grok-4.6",
+    "openai": "gpt-4.1",
+    "anthropic": "claude-sonnet-4-6",
+    "google": "gemini-2.5-pro",
+}
+PROVIDER_ALIASES = {
+    "xai": "xai",
+    "grok": "xai",
+    "openai": "openai",
+    "chatgpt": "openai",
+    "gpt": "openai",
+    "anthropic": "anthropic",
+    "claude": "anthropic",
+    "google": "google",
+    "gemini": "google",
+}
+PROVIDER_LABELS = {
+    "xai": "xAI",
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "google": "Gemini",
+}
+PROVIDER_KEY_ENVS = {
+    "xai": ("XAI_API_KEY",),
+    "openai": ("OPENAI_API_KEY",),
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "google": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+}
 MAX_REVIEW_CHARS = 60000
 MAX_USER_CHARS = 1_200_000
 MAX_FILE_CHARS = 120_000
@@ -442,46 +479,262 @@ def build_user_message(
     return truncate("\n".join(parts), MAX_USER_CHARS, "user message")
 
 
-def call_grok(system_prompt: str, user_message: str, model: str, api_key: str) -> str:
+def resolve_provider(raw: str) -> str:
+    key = (raw or DEFAULT_PROVIDER).strip().lower()
+    provider = PROVIDER_ALIASES.get(key)
+    if provider is None:
+        names = ", ".join(sorted(set(PROVIDER_ALIASES)))
+        raise RuntimeError(f"Unknown provider {raw!r}. Expected one of: {names}")
+    return provider
+
+
+def resolve_model(provider: str, raw: str) -> str:
+    model = (raw or "").strip()
+    if model:
+        return model
+    return DEFAULT_MODELS[provider]
+
+
+def resolve_api_key(provider: str) -> str:
+    for name in PROVIDER_KEY_ENVS[provider]:
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def missing_key_names(provider: str) -> str:
+    return " or ".join(PROVIDER_KEY_ENVS[provider])
+
+
+def http_post_json(
+    url: str,
+    payload: dict,
+    headers: dict[str, str],
+    *,
+    timeout: int = 600,
+    label: str = "API",
+) -> dict:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{label} HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"{label} request failed: {exc}") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{label} returned non-JSON: {raw[:2000]}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{label} JSON root must be an object: {raw[:2000]}")
+    return data
+
+
+def content_from_chat_completions(data: dict, label: str) -> str:
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"{label} returned no choices: {json.dumps(data)[:2000]}")
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+            elif isinstance(item, str):
+                parts.append(item)
+        content = "\n".join(parts)
+    if not content:
+        refusal = message.get("refusal") or data
+        raise RuntimeError(f"{label} returned empty content: {refusal}")
+    return str(content).strip()
+
+
+def content_from_anthropic(data: dict, label: str) -> str:
+    parts: list[str] = []
+    for block in data.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(str(block.get("text") or ""))
+    content = "\n".join(parts).strip()
+    if not content:
+        raise RuntimeError(f"{label} returned empty content: {json.dumps(data)[:2000]}")
+    return content
+
+
+def content_from_gemini(data: dict, label: str) -> str:
+    prompt_feedback = data.get("promptFeedback") or {}
+    block_reason = prompt_feedback.get("blockReason")
+    if block_reason:
+        raise RuntimeError(f"{label} blocked the prompt: {block_reason}")
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise RuntimeError(f"{label} returned no candidates: {json.dumps(data)[:2000]}")
+    content = candidates[0].get("content") or {}
+    parts: list[str] = []
+    for part in content.get("parts") or []:
+        if not isinstance(part, dict):
+            continue
+        if part.get("thought"):
+            continue
+        text = part.get("text")
+        if text:
+            parts.append(str(text))
+    joined = "\n".join(parts).strip()
+    if not joined:
+        finish = candidates[0].get("finishReason") or "unknown"
+        raise RuntimeError(f"{label} returned empty content (finishReason={finish})")
+    return joined
+
+
+def chat_completions_payload(
+    system_prompt: str,
+    user_message: str,
+    model: str,
+    extra: dict | None = None,
+) -> dict:
     payload = {
         "model": model,
         "temperature": 0.2,
-        "search_parameters": {"mode": "off"},
-        "prompt_cache_key": "merge-warden-v1",
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ],
     }
-    request = urllib.request.Request(
-        XAI_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def call_chat_completions(
+    url: str,
+    system_prompt: str,
+    user_message: str,
+    model: str,
+    api_key: str,
+    *,
+    extra: dict | None = None,
+    label: str,
+) -> str:
+    data = http_post_json(
+        url,
+        chat_completions_payload(system_prompt, user_message, model, extra),
+        {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
         },
+        label=label,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=600) as response:
-            raw = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Grok API HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Grok API request failed: {exc}") from exc
+    return content_from_chat_completions(data, label)
 
-    data = json.loads(raw)
-    choices = data.get("choices") or []
-    if not choices:
-        raise RuntimeError(f"Grok API returned no choices: {raw[:2000]}")
-    message = choices[0].get("message") or {}
-    content = message.get("content")
-    if not content:
-        refusal = message.get("refusal") or data
-        raise RuntimeError(f"Grok API returned empty content: {refusal}")
-    return content.strip()
+
+def anthropic_payload(system_prompt: str, user_message: str, model: str) -> dict:
+    return {
+        "model": model,
+        "max_tokens": ANTHROPIC_MAX_TOKENS,
+        "temperature": 0.2,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_message}],
+    }
+
+
+def call_anthropic(
+    system_prompt: str,
+    user_message: str,
+    model: str,
+    api_key: str,
+) -> str:
+    label = PROVIDER_LABELS["anthropic"]
+    data = http_post_json(
+        ANTHROPIC_URL,
+        anthropic_payload(system_prompt, user_message, model),
+        {
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+        },
+        label=label,
+    )
+    return content_from_anthropic(data, label)
+
+
+def gemini_url(model: str) -> str:
+    return GEMINI_URL_TEMPLATE.format(model=urllib.parse.quote(model, safe=".-"))
+
+
+def gemini_payload(system_prompt: str, user_message: str) -> dict:
+    return {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+        },
+    }
+
+
+def call_gemini(
+    system_prompt: str,
+    user_message: str,
+    model: str,
+    api_key: str,
+) -> str:
+    label = PROVIDER_LABELS["google"]
+    data = http_post_json(
+        gemini_url(model),
+        gemini_payload(system_prompt, user_message),
+        {
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
+        label=label,
+    )
+    return content_from_gemini(data, label)
+
+
+def call_model(
+    provider: str,
+    system_prompt: str,
+    user_message: str,
+    model: str,
+    api_key: str,
+) -> str:
+    label = PROVIDER_LABELS[provider]
+    if provider == "xai":
+        return call_chat_completions(
+            XAI_URL,
+            system_prompt,
+            user_message,
+            model,
+            api_key,
+            extra={
+                "search_parameters": {"mode": "off"},
+                "prompt_cache_key": "merge-warden-v1",
+            },
+            label=label,
+        )
+    if provider == "openai":
+        return call_chat_completions(
+            OPENAI_URL,
+            system_prompt,
+            user_message,
+            model,
+            api_key,
+            label=label,
+        )
+    if provider == "anthropic":
+        return call_anthropic(system_prompt, user_message, model, api_key)
+    if provider == "google":
+        return call_gemini(system_prompt, user_message, model, api_key)
+    raise RuntimeError(f"Unsupported provider {provider!r}")
 
 
 def parse_review_json(raw: str) -> dict:
@@ -493,10 +746,10 @@ def parse_review_json(raw: str) -> dict:
         start = text.find("{")
         end = text.rfind("}")
         if start == -1 or end == -1 or end <= start:
-            raise RuntimeError(f"Grok did not return JSON: {text[:2000]}") from None
+            raise RuntimeError(f"Model did not return JSON: {text[:2000]}") from None
         data = json.loads(text[start : end + 1])
     if not isinstance(data, dict):
-        raise RuntimeError("Grok JSON root must be an object")
+        raise RuntimeError("Model JSON root must be an object")
     return data
 
 
@@ -752,9 +1005,16 @@ def parse_args() -> argparse.Namespace:
         help="Local git ref pointing at the PR head",
     )
     parser.add_argument(
+        "--provider",
+        default=os.environ.get("MERGE_WARDEN_PROVIDER")
+        or os.environ.get("PROVIDER")
+        or DEFAULT_PROVIDER,
+        help="LLM provider (xai, openai, anthropic, google)",
+    )
+    parser.add_argument(
         "--model",
-        default=os.environ.get("XAI_MODEL", DEFAULT_MODEL),
-        help="Grok model name",
+        default=os.environ.get("MERGE_WARDEN_MODEL") or os.environ.get("XAI_MODEL") or "",
+        help="Model name (provider default if omitted)",
     )
     parser.add_argument(
         "--post-from",
@@ -769,10 +1029,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def generate_review(args: argparse.Namespace, repo: str) -> int:
-    api_key = os.environ.get("XAI_API_KEY", "")
+    provider = resolve_provider(args.provider)
+    model = resolve_model(provider, args.model)
+    api_key = resolve_api_key(provider)
     if not api_key:
         print(
-            "::warning::XAI_API_KEY secret is not set; skipping Merge Warden.",
+            f"::warning::{missing_key_names(provider)} secret is not set; "
+            "skipping Merge Warden.",
             file=sys.stderr,
         )
         return 0
@@ -808,7 +1071,8 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
         head_ref=args.head_ref,
         commentable=commentable,
     )
-    raw = call_grok(system_prompt, user_message, args.model, api_key)
+    print(f"Calling {PROVIDER_LABELS[provider]} ({model})")
+    raw = call_model(provider, system_prompt, user_message, model, api_key)
     review = parse_review_json(raw)
     comments = build_inline_comments(review, commentable)
     head_sha = pr.get("headRefOid") or ""

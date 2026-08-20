@@ -13,9 +13,30 @@ inputs:
     description: Token with contents read, issues read, and pull-requests write.
     required: false
     default: ${{ github.token }}
+  provider:
+    description: >
+      LLM provider: xai (grok), openai (chatgpt), anthropic (claude),
+      or google (gemini).
+    required: false
+    default: xai
   xai-api-key:
-    description: xAI API key (https://console.x.ai/).
-    required: true
+    description: xAI API key (https://console.x.ai/). Required when provider is xai.
+    required: false
+    default: ""
+  openai-api-key:
+    description: OpenAI API key (https://platform.openai.com/). Required when provider is openai.
+    required: false
+    default: ""
+  anthropic-api-key:
+    description: Anthropic API key (https://console.anthropic.com/). Required when provider is anthropic.
+    required: false
+    default: ""
+  google-api-key:
+    description: >
+      Google AI Studio / Gemini API key (https://aistudio.google.com/).
+      Required when provider is google. GEMINI_API_KEY is also accepted.
+    required: false
+    default: ""
   pr-number:
     description: Pull request number to review.
     required: true
@@ -26,9 +47,11 @@ inputs:
     required: false
     default: ""
   model:
-    description: Grok model name.
+    description: >
+      Model name. Empty uses the provider default (grok-4.6, gpt-4.1,
+      claude-sonnet-4-6, or gemini-2.5-pro).
     required: false
-    default: grok-4.6
+    default: ""
   arch-docs:
     description: >
       Newline- or comma-separated paths (on the checked-out default branch)
@@ -88,8 +111,13 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.github-token }}
         GITHUB_REPOSITORY: ${{ github.repository }}
+        MERGE_WARDEN_PROVIDER: ${{ inputs.provider }}
+        MERGE_WARDEN_MODEL: ${{ inputs.model }}
         XAI_API_KEY: ${{ inputs.xai-api-key }}
         XAI_MODEL: ${{ inputs.model }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        GOOGLE_API_KEY: ${{ inputs.google-api-key }}
         ARCH_DOCS: ${{ inputs.arch-docs }}
         SKIP_NAMES: ${{ inputs.skip-names }}
         PR_NUMBER: ${{ inputs.pr-number }}
@@ -110,6 +138,8 @@ runs:
         fi
         python3 "${ACTION_PATH}/merge_warden.py" \
           --pr "${PR_NUMBER}" \
+          --provider "${MERGE_WARDEN_PROVIDER:-xai}" \
+          --model "${MERGE_WARDEN_MODEL:-}" \
           --prompt-file "${prompt}" \
           --output merge-warden.md \
           --json-output merge-warden.json \
