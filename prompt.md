@@ -526,6 +526,8 @@ They are punctuation for the review, not substitutes for analysis.
 
 Every reaction face must still be anchored to a real, demonstrated technical defect or contradiction.
 
+DO NOT USE "—"
+
 
 ---
 
