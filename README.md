@@ -18,28 +18,17 @@ Pass `model` to override the default. Gemini also accepts `GEMINI_API_KEY`.
 Run it **after CI passes**, and **only on pull requests**. The action does not
 trigger itself — wrap it in a workflow in the consuming repo.
 
-## Publish this as its own repository
-
-Marketplace / `uses: OWNER/REPO@v1` requires `action.yml` at the **repository
-root**. Copy these files into a new public repo:
-
-```
-action.yml
-merge_warden.py
-prompt.md
-README.md
-```
-
-Then tag a release (`v1`, `v1.0.0`). Consumers reference that repo:
-
 ```yaml
-- uses: OWNER/merge-warden@v1
+- uses: leo-aa88/merge-warden@v1
 ```
 
 ## Usage
 
 Set the API key secret for the provider you choose. Existing Grok workflows
 keep working: `provider` defaults to `xai`.
+
+A missing provider API key **fails the job**. Set `skip-if-missing-key: true`
+only if the review should be optional.
 
 ### After another workflow succeeds (recommended)
 
@@ -107,12 +96,15 @@ provider default, or set it to a specific model id.
     pr-number: ${{ steps.pr.outputs.number }}
 ```
 
-### Same-repo reusable workflow
+## GitHub review events
 
-This repository also exposes `.github/workflows/merge-warden.yml`
-(`workflow_call`). That wrapper resolves `uses: ./.github/actions/merge-warden`,
-which only works when the **caller** is this repo. After you publish a
-dedicated action repo, prefer the composite action snippet above.
+Merge Warden may *generate* `APPROVE`, `COMMENT`, or `REQUEST_CHANGES`.
+`GITHUB_TOKEN` cannot approve pull requests unless the repository enables
+[Allow GitHub Actions to create and approve pull requests](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository).
+
+If GitHub rejects `APPROVE` or `REQUEST_CHANGES`, the action posts a `COMMENT`
+instead of failing. Use `generated-event` / `posted-event` (and the matching
+comment-count outputs) rather than assuming the generated event was published.
 
 ## Inputs
 
@@ -132,9 +124,7 @@ dedicated action repo, prefer the composite action snippet above.
 | `head-ref` | no | `pr-head` | Local ref for the fetched PR head |
 | `fetch-head` | no | `true` | Fetch `pull/{n}/head` |
 | `post` | no | `true` | Post the GitHub review |
-
-If the selected provider's API key is unset, the action skips the review
-instead of failing the job.
+| `skip-if-missing-key` | no | `false` | Skip instead of failing when the provider key is unset |
 
 The action never executes PR code. It checks out the default branch (caller
 must `actions/checkout`), fetches the PR head as a git ref, and reads files
@@ -144,9 +134,14 @@ with `git show`.
 
 - `markdown-path` — `merge-warden.md`
 - `json-path` — `merge-warden.json`
-- `comment-count` — inline comments in the payload
-- `event` — `APPROVE`, `COMMENT`, or `REQUEST_CHANGES`
+- `generated-event` — event the model produced
+- `generated-comment-count` — inline comments before GitHub accepts the review
+- `posted-event` — event GitHub accepted (empty when `post` is false)
+- `posted-comment-count` — inline comments GitHub accepted (empty when `post` is false)
+- `event` — `posted-event` when posting, otherwise `generated-event`
+- `comment-count` — `posted-comment-count` when posting, otherwise `generated-comment-count`
 
 Injected after the system prompt: architectural docs, issue bodies, PR
 description, complete diff, commentable line map, and numbered changed-file
-contents.
+contents. That material is treated as untrusted data, not as instructions to
+the reviewer.
