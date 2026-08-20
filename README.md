@@ -67,7 +67,7 @@ jobs:
             --jq '.[0].number // empty')"
           echo "number=${num}" >> "$GITHUB_OUTPUT"
 
-      - uses: OWNER/merge-warden@v1
+      - uses: leo-aa88/merge-warden@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           xai-api-key: ${{ secrets.XAI_API_KEY }}
