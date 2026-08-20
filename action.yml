@@ -82,6 +82,13 @@ inputs:
       failing the job.
     required: false
     default: "false"
+  expected-head-sha:
+    description: >
+      Expected PR head SHA, typically workflow_run.head_sha. When set, skip
+      the review (and skip posting) if the PR head or fetched ref is no
+      longer this commit.
+    required: false
+    default: ""
 
 outputs:
   markdown-path:
@@ -141,6 +148,7 @@ runs:
         HEAD_REF: ${{ inputs.head-ref }}
         POST: ${{ inputs.post }}
         SKIP_IF_MISSING_KEY: ${{ inputs.skip-if-missing-key }}
+        EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
         PROMPT_FILE: ${{ inputs.prompt-file }}
         ACTION_PATH: ${{ github.action_path }}
       shell: bash
@@ -156,6 +164,9 @@ runs:
         fi
         if [ "${SKIP_IF_MISSING_KEY}" = "true" ]; then
           extra+=(--skip-if-missing-key)
+        fi
+        if [ -n "${EXPECTED_HEAD_SHA:-}" ]; then
+          extra+=(--expected-head-sha "${EXPECTED_HEAD_SHA}")
         fi
         python3 "${ACTION_PATH}/merge_warden.py" \
           --pr "${PR_NUMBER}" \

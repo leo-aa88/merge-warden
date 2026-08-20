@@ -75,6 +75,7 @@ MAX_FILE_CHARS = 120_000
 MAX_DIFF_CHARS = 250_000
 MAX_COMMENTS = 25
 MAX_COMMENT_CHARS = 8000
+MAX_LINKED_ISSUES = 20
 RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
 HTTP_ATTEMPTS = 3
 HTTP_TIMEOUT_SECONDS = 300
@@ -440,6 +441,8 @@ def collect_issue_bodies(repo: str, pr_body: str, closing: list[dict]) -> str:
             seen.add(number)
             unique.append(number)
 
+    omitted = max(len(unique) - MAX_LINKED_ISSUES, 0)
+    unique = unique[:MAX_LINKED_ISSUES]
     if not unique:
         return "(no linked issues found)\n"
 
@@ -470,7 +473,13 @@ def collect_issue_bodies(repo: str, pr_body: str, closing: list[dict]) -> str:
             f"Labels: {labels or '(none)'}\n\n"
             f"{body}\n"
         )
-    return "\n".join(sections)
+    text = "\n".join(sections)
+    if omitted:
+        text += (
+            f"\n[{omitted} additional linked issue(s) omitted; "
+            f"capped at {MAX_LINKED_ISSUES}.]\n"
+        )
+    return text
 
 
 def collect_pr_files(repo: str, pr_number: str) -> list[dict]:
@@ -1207,6 +1216,55 @@ def post_review(repo: str, pr_number: str, payload: dict) -> tuple[str, list[dic
     raise RuntimeError(f"Failed to post Merge Warden review: {last_error}")
 
 
+def normalize_sha(value: str | None) -> str:
+    return (value or "").strip().lower()
+
+
+def shas_equal(left: str | None, right: str | None) -> bool:
+    a = normalize_sha(left)
+    b = normalize_sha(right)
+    return bool(a) and a == b
+
+
+def local_head_sha(head_ref: str) -> str:
+    result = run(["git", "rev-parse", head_ref], check=False)
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def current_pr_head_oid(repo: str, pr_number: str) -> str:
+    data = gh_json(
+        ["pr", "view", str(pr_number), "--repo", repo, "--json", "headRefOid"]
+    )
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("headRefOid") or "").strip()
+
+
+def skip_stale_workflow_run(
+    expected: str,
+    actual: str,
+    *,
+    fetched: bool = False,
+) -> bool:
+    if not normalize_sha(expected) or shas_equal(expected, actual):
+        return False
+    if fetched:
+        print(
+            f"::notice::Skipping stale workflow_run: "
+            f"expected {expected}, fetched {actual}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"::notice::Skipping stale workflow_run: "
+            f"CI passed {expected}, PR is now at {actual}",
+            file=sys.stderr,
+        )
+    return True
+
+
 def parse_bool(raw: str | None, default: bool = False) -> bool:
     if raw is None or str(raw).strip() == "":
         return default
@@ -1291,6 +1349,11 @@ def parse_args() -> argparse.Namespace:
         default=parse_bool(os.environ.get("SKIP_IF_MISSING_KEY")),
         help="Skip the review instead of failing when the provider API key is unset",
     )
+    parser.add_argument(
+        "--expected-head-sha",
+        default=os.environ.get("EXPECTED_HEAD_SHA") or "",
+        help="Skip if the PR head is no longer this SHA (workflow_run.head_sha)",
+    )
     return parser.parse_args()
 
 
@@ -1328,6 +1391,15 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
     if not isinstance(pr, dict):
         print(f"Could not load PR #{args.pr}", file=sys.stderr)
         return 1
+
+    expected = (getattr(args, "expected_head_sha", None) or "").strip()
+    actual = str(pr.get("headRefOid") or "").strip()
+    if skip_stale_workflow_run(expected, actual):
+        return 0
+    if expected:
+        fetched = local_head_sha(args.head_ref)
+        if fetched and skip_stale_workflow_run(expected, fetched, fetched=True):
+            return 0
     files = collect_pr_files(repo, args.pr)
     commentable = commentable_by_path(files)
     diff_result = run(["gh", "pr", "diff", args.pr, "--repo", repo], check=False)
@@ -1367,6 +1439,18 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
     posted_event: str | None = None
     posted_comments: list[dict] | None = None
     if args.post:
+        if expected and skip_stale_workflow_run(
+            expected, current_pr_head_oid(repo, args.pr)
+        ):
+            write_action_outputs(
+                markdown_path=args.output,
+                json_path=args.json_output,
+                generated_event=event,
+                generated_comment_count=len(comments),
+                posted_event=None,
+                posted_comment_count=None,
+            )
+            return 0
         posted_event, posted_comments = post_review(repo, args.pr, payload)
         Path(args.output).write_text(
             render_markdown(
@@ -1398,6 +1482,11 @@ def main() -> int:
 
     if args.post_from:
         payload = json.loads(Path(args.post_from).read_text(encoding="utf-8"))
+        expected = (getattr(args, "expected_head_sha", None) or "").strip()
+        if expected and skip_stale_workflow_run(
+            expected, current_pr_head_oid(repo, args.pr)
+        ):
+            return 0
         posted_event, posted_comments = post_review(repo, args.pr, payload)
         write_action_outputs(
             markdown_path="",
