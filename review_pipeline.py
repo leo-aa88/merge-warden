@@ -252,6 +252,7 @@ class PipelineStats:
     chunks: int = 0
     total_chars: int = 0
     coverage_complete: bool = False
+    deadline_exhausted: bool = False
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -276,6 +277,7 @@ class PipelineStats:
 
     def footer(self) -> str:
         coverage = "complete" if self.coverage_complete else "incomplete"
+        deadline = ", deadline exhausted" if self.deadline_exhausted else ""
         return (
             f"_Merge Warden context pipeline: {self.chunks} chunk(s), "
             f"{self.batches} planned map batch(es), "
@@ -284,7 +286,7 @@ class PipelineStats:
             f"{self.map_chunks_acknowledged}/{self.chunks} primary chunks acknowledged, "
             f"{self.validation_calls} validation call(s), "
             f"{self.reduce_calls} reduce call(s), {self.synthesis_calls} synthesis call(s), "
-            f"coverage {coverage}._"
+            f"coverage {coverage}{deadline}._"
         )
 
 
@@ -334,6 +336,10 @@ class RequestPlan:
 
 class RequestTooLarge(RuntimeError):
     """A serialized model request exceeded the configured character budget."""
+
+
+class PipelineDeadlineExceeded(RuntimeError):
+    """The caller's wall-clock review budget was exhausted."""
 
 
 def sanitize_failure_note(note: str, *, max_chars: int = 240) -> str:
@@ -391,6 +397,60 @@ def _incomplete_preamble(
         total=total_members,
         failure_notes=compact_failure_notes(stats.notes),
     )
+
+
+def _deadline_preamble(
+    corpus: ReviewCorpus,
+    coverage: CoverageReport,
+    stats: PipelineStats,
+) -> str:
+    notice = (
+        "Merge Warden exhausted its internal wall-clock review deadline and "
+        "stopped before the outer CI timeout could kill the process."
+    )
+    if not all_reviewable_context_covered(coverage):
+        base = _incomplete_preamble(corpus, coverage, stats)
+        return base.replace("# COMMENT\n\n", f"# COMMENT\n\n{notice}\n\n", 1)
+    return (
+        "# COMMENT\n\n"
+        f"{notice}\n\n"
+        "Primary context coverage reached 100%, but validation, reduction, "
+        "or final synthesis did not finish within the review budget.\n\n"
+        "No approval decision was produced.\n"
+    )
+
+
+def _preserve_unresolved_findings(store: EvidenceStore) -> None:
+    """Keep every surviving finding when deadline interrupts reduction."""
+    for finding_id in store.findings:
+        canonical = store.resolve_canonical(finding_id)
+        if canonical in store.findings and canonical not in store.rejected:
+            store.kept.add(canonical)
+
+
+def _deadline_result(
+    *,
+    corpus: ReviewCorpus,
+    coverage: CoverageReport,
+    store: EvidenceStore,
+    stats: PipelineStats,
+    analyzed: list[ContextChunk],
+    error: PipelineDeadlineExceeded,
+) -> tuple[dict, CoverageReport, EvidenceStore, PipelineStats]:
+    # A deadline can interrupt a map sub-batch before it returns its local
+    # acknowledgement list. Under-reporting that sub-batch is intentional:
+    # deadline degradation must be conservative, never optimistic.
+    mark_chunks_covered(coverage, analyzed)
+    stats.map_chunks_acknowledged = len(analyzed)
+    stats.map_chunks_uncovered = max(stats.chunks - len(analyzed), 0)
+    stats.coverage_complete = all_reviewable_context_covered(coverage)
+    stats.deadline_exhausted = True
+    note = sanitize_failure_note(f"review deadline exhausted: {error}")
+    if note and note not in stats.notes:
+        stats.notes.append(note)
+    _preserve_unresolved_findings(store)
+    review = findings_as_review(store, _deadline_preamble(corpus, coverage, stats))
+    return review, coverage, store, stats
 
 
 def load_prompt(path: Path | str) -> str:
@@ -1070,6 +1130,8 @@ def hierarchical_reduce(
                 continue
             try:
                 raw = _call(call_model, reduce_prompt, payload, stats, "reduce")
+            except PipelineDeadlineExceeded:
+                raise
             except Exception as exc:  # pragma: no cover - defensive
                 stats.notes.append(f"reduce call failed ({exc}); keeping original findings")
                 for item in group:
@@ -1181,6 +1243,8 @@ def execute_map_request(
             sanitize_failure_note(f"map batch {batch_tag} failed: {exc}")
         )
         return MapAttemptResult(acknowledged=[], missing=missing)
+    except PipelineDeadlineExceeded:
+        raise
     except Exception as exc:
         stats.map_provider_failures += 1
         stats.notes.append(
@@ -1467,6 +1531,8 @@ def run_validation_pass(
                         "validation",
                         max_chars=max_request_chars,
                     )
+                except PipelineDeadlineExceeded:
+                    raise
                 except Exception as exc:
                     stats.notes.append(f"validation for {path} failed: {exc}")
                     continue
@@ -1538,37 +1604,57 @@ def run_hierarchical_review(
     analyzed: list[ContextChunk] = []
 
     for index, batch in enumerate(packed, 1):
-        analyzed.extend(
-            _run_map_batch(
-                corpus=corpus,
-                batch=batch,
-                store=store,
-                map_prompt=map_prompt,
-                call_model=call_model,
-                stats=stats,
-                batch_tag=f"{index}/{len(packed)}",
-                max_request_chars=max_map_request_chars,
+        try:
+            analyzed.extend(
+                _run_map_batch(
+                    corpus=corpus,
+                    batch=batch,
+                    store=store,
+                    map_prompt=map_prompt,
+                    call_model=call_model,
+                    stats=stats,
+                    batch_tag=f"{index}/{len(packed)}",
+                    max_request_chars=max_map_request_chars,
+                )
             )
-        )
+        except PipelineDeadlineExceeded as exc:
+            return _deadline_result(
+                corpus=corpus,
+                coverage=coverage,
+                store=store,
+                stats=stats,
+                analyzed=analyzed,
+                error=exc,
+            )
 
     mark_chunks_covered(coverage, analyzed)
     stats.map_chunks_acknowledged = len(analyzed)
     stats.map_chunks_uncovered = max(stats.chunks - len(analyzed), 0)
-    run_validation_pass(
-        corpus,
-        store,
-        map_prompt,
-        call_model,
-        max_map_request_chars,
-        stats,
-    )
-    hierarchical_reduce(
-        store,
-        reduce_prompt,
-        call_model,
-        max_reduce_request_chars,
-        stats,
-    )
+    try:
+        run_validation_pass(
+            corpus,
+            store,
+            map_prompt,
+            call_model,
+            max_map_request_chars,
+            stats,
+        )
+        hierarchical_reduce(
+            store,
+            reduce_prompt,
+            call_model,
+            max_reduce_request_chars,
+            stats,
+        )
+    except PipelineDeadlineExceeded as exc:
+        return _deadline_result(
+            corpus=corpus,
+            coverage=coverage,
+            store=store,
+            stats=stats,
+            analyzed=analyzed,
+            error=exc,
+        )
     stats.coverage_complete = all_reviewable_context_covered(coverage)
 
     if not all_reviewable_context_covered(coverage):
@@ -1596,7 +1682,17 @@ def run_hierarchical_review(
         )
         return review, coverage, store, stats
 
-    raw = _call(call_model, synthesis_prompt, synthesis_message, stats, "synthesis")
+    try:
+        raw = _call(call_model, synthesis_prompt, synthesis_message, stats, "synthesis")
+    except PipelineDeadlineExceeded as exc:
+        return _deadline_result(
+            corpus=corpus,
+            coverage=coverage,
+            store=store,
+            stats=stats,
+            analyzed=analyzed,
+            error=exc,
+        )
     parsed = _maybe_json_object(raw)
     if parsed is None:
         raise RuntimeError(f"Model did not return JSON: {(raw or '')[:2000]}")

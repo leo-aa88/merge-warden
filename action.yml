@@ -89,6 +89,19 @@ inputs:
       longer this commit.
     required: false
     default: ""
+  review-timeout-seconds:
+    description: >
+      Internal wall-clock budget for the review. Merge Warden stops provider
+      work before this expires and fail-closes instead of waiting for the
+      outer GitHub Actions timeout.
+    required: false
+    default: "900"
+  shutdown-reserve-seconds:
+    description: >
+      Portion of review-timeout-seconds reserved for writing outputs and
+      posting the GitHub review after provider work stops.
+    required: false
+    default: "60"
 
 outputs:
   markdown-path:
@@ -149,6 +162,8 @@ runs:
         POST: ${{ inputs.post }}
         SKIP_IF_MISSING_KEY: ${{ inputs.skip-if-missing-key }}
         EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
+        REVIEW_TIMEOUT_SECONDS: ${{ inputs.review-timeout-seconds }}
+        SHUTDOWN_RESERVE_SECONDS: ${{ inputs.shutdown-reserve-seconds }}
         PROMPT_FILE: ${{ inputs.prompt-file }}
         ACTION_PATH: ${{ github.action_path }}
       shell: bash
@@ -168,7 +183,7 @@ runs:
         if [ -n "${EXPECTED_HEAD_SHA:-}" ]; then
           extra+=(--expected-head-sha "${EXPECTED_HEAD_SHA}")
         fi
-        python3 "${ACTION_PATH}/merge_warden.py" \
+        python3 -u "${ACTION_PATH}/merge_warden.py" \
           --pr "${PR_NUMBER}" \
           --provider "${MERGE_WARDEN_PROVIDER:-xai}" \
           --model "${MERGE_WARDEN_MODEL:-}" \
@@ -176,4 +191,6 @@ runs:
           --output merge-warden.md \
           --json-output merge-warden.json \
           --head-ref "${HEAD_REF}" \
+          --review-timeout-seconds "${REVIEW_TIMEOUT_SECONDS}" \
+          --shutdown-reserve-seconds "${SHUTDOWN_RESERVE_SECONDS}" \
           "${extra[@]}"

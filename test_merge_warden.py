@@ -545,7 +545,7 @@ class ActionOutputTests(unittest.TestCase):
                                 with mock.patch.object(
                                     mw,
                                     "call_model",
-                                    side_effect=lambda _p, system, user, _m, _k: _pipeline_model_response(
+                                    side_effect=lambda _p, system, user, _m, _k, **_kwargs: _pipeline_model_response(
                                         system,
                                         user,
                                         {
@@ -641,7 +641,7 @@ class StaleHeadTests(unittest.TestCase):
                                     with mock.patch.object(
                                         mw,
                                         "call_model",
-                                        side_effect=lambda _p, system, user, _m, _k: _pipeline_model_response(
+                                        side_effect=lambda _p, system, user, _m, _k, **_kwargs: _pipeline_model_response(
                                             system, user
                                         ),
                                     ):
@@ -679,7 +679,7 @@ class StaleHeadTests(unittest.TestCase):
                                     with mock.patch.object(
                                         mw,
                                         "call_model",
-                                        side_effect=lambda _p, system, user, _m, _k: _pipeline_model_response(
+                                        side_effect=lambda _p, system, user, _m, _k, **_kwargs: _pipeline_model_response(
                                             system, user
                                         ),
                                     ) as call_model:
@@ -850,6 +850,56 @@ class HttpPostRetryTests(unittest.TestCase):
         self.assertEqual(data, {"ok": True})
 
 
+class ReviewDeadlineTests(unittest.TestCase):
+    def _response(self, body: bytes = b'{"ok": true}'):
+        response = mock.Mock()
+        response.read.return_value = body
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        return response
+
+    def test_compute_review_deadlines_reserves_shutdown_time(self) -> None:
+        hard, provider = mw.compute_review_deadlines(900, 60, now=100.0)
+        self.assertEqual(hard, 1000.0)
+        self.assertEqual(provider, 940.0)
+
+    def test_invalid_review_deadline_configuration_is_rejected(self) -> None:
+        with self.assertRaises(RuntimeError):
+            mw.compute_review_deadlines(60, 60, now=0.0)
+        with self.assertRaises(RuntimeError):
+            mw.compute_review_deadlines(60, -1, now=0.0)
+
+    def test_http_timeout_is_clamped_to_remaining_deadline(self) -> None:
+        response = self._response()
+        with mock.patch("urllib.request.urlopen", return_value=response) as urlopen:
+            with mock.patch.object(mw.time, "monotonic", side_effect=[100.0, 100.5]):
+                data = mw.http_post_json(
+                    "https://example.test/v1",
+                    {"a": 1},
+                    {"h": "v"},
+                    timeout=300,
+                    deadline=110.0,
+                )
+        self.assertEqual(data, {"ok": True})
+        self.assertAlmostEqual(urlopen.call_args.kwargs["timeout"], 10.0)
+
+    def test_retry_is_refused_when_backoff_would_cross_deadline(self) -> None:
+        error = urllib.error.URLError("timed out")
+        with mock.patch("urllib.request.urlopen", side_effect=error) as urlopen:
+            with mock.patch.object(mw.time, "monotonic", side_effect=[100.0, 100.4]):
+                with mock.patch("time.sleep") as sleep:
+                    with self.assertRaises(mw.RequestDeadlineExceeded):
+                        mw.http_post_json(
+                            "https://example.test/v1",
+                            {"a": 1},
+                            {"h": "v"},
+                            attempts=3,
+                            deadline=100.5,
+                        )
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+
+
 class PromptBudgetTests(unittest.TestCase):
     def test_request_budgets_are_per_call_not_source_truncation(self) -> None:
         self.assertEqual(mw.MAX_MAP_REQUEST_CHARS, 225_000)
@@ -908,6 +958,7 @@ class PromptInjectionTests(unittest.TestCase):
             user_message: str,
             model: str,
             api_key: str,
+            **_kwargs,
         ) -> str:
             captured["system"].append(system_prompt)
             captured["user"].append(user_message)
