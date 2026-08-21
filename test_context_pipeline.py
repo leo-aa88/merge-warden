@@ -15,6 +15,9 @@ from unittest import mock
 import merge_warden as mw
 import review_pipeline as rp
 from context_pipeline import (
+    DEFAULT_ARCH_COALESCE_CHARS,
+    DEFAULT_MAX_SINGLE_CHUNK_CHARS,
+    MAX_FAILURE_NOTES_IN_REVIEW,
     ContextChunk,
     CorpusInputs,
     ReviewCorpus,
@@ -32,6 +35,9 @@ from context_pipeline import (
     split_text_by_lines,
 )
 from review_pipeline import (
+    MAP_MISSING_CHUNK_RETRIES,
+    MAX_MAP_ATTEMPTS,
+    MAX_MAP_CHUNKS_PER_CALL,
     MAX_REDUCE_ROUNDS,
     MAX_VALIDATION_CALLS,
     REDUCE_GROUP_SIZE,
@@ -50,6 +56,7 @@ from review_pipeline import (
     ingest_map_result,
     plan_requests,
     run_hierarchical_review,
+    sanitize_failure_note,
 )
 
 FOO_MAP_CHUNK = "diff:src/foo.c:1"
@@ -2304,6 +2311,45 @@ class RequestPlannerTests(unittest.TestCase):
         self.assertEqual(plan.batches, [])
         self.assertEqual([item.id for item in plan.oversized], ["too-big"])
 
+    def test_plan_requests_respects_map_chunk_count_limit(self) -> None:
+        chunks = [_chunk(f"C{i}", "tiny.c", "tiny") for i in range(25)]
+
+        def render(batch: list[ContextChunk]) -> str:
+            return "HDR" + "".join(item.text for item in batch)
+
+        plan = plan_requests(chunks, render, 10_000, max_chunks=MAX_MAP_CHUNKS_PER_CALL)
+        sizes = [len(batch.chunks) for batch in plan.batches]
+        self.assertEqual(sizes, [8, 8, 8, 1])
+        self.assertEqual(MAX_MAP_CHUNKS_PER_CALL, 8)
+        packed = [item for batch in plan.batches for item in batch.chunks]
+        self.assertEqual([chunk.id for chunk in packed], [chunk.id for chunk in chunks])
+        self.assertFalse(plan.oversized)
+        for batch in plan.batches:
+            self.assertLessEqual(len(batch.chunks), MAX_MAP_CHUNKS_PER_CALL)
+            self.assertLessEqual(batch.chars, 10_000)
+            self.assertEqual(batch.message, render(batch.chunks))
+
+    def test_plan_requests_character_limit_still_applies_with_fanout(self) -> None:
+        chunks = [
+            _chunk("C1", "a.c", "X" * 40),
+            _chunk("C2", "b.c", "Y" * 40),
+        ]
+
+        def render(batch: list[ContextChunk]) -> str:
+            return "".join(item.text for item in batch)
+
+        limit = 50
+        self.assertLess(2, MAX_MAP_CHUNKS_PER_CALL)
+        self.assertGreater(len(render(chunks)), limit)
+        self.assertLessEqual(len(render([chunks[0]])), limit)
+        self.assertLessEqual(len(render([chunks[1]])), limit)
+        plan = plan_requests(chunks, render, limit, max_chunks=MAX_MAP_CHUNKS_PER_CALL)
+        self.assertEqual([len(batch.chunks) for batch in plan.batches], [1, 1])
+        self.assertFalse(plan.oversized)
+        for batch in plan.batches:
+            self.assertLessEqual(batch.chars, limit)
+            self.assertLessEqual(len(batch.chunks), MAX_MAP_CHUNKS_PER_CALL)
+
 
 class SerializedRequestBudgetTests(unittest.TestCase):
     def _run(self, corpus: ReviewCorpus, recorder: _ReviewRecorder, **kwargs):
@@ -2715,6 +2761,582 @@ class SerializedRequestBudgetTests(unittest.TestCase):
         self.assertEqual(review["event"], "COMMENT")
         self.assertIn("No approval decision was produced", review["body"])
         self.assertIn("could not complete a full review", review["body"])
+
+
+def _tiny_chunks(count: int, prefix: str = "C") -> list[ContextChunk]:
+    return [
+        _chunk(f"{prefix}{index}", f"{prefix.lower()}{index}.c", f"tiny-{index}")
+        for index in range(1, count + 1)
+    ]
+
+
+def _heading_doc(title: str, sections: int, filler: str = "body") -> str:
+    parts = [
+        f"# {title} {index}\n{filler} {index}\n" for index in range(1, sections + 1)
+    ]
+    return "\n".join(parts)
+
+
+class MapFanoutAndDegradationTests(unittest.TestCase):
+    def _run(self, corpus: ReviewCorpus, fake, **kwargs):
+        return _run_hierarchical(corpus, fake, **kwargs)
+
+    def _ack_model(self, handler):
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                if "Context requests" in user:
+                    return _map_chunks_json(_chunk_ids_in_prompt(user))
+                return handler(user)
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        return fake
+
+    def test_non_json_map_response_is_retried(self) -> None:
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        state = {"n": 0}
+
+        def handler(user: str) -> str:
+            state["n"] += 1
+            if state["n"] == 1:
+                return "not json"
+            return _map_chunks_json(_chunk_ids_in_prompt(user))
+
+        review, coverage, _store, stats = self._run(corpus, self._ack_model(handler))
+        self.assertTrue(coverage.complete)
+        self.assertEqual(coverage.uncovered_chunk_ids, [])
+        self.assertGreaterEqual(stats.map_attempts, 2)
+        self.assertEqual(stats.map_non_json_responses, 1)
+        self.assertEqual(stats.map_calls_succeeded, 1)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(MAP_MISSING_CHUNK_RETRIES, 1)
+
+    def test_non_json_multi_chunk_response_degrades_batch(self) -> None:
+        chunks = _tiny_chunks(4)
+        corpus = _synthetic_corpus(chunks)
+        seen_sizes: list[int] = []
+
+        def handler(user: str) -> str:
+            ids = _chunk_ids_in_prompt(user)
+            seen_sizes.append(len(ids))
+            if len(ids) >= 4:
+                return "definitely not JSON {"
+            return _map_chunks_json(ids)
+
+        _review, coverage, _store, stats = self._run(corpus, self._ack_model(handler))
+        self.assertTrue(coverage.complete)
+        self.assertIn(4, seen_sizes)
+        self.assertTrue(any(size == 2 for size in seen_sizes))
+        self.assertGreaterEqual(stats.map_batches_split, 1)
+        self.assertGreaterEqual(stats.map_non_json_responses, 1)
+        self.assertEqual({chunk.id for chunk in chunks} - set(coverage.uncovered_chunk_ids), {chunk.id for chunk in chunks})
+
+    def test_provider_exception_degrades_batch(self) -> None:
+        chunks = _tiny_chunks(4)
+        corpus = _synthetic_corpus(chunks)
+        calls = {"n": 0}
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system and "Context requests" not in user:
+                ids = _chunk_ids_in_prompt(user)
+                calls["n"] += 1
+                if len(ids) >= 4:
+                    raise RuntimeError("provider unavailable")
+                return _map_chunks_json(ids)
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps({"event": "COMMENT", "body": "# COMMENT\n", "comments": []})
+
+        _review, coverage, _store, stats = self._run(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertGreaterEqual(stats.map_provider_failures, 1)
+        self.assertEqual(stats.map_attempts, calls["n"])
+        self.assertGreater(stats.map_calls_succeeded, 0)
+
+    def test_zero_acknowledgement_degrades_batch(self) -> None:
+        chunks = _tiny_chunks(4)
+        corpus = _synthetic_corpus(chunks)
+        empty_batches = {"n": 0}
+
+        def handler(user: str) -> str:
+            ids = _chunk_ids_in_prompt(user)
+            if len(ids) >= 4:
+                empty_batches["n"] += 1
+                return json.dumps({"chunks": []})
+            return _map_chunks_json(ids)
+
+        _review, coverage, _store, stats = self._run(corpus, self._ack_model(handler))
+        self.assertTrue(coverage.complete)
+        self.assertGreaterEqual(empty_batches["n"], 1)
+        self.assertGreaterEqual(stats.map_batches_split, 1)
+        self.assertTrue(any("acknowledged 0/" in note for note in stats.notes))
+
+    def test_hallucinated_only_acknowledgement_degrades_batch(self) -> None:
+        chunks = _tiny_chunks(2)
+        corpus = _synthetic_corpus(chunks)
+        hallucinated = {"n": 0}
+
+        def handler(user: str) -> str:
+            ids = _chunk_ids_in_prompt(user)
+            if len(ids) > 1:
+                hallucinated["n"] += 1
+                return _map_chunks_json(["NOT_REAL"])
+            return _map_chunks_json(ids)
+
+        _review, coverage, _store, stats = self._run(corpus, self._ack_model(handler))
+        self.assertTrue(coverage.complete)
+        self.assertGreaterEqual(hallucinated["n"], 1)
+        self.assertGreaterEqual(stats.map_batches_split, 1)
+        self.assertNotIn("NOT_REAL", coverage.uncovered_chunk_ids)
+
+    def test_partial_acknowledgement_retries_only_missing_chunks(self) -> None:
+        chunks = _tiny_chunks(4)
+        corpus = _synthetic_corpus(chunks)
+        requests: list[list[str]] = []
+
+        def handler(user: str) -> str:
+            ids = _chunk_ids_in_prompt(user)
+            requests.append(ids)
+            if len(ids) >= 4:
+                return _map_chunks_json(ids[:3])
+            return _map_chunks_json(ids)
+
+        _review, coverage, _store, stats = self._run(corpus, self._ack_model(handler))
+        self.assertTrue(coverage.complete)
+        self.assertGreaterEqual(len(requests), 2)
+        self.assertEqual(set(requests[0]), {chunk.id for chunk in chunks})
+        later = [item for batch in requests[1:] for item in batch]
+        self.assertEqual(set(later), {"C4"})
+        self.assertNotIn("C1", later)
+        self.assertNotIn("C2", later)
+        self.assertNotIn("C3", later)
+        self.assertGreaterEqual(stats.map_partial_responses, 1)
+
+    def test_successful_partial_evidence_is_preserved(self) -> None:
+        chunks = _tiny_chunks(2)
+        corpus = _synthetic_corpus(chunks)
+        requests: list[list[str]] = []
+
+        def handler(user: str) -> str:
+            ids = _chunk_ids_in_prompt(user)
+            requests.append(ids)
+            if "C1" in ids and "C2" in ids:
+                return _map_chunks_json(
+                    ["C1"],
+                    findings=[
+                        {
+                            "id": "F1",
+                            "severity": "MAJOR",
+                            "path": "c1.c",
+                            "body": "from C1 only",
+                            "confidence": "LIKELY",
+                        }
+                    ],
+                )
+            return _map_chunks_json(ids)
+
+        _review, coverage, store, _stats = self._run(corpus, self._ack_model(handler))
+        self.assertTrue(coverage.complete)
+        finding = _by_local_id(store, "F1")
+        self.assertEqual(finding.body, "from C1 only")
+        self.assertEqual(sum(batch.count("C1") for batch in requests), 1)
+        later = [item for batch in requests[1:] for item in batch]
+        self.assertNotIn("C1", later)
+        self.assertIn("C2", later)
+
+    def test_single_pathological_chunk_does_not_poison_siblings(self) -> None:
+        chunks = _tiny_chunks(4)
+        corpus = _synthetic_corpus(chunks)
+
+        def handler(user: str) -> str:
+            ids = _chunk_ids_in_prompt(user)
+            if "C3" in ids:
+                return "not json"
+            return _map_chunks_json(ids)
+
+        review, coverage, _store, stats = self._run(corpus, self._ack_model(handler))
+        self.assertFalse(coverage.complete)
+        self.assertEqual(coverage.uncovered_chunk_ids, ["C3"])
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertIn("1 context chunk(s)", review["body"])
+        self.assertNotIn("`C1`", review["body"])
+        self.assertIn("`C3`", review["body"])
+        self.assertIn("No approval decision was produced", review["body"])
+        self.assertEqual(stats.map_chunks_acknowledged, 3)
+        self.assertEqual(stats.map_chunks_uncovered, 1)
+        self.assertEqual(stats.synthesis_calls, 0)
+
+    def test_map_attempt_cap_is_global(self) -> None:
+        chunks = _tiny_chunks(8)
+        corpus = _synthetic_corpus(chunks)
+
+        def boom(_system: str, _user: str) -> str:
+            raise RuntimeError("always fail")
+
+        with mock.patch.object(rp, "MAX_MAP_ATTEMPTS", 5):
+            review, coverage, _store, stats = self._run(corpus, boom)
+        self.assertEqual(stats.map_attempts, 5)
+        self.assertLessEqual(stats.map_attempts, 5)
+        self.assertEqual(stats.map_calls_succeeded, 0)
+        self.assertFalse(coverage.complete)
+        self.assertEqual(len(coverage.uncovered_chunk_ids), 8)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertTrue(any("attempt budget exhausted" in note for note in stats.notes))
+
+    def test_provider_failures_count_as_attempts(self) -> None:
+        chunks = _tiny_chunks(2)
+        corpus = _synthetic_corpus(chunks)
+        calls = {"n": 0}
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system and "Context requests" not in user:
+                calls["n"] += 1
+                raise RuntimeError("nope")
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            raise AssertionError("synthesis must not run")
+
+        with mock.patch.object(rp, "MAX_MAP_ATTEMPTS", 3):
+            _review, _coverage, _store, stats = self._run(corpus, fake)
+        self.assertEqual(stats.map_attempts, calls["n"])
+        self.assertEqual(stats.map_attempts, stats.map_provider_failures)
+        self.assertEqual(stats.map_calls_succeeded, 0)
+
+    def test_malformed_responses_count_as_attempts(self) -> None:
+        chunks = _tiny_chunks(2)
+        corpus = _synthetic_corpus(chunks)
+
+        def handler(_user: str) -> str:
+            return "still not json"
+
+        with mock.patch.object(rp, "MAX_MAP_ATTEMPTS", 3):
+            _review, _coverage, _store, stats = self._run(
+                corpus, self._ack_model(handler)
+            )
+        self.assertEqual(stats.map_attempts, stats.map_non_json_responses)
+        self.assertEqual(stats.map_calls_succeeded, 0)
+        self.assertLessEqual(stats.map_attempts, 3)
+
+    def test_internal_http_retries_do_not_multiply_logical_attempts(self) -> None:
+        """HTTP retries inside one call_model() are one logical map attempt."""
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        counts = {"calls": 0, "http": 0}
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system and "Context requests" not in user:
+                counts["calls"] += 1
+                counts["http"] += 3
+                return _map_chunks_json(_chunk_ids_in_prompt(user))
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps({"event": "COMMENT", "body": "# COMMENT\n", "comments": []})
+
+        _review, coverage, _store, stats = self._run(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(counts["calls"], 1)
+        self.assertEqual(counts["http"], 3)
+        self.assertEqual(stats.map_attempts, 1)
+        self.assertEqual(stats.map_calls, 1)
+
+    def test_architecture_document_sections_coalesce_without_losing_ids(self) -> None:
+        text = _heading_doc("Readme", 21)
+        corpus = build_review_corpus(
+            _inputs(arch_docs=[("README.md", text)], diff="+ok\n")
+        )
+        arch = [
+            chunk
+            for chunk in corpus.reviewable_chunks
+            if chunk.kind == "arch" and chunk.source == "README.md"
+        ]
+        self.assertEqual(len(arch), 1)
+        members = arch[0].member_ids
+        self.assertGreaterEqual(len(members), 21)
+        self.assertTrue(all(item.startswith("arch:README.md:") for item in members))
+        self.assertLessEqual(arch[0].size, DEFAULT_MAX_SINGLE_CHUNK_CHARS)
+        self.assertLessEqual(arch[0].size, DEFAULT_ARCH_COALESCE_CHARS)
+
+        recorder = _ReviewRecorder()
+        review, coverage, _store, _stats = self._run(corpus, recorder)
+        self.assertTrue(coverage.complete)
+        for member_id in members:
+            self.assertNotIn(member_id, coverage.uncovered_chunk_ids)
+        supplied = [
+            chunk_id
+            for message in recorder.map_messages
+            for chunk_id in _chunk_ids_in_prompt(message)
+        ]
+        self.assertIn(arch[0].id, supplied)
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_architecture_coalesce_respects_max_single_chunk_size(self) -> None:
+        limit = 220
+        text = _heading_doc("Readme", 12, filler="x" * 40)
+        corpus = build_review_corpus(
+            _inputs(arch_docs=[("README.md", text)]),
+            max_single_chunk_chars=limit,
+        )
+        arch = [chunk for chunk in corpus.chunks if chunk.kind == "arch"]
+        self.assertGreater(len(arch), 1)
+        for chunk in arch:
+            self.assertLessEqual(chunk.size, limit)
+        members = [member for chunk in arch for member in chunk.member_ids]
+        self.assertGreaterEqual(len(members), 12)
+
+    def test_changed_code_chunks_remain_independent_of_arch_coalesce(self) -> None:
+        diff = (
+            "diff --git a/src/a.c b/src/a.c\n"
+            "--- a/src/a.c\n"
+            "+++ b/src/a.c\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old-a\n"
+            "+new-a\n"
+            "diff --git a/src/b.c b/src/b.c\n"
+            "--- a/src/b.c\n"
+            "+++ b/src/b.c\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old-b\n"
+            "+new-b\n"
+        )
+        text = _heading_doc("Guide", 12)
+        corpus = build_review_corpus(
+            _inputs(
+                arch_docs=[("CONTRIBUTING.md", text)],
+                diff=diff,
+                files=[
+                    {"filename": "src/a.c", "status": "modified", "additions": 1, "deletions": 1},
+                    {"filename": "src/b.c", "status": "modified", "additions": 1, "deletions": 1},
+                ],
+                file_contents={"src/a.c": "int a;\n", "src/b.c": "int b;\n"},
+            )
+        )
+        diff_chunks = [chunk for chunk in corpus.reviewable_chunks if chunk.kind == "diff"]
+        sources = {chunk.source for chunk in diff_chunks}
+        self.assertIn("src/a.c", sources)
+        self.assertIn("src/b.c", sources)
+        self.assertFalse(
+            any("|" in chunk.source and chunk.kind == "diff" for chunk in corpus.reviewable_chunks)
+        )
+        file_chunks = [chunk for chunk in corpus.reviewable_chunks if chunk.kind == "file"]
+        self.assertTrue(any(chunk.source == "src/a.c" for chunk in file_chunks))
+        self.assertTrue(any(chunk.source == "src/b.c" for chunk in file_chunks))
+
+    def test_failure_diagnostics_appear_in_incomplete_review(self) -> None:
+        chunks = _tiny_chunks(10)
+        corpus = _synthetic_corpus(chunks)
+        fail = {"C9", "C10"}
+
+        def handler(user: str) -> str:
+            ids = _chunk_ids_in_prompt(user)
+            if any(chunk_id in fail for chunk_id in ids):
+                return "not json"
+            return _map_chunks_json(ids)
+
+        review, coverage, _store, stats = self._run(corpus, self._ack_model(handler))
+        self.assertFalse(coverage.complete)
+        self.assertEqual(set(coverage.uncovered_chunk_ids), fail)
+        self.assertIn("8 / 10 context chunks analyzed", review["body"])
+        self.assertIn("Map failures:", review["body"])
+        self.assertIn("non-JSON", review["body"])
+        self.assertIn("No approval decision was produced", review["body"])
+        self.assertIn("planned map batch", stats.footer())
+        self.assertIn("map attempt", stats.footer())
+        self.assertIn("8/10 primary chunks acknowledged", stats.footer())
+        self.assertIn("coverage incomplete", stats.footer())
+
+    def test_failure_diagnostics_are_bounded(self) -> None:
+        chunks = _tiny_chunks(1)
+        corpus = _synthetic_corpus(chunks)
+
+        def handler(_user: str) -> str:
+            return "not json"
+
+        _review, _coverage, _store, stats = self._run(corpus, self._ack_model(handler))
+        stats.notes = [f"map batch synthetic:{index} returned non-JSON evidence" for index in range(200)]
+        body = incomplete_coverage_body(
+            corpus.coverage,
+            analyzed=0,
+            total=1,
+            failure_notes=stats.notes,
+        )
+        self.assertEqual(MAX_FAILURE_NOTES_IN_REVIEW, 10)
+        self.assertLessEqual(body.count("map batch synthetic:"), MAX_FAILURE_NOTES_IN_REVIEW)
+        self.assertIn("… 190 more", body)
+        self.assertNotIn("map batch synthetic:50", body)
+
+    def test_provider_error_bodies_are_not_exposed(self) -> None:
+        chunks = _tiny_chunks(1)
+        corpus = _synthetic_corpus(chunks)
+        secret = "Authorization: Bearer SECRET_TOKEN_ABC"
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system and "Context requests" not in user:
+                raise RuntimeError(secret + " raw-provider-body " + ("Z" * 4000))
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            raise AssertionError("synthesis must not run")
+
+        review, coverage, _store, stats = self._run(corpus, fake)
+        self.assertFalse(coverage.complete)
+        self.assertNotIn("SECRET_TOKEN_ABC", review["body"])
+        self.assertNotIn("Bearer SECRET", review["body"])
+        self.assertNotIn("Z" * 200, review["body"])
+        joined = "\n".join(stats.notes)
+        self.assertNotIn("SECRET_TOKEN_ABC", joined)
+        self.assertIn("[redacted]", sanitize_failure_note(secret))
+
+    def test_complete_coverage_still_permits_synthesis(self) -> None:
+        chunks = _tiny_chunks(20)
+        corpus = _synthetic_corpus(chunks)
+        recorder = _ReviewRecorder(synthesis_event="APPROVE", synthesis_body="# APPROVE\n")
+        review, coverage, _store, stats = self._run(corpus, recorder)
+        self.assertTrue(coverage.complete)
+        self.assertGreater(stats.batches, 1)
+        self.assertGreaterEqual(stats.map_attempts, 3)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertEqual(review["event"], "APPROVE")
+        for message in recorder.map_messages:
+            self.assertLessEqual(len(_chunk_ids_in_prompt(message)), MAX_MAP_CHUNKS_PER_CALL)
+
+    def test_incomplete_coverage_still_cannot_approve(self) -> None:
+        chunks = _tiny_chunks(3)
+        corpus = _synthetic_corpus(chunks)
+
+        def handler(user: str) -> str:
+            ids = _chunk_ids_in_prompt(user)
+            if "C3" in ids:
+                return "not json"
+            return _map_chunks_json(ids)
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system and "Context requests" not in user:
+                return handler(user)
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "APPROVE", "body": "# APPROVE\n\nLooks good.\n", "comments": []}
+            )
+
+        review, coverage, _store, stats = self._run(corpus, fake)
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertNotIn("# APPROVE", review["body"])
+        self.assertEqual(stats.synthesis_calls, 0)
+
+    def test_tail_sentinel_is_mapped_or_explicitly_uncovered(self) -> None:
+        sentinel = "TAIL_SENTINEL_123"
+        chunks = _tiny_chunks(5)
+        chunks[-1] = _chunk("C5", "c5.c", f"tiny-5\n{sentinel}\n")
+        corpus = _synthetic_corpus(chunks)
+        recorder = _ReviewRecorder()
+        _review, coverage, _store, _stats = self._run(corpus, recorder)
+        joined = "\n".join(recorder.map_messages)
+        self.assertTrue(coverage.complete)
+        self.assertIn(sentinel, joined)
+        self.assertIn(sentinel, chunks[-1].text)
+
+    def test_validation_is_not_bound_by_map_chunk_fanout(self) -> None:
+        map_chunk = _chunk(
+            "diff:src/foo.c:1",
+            "src/foo.c",
+            '+#include "include/foo.h"\n',
+            kind="diff",
+        )
+        matching = [
+            _chunk(
+                f"file:include/foo.h:{index}",
+                "include/foo.h",
+                f"/* part {index} */\nint field_{index};\n",
+            )
+            for index in range(1, 11)
+        ]
+        corpus = _synthetic_corpus([map_chunk, *matching])
+        recorder = _ReviewRecorder(
+            findings=[_likely_foo_finding()],
+            needs_context=[{"path": "include/foo.h", "reason": "cross-context check"}],
+        )
+        _review, coverage, _store, stats = self._run(corpus, recorder)
+        self.assertTrue(coverage.complete)
+        self.assertTrue(recorder.validation_messages)
+        self.assertGreater(len(matching), MAX_MAP_CHUNKS_PER_CALL)
+        self.assertGreaterEqual(
+            max(len(_chunk_ids_in_prompt(message)) for message in recorder.validation_messages),
+            MAX_MAP_CHUNKS_PER_CALL + 1,
+        )
+        self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
+
+    def test_brainrot_shaped_small_chunk_corpus_recovers(self) -> None:
+        arch_docs = [
+            ("AGENTS.md", _heading_doc("Agent", 18)),
+            ("CONTRIBUTING.md", _heading_doc("Contributing", 21)),
+            ("README.md", _heading_doc("Readme", 16)),
+        ]
+        files = [
+            {
+                "filename": f"src/mod_{index}.c",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 0,
+            }
+            for index in range(1, 9)
+        ]
+        file_contents = {
+            item["filename"]: f"int f_{item['filename']}(void) {{ return 1; }}\n"
+            for item in files
+        }
+        file_contents["src/mod_8.c"] += "TAIL_SENTINEL_123\n"
+        diff_parts = []
+        for item in files:
+            path = item["filename"]
+            diff_parts.append(
+                f"diff --git a/{path} b/{path}\n"
+                f"--- a/{path}\n"
+                f"+++ b/{path}\n"
+                f"@@ -1,0 +1,1 @@\n"
+                f"+int f_{path}(void) {{ return 1; }}\n"
+            )
+        corpus = build_review_corpus(
+            _inputs(
+                pr=_pr(body=_heading_doc("PR", 6, filler="change")),
+                arch_docs=arch_docs,
+                files=files,
+                file_contents=file_contents,
+                diff="".join(diff_parts),
+            )
+        )
+        member_ids = [
+            member
+            for chunk in corpus.reviewable_chunks
+            for member in chunk.member_ids
+        ]
+        self.assertGreaterEqual(len(member_ids), 60)
+        self.assertLessEqual(len(member_ids), 90)
+        self.assertGreater(len(corpus.reviewable_chunks), MAX_MAP_CHUNKS_PER_CALL)
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                ids = _chunk_ids_in_prompt(user)
+                if "Context requests" in user:
+                    return _map_chunks_json(ids)
+                self.assertLessEqual(len(ids), MAX_MAP_CHUNKS_PER_CALL)
+                if len(ids) > MAX_MAP_CHUNKS_PER_CALL:
+                    return "not json"
+                return _map_chunks_json(ids)
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        review, coverage, _store, stats = self._run(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertLessEqual(stats.map_attempts, MAX_MAP_ATTEMPTS)
+        self.assertGreater(stats.batches, 1)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertIn("TAIL_SENTINEL_123", "\n".join(chunk.text for chunk in corpus.reviewable_chunks))
 
 
 class GenerateReviewPipelineTests(unittest.TestCase):
