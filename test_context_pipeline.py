@@ -7,6 +7,8 @@ import argparse
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -35,14 +37,17 @@ from context_pipeline import (
     split_text_by_lines,
 )
 from review_pipeline import (
+    DEFAULT_MAP_CONCURRENCY,
     MAP_MISSING_CHUNK_RETRIES,
     MAX_MAP_ATTEMPTS,
     MAX_MAP_CHUNKS_PER_CALL,
+    MAX_MAP_CONCURRENCY,
     MAX_REDUCE_ROUNDS,
     MAX_VALIDATION_CALLS,
     REDUCE_GROUP_SIZE,
     SYNTHESIS_SUFFIX,
     VALIDATION_MISSING_CHUNK_RETRIES,
+    VALIDATION_STAGE_TOKEN,
     EvidenceStore,
     Finding,
     PipelineDeadlineExceeded,
@@ -55,6 +60,7 @@ from review_pipeline import (
     format_validation_user_message,
     hierarchical_reduce,
     ingest_map_result,
+    normalize_map_concurrency,
     plan_requests,
     run_hierarchical_review,
     sanitize_failure_note,
@@ -213,16 +219,20 @@ class _ReviewRecorder:
         self.needs_context = needs_context
         self.synthesis_event = synthesis_event
         self.synthesis_body = synthesis_body
+        self._lock = threading.Lock()
 
     def __call__(self, system: str, user: str) -> str:
         if "merge-warden-map" in system:
             ids = _chunk_ids_in_prompt(user)
-            if "Context requests" in user:
-                self.validation_messages.append(user)
+            if "Context requests" in user or VALIDATION_STAGE_TOKEN in user:
+                with self._lock:
+                    self.validation_messages.append(user)
                 return _map_chunks_json(ids)
-            self.map_messages.append(user)
             extras: dict = {}
-            if not self.map_messages[1:]:
+            with self._lock:
+                first = not self.map_messages
+                self.map_messages.append(user)
+            if first:
                 if self.findings:
                     extras["findings"] = self.findings
                 if self.needs_context:
@@ -3400,6 +3410,199 @@ class MapFanoutAndDegradationTests(unittest.TestCase):
         self.assertEqual(stats.synthesis_calls, 1)
         self.assertEqual(review["event"], "COMMENT")
         self.assertIn("TAIL_SENTINEL_123", "\n".join(chunk.text for chunk in corpus.reviewable_chunks))
+
+
+class ParallelMapSchedulerTests(unittest.TestCase):
+    def _run(self, corpus: ReviewCorpus, fake, **kwargs):
+        return _run_hierarchical(corpus, fake, **kwargs)
+
+    def _pipeline(self, handler):
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                if "Context requests" in user or VALIDATION_STAGE_TOKEN in user:
+                    return _map_chunks_json(_chunk_ids_in_prompt(user))
+                return handler(user)
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        return fake
+
+    def test_normalize_map_concurrency_clamps_to_conservative_bounds(self) -> None:
+        self.assertEqual(DEFAULT_MAP_CONCURRENCY, 4)
+        self.assertEqual(MAX_MAP_CONCURRENCY, 8)
+        self.assertEqual(normalize_map_concurrency(None), 4)
+        self.assertEqual(normalize_map_concurrency(1), 1)
+        self.assertEqual(normalize_map_concurrency(4), 4)
+        self.assertEqual(normalize_map_concurrency(100), 8)
+        self.assertEqual(normalize_map_concurrency(0), 1)
+        self.assertEqual(normalize_map_concurrency(-3), 1)
+
+    def test_validation_user_message_carries_stage_token(self) -> None:
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        message = format_validation_user_message(
+            corpus,
+            [],
+            corpus.reviewable_chunks,
+            [],
+        )
+        self.assertIn(f"<!-- {VALIDATION_STAGE_TOKEN} -->", message)
+        self.assertTrue(message.lstrip().startswith(rp.UNTRUSTED_CONTEXT_BANNER[:20]))
+
+    def test_independent_map_calls_overlap(self) -> None:
+        corpus = _synthetic_corpus(_tiny_chunks(24))
+        barrier = threading.Barrier(3, timeout=5)
+        overlapped = {"ok": False, "error": None}
+
+        def handler(user: str) -> str:
+            ids = _chunk_ids_in_prompt(user)
+            try:
+                barrier.wait()
+                overlapped["ok"] = True
+            except threading.BrokenBarrierError as exc:
+                overlapped["error"] = exc
+            return _map_chunks_json(ids)
+
+        review, coverage, _store, stats = self._run(
+            corpus, self._pipeline(handler), map_concurrency=4
+        )
+        self.assertTrue(coverage.complete)
+        self.assertGreaterEqual(stats.batches, 3)
+        self.assertTrue(overlapped["ok"])
+        self.assertIsNone(overlapped["error"])
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_concurrency_never_exceeds_configured_limit(self) -> None:
+        corpus = _synthetic_corpus(_tiny_chunks(32))
+        current = 0
+        max_inflight = 0
+        lock = threading.Lock()
+
+        def handler(user: str) -> str:
+            nonlocal current, max_inflight
+            with lock:
+                current += 1
+                max_inflight = max(max_inflight, current)
+            time.sleep(0.05)
+            with lock:
+                current -= 1
+            return _map_chunks_json(_chunk_ids_in_prompt(user))
+
+        _review, coverage, _store, stats = self._run(
+            corpus, self._pipeline(handler), map_concurrency=2
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(max_inflight, 2)
+        self.assertGreaterEqual(stats.batches, 4)
+        self.assertLessEqual(current, 0)
+
+    def test_results_are_ingested_in_sequence_order(self) -> None:
+        corpus = _synthetic_corpus(_tiny_chunks(24))
+        first_gate = threading.Event()
+        later = threading.Barrier(2, timeout=5)
+        recorded_later = threading.Barrier(2, timeout=5)
+        completion: list[str] = []
+        lock = threading.Lock()
+
+        def handler(user: str) -> str:
+            ids = _chunk_ids_in_prompt(user)
+            lead = ids[0]
+            payload = _map_chunks_json(
+                ids,
+                needs_context=[{"path": f"from-{lead}", "reason": "order"}],
+            )
+            if lead == "C1":
+                if not first_gate.wait(timeout=5):
+                    raise AssertionError("first batch was not released")
+                with lock:
+                    completion.append(lead)
+                return payload
+            later.wait()
+            with lock:
+                completion.append(lead)
+            recorded_later.wait()
+            if lead == "C17":
+                first_gate.set()
+            return payload
+
+        _review, coverage, store, _stats = self._run(
+            corpus, self._pipeline(handler), map_concurrency=4
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(set(completion[:2]), {"C9", "C17"})
+        self.assertEqual(completion[-1], "C1")
+        self.assertEqual(
+            [need.path for need in store.needs_context],
+            ["from-C1", "from-C9", "from-C17"],
+        )
+
+    def test_deadline_stops_scheduling_new_batches(self) -> None:
+        corpus = _synthetic_corpus(_tiny_chunks(64))
+        calls: list[list[str]] = []
+        lock = threading.Lock()
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system and VALIDATION_STAGE_TOKEN not in user:
+                with lock:
+                    calls.append(_chunk_ids_in_prompt(user))
+                raise PipelineDeadlineExceeded("provider cutoff reached during map")
+            raise AssertionError("no later pipeline stage should run")
+
+        review, coverage, _store, stats = self._run(
+            corpus, fake, map_concurrency=4
+        )
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(stats.map_attempts, 4)
+        self.assertEqual(stats.map_batches_split, 0)
+        self.assertTrue(stats.deadline_exhausted)
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertIn("wall-clock review deadline", review["body"])
+
+    def test_deadline_does_not_trigger_retry_or_split_storm(self) -> None:
+        corpus = _synthetic_corpus(_tiny_chunks(24))
+        calls = {"n": 0}
+        lock = threading.Lock()
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system and VALIDATION_STAGE_TOKEN not in user:
+                with lock:
+                    calls["n"] += 1
+                raise PipelineDeadlineExceeded("provider cutoff reached during map")
+            raise AssertionError("no later pipeline stage should run")
+
+        _review, _coverage, _store, stats = self._run(
+            corpus, fake, map_concurrency=4
+        )
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(stats.map_attempts, 3)
+        self.assertEqual(stats.map_batches_split, 0)
+        self.assertEqual(stats.map_calls_succeeded, 0)
+        self.assertTrue(stats.deadline_exhausted)
+
+    def test_failed_batch_does_not_poison_successful_siblings(self) -> None:
+        corpus = _synthetic_corpus(_tiny_chunks(16))
+        poison = {f"C{index}" for index in range(9, 17)}
+
+        def handler(user: str) -> str:
+            ids = _chunk_ids_in_prompt(user)
+            if poison.intersection(ids):
+                raise RuntimeError("provider unavailable for sibling batch")
+            return _map_chunks_json(ids)
+
+        review, coverage, _store, stats = self._run(
+            corpus, self._pipeline(handler), map_concurrency=4
+        )
+        self.assertFalse(coverage.complete)
+        self.assertEqual(set(coverage.uncovered_chunk_ids), poison)
+        self.assertEqual(stats.map_chunks_acknowledged, 8)
+        self.assertGreaterEqual(stats.map_provider_failures, 1)
+        self.assertGreater(stats.map_calls_succeeded, 0)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertIn("`C9`", review["body"])
+        self.assertNotIn("`C1`", review["body"])
 
 
 class GenerateReviewPipelineTests(unittest.TestCase):
