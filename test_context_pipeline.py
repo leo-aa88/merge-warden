@@ -128,15 +128,20 @@ def _finding(
     body: str | None = None,
     *,
     severity: str = "MAJOR",
+    confidence: str = "LIKELY",
+    evidence: list[str] | None = None,
+    path: str = "a.c",
+    line: int | None = 1,
 ) -> Finding:
     return Finding(
         id=finding_id,
         severity=severity,
-        path="a.c",
+        path=path,
         side="RIGHT",
-        line=1,
+        line=line,
         body=body or f"defect {finding_id}",
-        confidence="LIKELY",
+        confidence=confidence,
+        evidence=list(evidence or []),
     )
 
 
@@ -381,6 +386,11 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('"finding_ids"', prompt)
         self.assertIn("list that finding's ID in finding_ids", prompt)
         self.assertIn("Finding IDs are local to the chunk", prompt)
+
+    def test_reduce_prompt_documents_evidentiary_join(self) -> None:
+        prompt = mw.DEFAULT_PROMPT_REDUCE.read_text(encoding="utf-8")
+        self.assertIn("Canonical selection chooses identity", prompt)
+        self.assertIn("validation:incomplete:", prompt)
 
     def test_reduce_keeps_original_finding_bodies(self) -> None:
         store = EvidenceStore()
@@ -1937,6 +1947,253 @@ class ReducerDecisionValidationTests(unittest.TestCase):
         self.assertIn("B", store.kept)
         self.assertFalse(store.merged_into)
         self._assert_known_identities(store)
+
+    def test_overlapping_merges_fail_safe_to_keep(self) -> None:
+        store = self._store(_finding("A"), _finding("B"), _finding("C"))
+        raw = json.dumps(
+            {
+                "keep": [],
+                "reject": [],
+                "merge": [
+                    {"ids": ["A", "B"], "canonical": "A"},
+                    {"ids": ["B", "C"], "canonical": "C"},
+                ],
+            }
+        )
+        apply_reduce_decision(store, raw, ["A", "B", "C"])
+        self.assertIn("A", store.kept)
+        self.assertIn("B", store.kept)
+        self.assertIn("C", store.kept)
+        self.assertFalse(store.merged_into)
+        self._assert_known_identities(store)
+
+
+class ReducerEvidentiaryStrengthTests(unittest.TestCase):
+    """Valid merges must not weaken the surviving representative."""
+
+    def _store(self, *findings: Finding) -> EvidenceStore:
+        store = EvidenceStore()
+        for finding in findings:
+            store.findings[finding.id] = finding
+        return store
+
+    def _apply_merge(
+        self,
+        store: EvidenceStore,
+        ids: list[str],
+        canonical: str,
+        group_ids: list[str] | None = None,
+    ) -> None:
+        raw = json.dumps(
+            {
+                "keep": [],
+                "reject": [],
+                "merge": [{"ids": ids, "canonical": canonical}],
+            }
+        )
+        apply_reduce_decision(store, raw, group_ids or ids)
+
+    def _sole_kept(self, store: EvidenceStore) -> Finding:
+        kept = store.kept_findings()
+        self.assertEqual(len(kept), 1, [item.id for item in kept])
+        return kept[0]
+
+    def test_valid_merge_cannot_downgrade_blocking_to_minor(self) -> None:
+        store = self._store(
+            _finding("A", severity="MINOR"),
+            _finding("B", severity="BLOCKING"),
+        )
+        self._apply_merge(store, ["A", "B"], "A")
+        result = self._sole_kept(store)
+        self.assertEqual(result.id, "A")
+        self.assertEqual(result.severity, "BLOCKING")
+
+    def test_canonical_choice_cannot_affect_severity(self) -> None:
+        severities = []
+        for canonical in ("A", "B"):
+            store = self._store(
+                _finding("A", severity="MINOR"),
+                _finding("B", severity="BLOCKING"),
+            )
+            self._apply_merge(store, ["A", "B"], canonical)
+            result = self._sole_kept(store)
+            self.assertEqual(result.id, canonical)
+            severities.append(result.severity)
+        self.assertEqual(severities, ["BLOCKING", "BLOCKING"])
+
+    def test_valid_merge_preserves_all_evidence(self) -> None:
+        store = self._store(
+            _finding("A", evidence=["evidence:a"]),
+            _finding("B", evidence=["evidence:b"]),
+        )
+        self._apply_merge(store, ["A", "B"], "A")
+        result = self._sole_kept(store)
+        self.assertGreaterEqual(set(result.evidence), {"evidence:a", "evidence:b"})
+
+    def test_valid_merge_cannot_erase_incomplete_validation(self) -> None:
+        store = self._store(
+            _finding("A", evidence=["chunk:a"]),
+            _finding(
+                "B",
+                evidence=["chunk:b", "validation:incomplete:include/foo.h"],
+            ),
+        )
+        self._apply_merge(store, ["A", "B"], "A")
+        result = self._sole_kept(store)
+        self.assertIn("validation:incomplete:include/foo.h", result.evidence)
+
+    def test_canonical_choice_cannot_affect_evidence_union(self) -> None:
+        evidence_sets = []
+        for canonical in ("A", "B"):
+            store = self._store(
+                _finding("A", evidence=["evidence:a"]),
+                _finding("B", evidence=["evidence:b"]),
+            )
+            self._apply_merge(store, ["A", "B"], canonical)
+            evidence_sets.append(set(self._sole_kept(store).evidence))
+        self.assertEqual(evidence_sets[0], evidence_sets[1])
+        self.assertGreaterEqual(evidence_sets[0], {"evidence:a", "evidence:b"})
+
+    def test_three_way_merge_preserves_strongest_severity_and_all_evidence(self) -> None:
+        store = self._store(
+            _finding("A", severity="MINOR", evidence=["evidence:a"]),
+            _finding("B", severity="MAJOR", evidence=["evidence:b"]),
+            _finding("C", severity="BLOCKING", evidence=["evidence:c"]),
+        )
+        self._apply_merge(store, ["A", "B", "C"], "A")
+        result = self._sole_kept(store)
+        self.assertEqual(result.id, "A")
+        self.assertEqual(result.severity, "BLOCKING")
+        self.assertGreaterEqual(
+            set(result.evidence),
+            {"evidence:a", "evidence:b", "evidence:c"},
+        )
+
+    def test_transitive_merge_preserves_all_metadata(self) -> None:
+        store = self._store(
+            _finding("A", severity="MINOR", evidence=["evidence:a"]),
+            _finding("B", severity="BLOCKING", evidence=["evidence:b"]),
+            _finding("C", severity="MAJOR", evidence=["evidence:c"]),
+        )
+        self._apply_merge(store, ["A", "B"], "A")
+        self._apply_merge(store, ["A", "C"], "C")
+        result = self._sole_kept(store)
+        self.assertEqual(result.id, "C")
+        self.assertEqual(result.severity, "BLOCKING")
+        self.assertGreaterEqual(
+            set(result.evidence),
+            {"evidence:a", "evidence:b", "evidence:c"},
+        )
+
+    def test_incomplete_marker_survives_transitive_merge(self) -> None:
+        store = self._store(
+            _finding("A", evidence=["chunk:a"]),
+            _finding("B", evidence=["validation:incomplete:foo.h"]),
+            _finding("C", evidence=["chunk:c"]),
+        )
+        self._apply_merge(store, ["A", "B"], "A")
+        self._apply_merge(store, ["A", "C"], "C")
+        result = self._sole_kept(store)
+        self.assertEqual(result.id, "C")
+        self.assertIn("validation:incomplete:foo.h", result.evidence)
+
+    def test_kept_findings_is_idempotent(self) -> None:
+        store = self._store(
+            _finding("A", severity="MINOR", evidence=["evidence:a"]),
+            _finding(
+                "B",
+                severity="BLOCKING",
+                evidence=["evidence:b", "validation:incomplete:foo.h"],
+            ),
+        )
+        self._apply_merge(store, ["A", "B"], "A")
+        before = {
+            "findings": deepcopy(store.findings),
+            "kept": set(store.kept),
+            "rejected": dict(store.rejected),
+            "merged_into": dict(store.merged_into),
+        }
+        first = store.kept_findings()
+        second = store.kept_findings()
+        self.assertEqual(first, second)
+        self.assertEqual(store.findings, before["findings"])
+        self.assertEqual(store.kept, before["kept"])
+        self.assertEqual(store.rejected, before["rejected"])
+        self.assertEqual(store.merged_into, before["merged_into"])
+
+    def test_raw_findings_remain_unchanged(self) -> None:
+        store = self._store(
+            _finding("A", severity="MINOR", evidence=["evidence:a"]),
+            _finding("B", severity="BLOCKING", evidence=["evidence:b"]),
+        )
+        original_a = deepcopy(store.findings["A"])
+        original_b = deepcopy(store.findings["B"])
+        self._apply_merge(store, ["A", "B"], "A")
+        store.kept_findings()
+        self.assertEqual(store.findings["A"], original_a)
+        self.assertEqual(store.findings["B"], original_b)
+
+    def test_rejected_findings_do_not_leak_into_unrelated_representatives(self) -> None:
+        store = self._store(
+            _finding("A", severity="MINOR", evidence=["evidence:a"]),
+            _finding("B", severity="MAJOR", evidence=["evidence:b"]),
+            _finding(
+                "C",
+                severity="BLOCKING",
+                evidence=["evidence:c", "validation:incomplete:foo.h"],
+            ),
+            _finding("D", severity="MINOR", evidence=["evidence:d"]),
+        )
+        self._apply_merge(store, ["A", "B"], "A")
+        apply_reduce_decision(
+            store,
+            json.dumps(
+                {
+                    "keep": ["D"],
+                    "reject": [{"id": "C", "reason": "independently contradicted"}],
+                    "merge": [],
+                }
+            ),
+            ["C", "D"],
+        )
+        # Stale merge pointer from the rejected finding must not contribute.
+        store.merged_into["C"] = "A"
+        kept = {item.id: item for item in store.kept_findings()}
+        self.assertEqual(set(kept), {"A", "D"})
+        self.assertEqual(kept["A"].severity, "MAJOR")
+        self.assertGreaterEqual(set(kept["A"].evidence), {"evidence:a", "evidence:b"})
+        self.assertNotIn("evidence:c", kept["A"].evidence)
+        self.assertNotIn("validation:incomplete:foo.h", kept["A"].evidence)
+        self.assertEqual(kept["D"].severity, "MINOR")
+        self.assertNotIn("evidence:c", kept["D"].evidence)
+        self.assertNotIn("C", {item.id for item in store.kept_findings()})
+
+    def test_canonical_choice_cannot_affect_confidence(self) -> None:
+        confidences = []
+        for canonical in ("A", "B"):
+            store = self._store(
+                _finding("A", confidence="CONFIRMED", evidence=["evidence:a"]),
+                _finding("B", confidence="QUESTION", evidence=["evidence:b"]),
+            )
+            self._apply_merge(store, ["A", "B"], canonical)
+            result = self._sole_kept(store)
+            self.assertEqual(result.id, canonical)
+            confidences.append(result.confidence)
+        self.assertEqual(confidences, ["CONFIRMED", "CONFIRMED"])
+
+    def test_confidence_join_is_independent_of_canonical_and_preserves_markers(self) -> None:
+        store = self._store(
+            _finding("A", confidence="CONFIRMED", evidence=["chunk:a"]),
+            _finding(
+                "B",
+                confidence="LIKELY",
+                evidence=["chunk:b", "validation:incomplete:include/foo.h"],
+            ),
+        )
+        self._apply_merge(store, ["A", "B"], "A")
+        result = self._sole_kept(store)
+        self.assertEqual(result.confidence, "CONFIRMED")
+        self.assertIn("validation:incomplete:include/foo.h", result.evidence)
 
 
 class ReducerTerminationTests(unittest.TestCase):

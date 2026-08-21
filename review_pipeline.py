@@ -47,6 +47,23 @@ SYNTHESIS_SUFFIX = (
     "unresolved cross-context dependency. Do not escalate that finding to "
     "CONFIRMED based on context that was not successfully validated.\n"
 )
+# Reduction is monotonic in evidentiary strength. A merged representative is
+# at least as severe and at least as informed as every member of its class.
+# Canonical selection chooses identity, location, and body only.
+SEVERITY_ORDER = {
+    "MINOR": 0,
+    "MAJOR": 1,
+    "BLOCKING": 2,
+}
+# Strongest label among members (CONFIRMED > LIKELY > QUESTION). Uncertainty
+# is preserved separately: every evidence item, including
+# validation:incomplete:<path>, is unioned onto the representative. Canonical
+# selection does not determine confidence.
+CONFIDENCE_ORDER = {
+    "QUESTION": 0,
+    "LIKELY": 1,
+    "CONFIRMED": 2,
+}
 
 CallModel = Callable[[str, str], str]
 
@@ -86,19 +103,121 @@ class EvidenceStore:
     rejected: dict[str, str] = field(default_factory=dict)
     merged_into: dict[str, str] = field(default_factory=dict)
 
+    def resolve_canonical(self, finding_id: str) -> str:
+        """Follow merge edges to the root identity of an equivalence class.
+
+        Cycle handling is defensive only; reducer validation should prevent
+        cycles from being recorded.
+        """
+        seen: set[str] = set()
+        current = finding_id
+        while current in self.merged_into:
+            if current in seen:
+                break
+            seen.add(current)
+            current = self.merged_into[current]
+        return current
+
+    def merge_members(self, canonical_id: str) -> list[Finding]:
+        """Original findings in the equivalence class rooted at ``canonical_id``.
+
+        Rejected findings are excluded so they cannot contribute severity or
+        evidence to an unrelated surviving representative. The canonical
+        finding is listed first when it is present and not rejected.
+        """
+        members: list[Finding] = []
+        seen: set[str] = set()
+        canonical = self.findings.get(canonical_id)
+        if canonical is not None and canonical_id not in self.rejected:
+            members.append(canonical)
+            seen.add(canonical_id)
+        for finding_id, finding in self.findings.items():
+            if finding_id in seen or finding_id in self.rejected:
+                continue
+            if self.resolve_canonical(finding_id) != canonical_id:
+                continue
+            members.append(finding)
+            seen.add(finding_id)
+        return members
+
     def kept_findings(self) -> list[Finding]:
+        """Materialize derived representatives for surviving merge classes.
+
+        Raw findings are not mutated. Each representative keeps the
+        canonical ID, body, and location, and joins severity, confidence,
+        and evidence from every non-rejected member of the class.
+        """
         kept: list[Finding] = []
         seen: set[str] = set()
-        for finding_id, finding in self.findings.items():
-            canonical = self.merged_into.get(finding_id, finding_id)
-            if canonical in self.rejected or canonical in seen:
+        for finding_id in self.findings:
+            canonical_id = self.resolve_canonical(finding_id)
+            if canonical_id in self.rejected or canonical_id in seen:
                 continue
-            if self.kept and canonical not in self.kept:
+            if self.kept and canonical_id not in self.kept:
                 continue
-            original = self.findings.get(canonical) or finding
-            kept.append(original)
-            seen.add(canonical)
+            if canonical_id not in self.findings:
+                continue
+            members = self.merge_members(canonical_id)
+            if not members:
+                continue
+            kept.append(aggregate_finding(self.findings[canonical_id], members))
+            seen.add(canonical_id)
         return kept
+
+
+def join_severity(findings: list[Finding]) -> str:
+    """Strongest severity among ``findings`` (BLOCKING > MAJOR > MINOR)."""
+    return max(
+        findings,
+        key=lambda finding: SEVERITY_ORDER.get(finding.severity, -1),
+    ).severity
+
+
+def join_confidence(findings: list[Finding]) -> str:
+    """Strongest confidence among ``findings`` (CONFIRMED > LIKELY > QUESTION).
+
+    This is independent of which member the reducer named canonical.
+    Incomplete-validation markers survive through ``union_evidence`` and
+    remain binding on synthesis: a representative carrying
+    ``validation:incomplete:*`` must not be treated as CONFIRMED based on
+    context that was never validated.
+    """
+    return max(
+        findings,
+        key=lambda finding: CONFIDENCE_ORDER.get(finding.confidence, -1),
+    ).confidence
+
+
+def union_evidence(findings: list[Finding]) -> list[str]:
+    """Stable union of every member's evidence, including incomplete markers."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for finding in findings:
+        for item in finding.evidence:
+            if item in seen:
+                continue
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def aggregate_finding(canonical: Finding, members: list[Finding]) -> Finding:
+    """Derive a representative from a complete merge equivalence class.
+
+    Identity, body, and location come from ``canonical``. Severity,
+    confidence, and evidence are joined from ``members``. Raw findings are
+    not mutated.
+    """
+    return Finding(
+        id=canonical.id,
+        severity=join_severity(members),
+        path=canonical.path,
+        side=canonical.side,
+        line=canonical.line,
+        body=canonical.body,
+        confidence=join_confidence(members),
+        evidence=union_evidence(members),
+    )
 
 
 @dataclass
@@ -695,7 +814,8 @@ def format_synthesis_user_message(
             "# Coverage manifest",
             coverage_json,
             "",
-            "# Evidence store (original finding bodies; do not telephone-game them)",
+            "# Evidence store (canonical identity and body; severity, confidence, "
+            "and evidence are joined across merged members)",
             evidence,
             "",
             "# Contracts",
@@ -827,7 +947,7 @@ def hierarchical_reduce(
             group_ids = [item.id for item in group]
             apply_reduce_decision(store, raw, group_ids)
             for item in group:
-                canonical = store.merged_into.get(item.id, item.id)
+                canonical = store.resolve_canonical(item.id)
                 if canonical not in store.rejected:
                     next_kept_ids.append(canonical)
         unique: list[str] = []
