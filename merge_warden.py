@@ -23,6 +23,7 @@ from context_pipeline import CorpusInputs, build_review_corpus, format_char_coun
 from review_pipeline import (
     DEFAULT_PROMPT_MAP,
     DEFAULT_PROMPT_REDUCE,
+    PipelineDeadlineExceeded,
     run_hierarchical_review,
 )
 
@@ -86,6 +87,8 @@ RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
 HTTP_ATTEMPTS = 3
 HTTP_TIMEOUT_SECONDS = 300
 MAX_RETRY_AFTER_SECONDS = 60
+DEFAULT_REVIEW_TIMEOUT_SECONDS = 900
+DEFAULT_SHUTDOWN_RESERVE_SECONDS = 60
 USER_MESSAGE_SUFFIX = (
     "Place every BLOCKING and MAJOR finding on a commentable line.\n"
     "Reply with JSON only: event, body (full markdown review), comments.\n"
@@ -135,6 +138,10 @@ FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
 class CommandError(RuntimeError):
     pass
+
+
+class RequestDeadlineExceeded(RuntimeError):
+    """A provider request cannot finish inside the remaining review budget."""
 
 
 def _maybe_json_object(raw: str) -> dict | None:
@@ -280,6 +287,47 @@ def retry_sleep_seconds(attempt: int, retry_after: str | None = None) -> float:
     if parsed is None:
         return fallback
     return min(parsed, float(MAX_RETRY_AFTER_SECONDS))
+
+
+def remaining_deadline_seconds(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return deadline - time.monotonic()
+
+
+def http_timeout_for_deadline(
+    timeout: float,
+    deadline: float | None,
+    *,
+    label: str,
+) -> float:
+    configured = max(float(timeout), 0.001)
+    remaining = remaining_deadline_seconds(deadline)
+    if remaining is None:
+        return configured
+    if remaining <= 0:
+        raise RequestDeadlineExceeded(
+            f"{label} request skipped because the review deadline is exhausted"
+        )
+    return min(configured, max(remaining, 0.001))
+
+
+def compute_review_deadlines(
+    timeout_seconds: int,
+    reserve_seconds: int,
+    *,
+    now: float | None = None,
+) -> tuple[float, float]:
+    if timeout_seconds <= 0:
+        raise RuntimeError("review timeout must be greater than zero")
+    if reserve_seconds < 0:
+        raise RuntimeError("shutdown reserve cannot be negative")
+    if reserve_seconds >= timeout_seconds:
+        raise RuntimeError("shutdown reserve must be smaller than review timeout")
+    started = time.monotonic() if now is None else float(now)
+    hard_deadline = started + float(timeout_seconds)
+    provider_deadline = hard_deadline - float(reserve_seconds)
+    return hard_deadline, provider_deadline
 
 
 def parse_path_list(raw: str) -> list[str]:
@@ -641,9 +689,10 @@ def http_post_json(
     payload: dict,
     headers: dict[str, str],
     *,
-    timeout: int = HTTP_TIMEOUT_SECONDS,
+    timeout: float = HTTP_TIMEOUT_SECONDS,
     label: str = "API",
     attempts: int = HTTP_ATTEMPTS,
+    deadline: float | None = None,
 ) -> dict:
     encoded = json.dumps(payload).encode("utf-8")
     raw = ""
@@ -656,9 +705,16 @@ def http_post_json(
             headers=headers,
         )
         retry_after = None
+        last_error: BaseException | None = None
+        request_timeout = http_timeout_for_deadline(timeout, deadline, label=label)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(request, timeout=request_timeout) as response:
                 raw = response.read().decode("utf-8")
+            remaining = remaining_deadline_seconds(deadline)
+            if remaining is not None and remaining <= 0:
+                raise RequestDeadlineExceeded(
+                    f"{label} response arrived after the review deadline"
+                )
             break
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
@@ -667,6 +723,9 @@ def http_post_json(
             if exc.code not in RETRYABLE_HTTP_CODES or attempt == attempts:
                 raise RuntimeError(f"{label} HTTP {exc.code}: {detail}") from exc
             error = f"HTTP {exc.code}"
+            last_error = exc
+        except RequestDeadlineExceeded:
+            raise
         except (
             urllib.error.URLError,
             http.client.RemoteDisconnected,
@@ -680,13 +739,21 @@ def http_post_json(
                     f"{label} request failed after {attempts} attempts: {exc}"
                 ) from exc
             error = str(exc)
+            last_error = exc
 
         delay = retry_sleep_seconds(attempt, retry_after)
+        remaining = remaining_deadline_seconds(deadline)
+        if remaining is not None and delay >= remaining:
+            raise RequestDeadlineExceeded(
+                f"{label} retry would cross the review deadline "
+                f"({max(remaining, 0.0):.1f}s remaining)"
+            ) from last_error
         delay_display = int(delay) if float(delay).is_integer() else delay
         print(
             f"::warning::{label} request attempt {attempt}/{attempts} "
             f"failed: {error}; retrying in {delay_display}s",
             file=sys.stderr,
+            flush=True,
         )
         time.sleep(delay)
 
@@ -785,6 +852,7 @@ def call_chat_completions(
     extra: dict | None = None,
     extra_headers: dict[str, str] | None = None,
     label: str,
+    deadline: float | None = None,
 ) -> str:
     headers = {
         "Content-Type": "application/json",
@@ -797,6 +865,7 @@ def call_chat_completions(
         chat_completions_payload(system_prompt, user_message, model, extra),
         headers,
         label=label,
+        deadline=deadline,
     )
     return content_from_chat_completions(data, label)
 
@@ -816,6 +885,8 @@ def call_anthropic(
     user_message: str,
     model: str,
     api_key: str,
+    *,
+    deadline: float | None = None,
 ) -> str:
     label = PROVIDER_LABELS["anthropic"]
     data = http_post_json(
@@ -827,6 +898,7 @@ def call_anthropic(
             "anthropic-version": ANTHROPIC_VERSION,
         },
         label=label,
+        deadline=deadline,
     )
     return content_from_anthropic(data, label)
 
@@ -851,6 +923,8 @@ def call_gemini(
     user_message: str,
     model: str,
     api_key: str,
+    *,
+    deadline: float | None = None,
 ) -> str:
     label = PROVIDER_LABELS["google"]
     data = http_post_json(
@@ -861,6 +935,7 @@ def call_gemini(
             "x-goog-api-key": api_key,
         },
         label=label,
+        deadline=deadline,
     )
     return content_from_gemini(data, label)
 
@@ -871,6 +946,8 @@ def call_model(
     user_message: str,
     model: str,
     api_key: str,
+    *,
+    deadline: float | None = None,
 ) -> str:
     label = PROVIDER_LABELS[provider]
     if provider == "xai":
@@ -882,6 +959,7 @@ def call_model(
             api_key,
             extra_headers={"x-grok-conv-id": XAI_CONV_ID},
             label=label,
+            deadline=deadline,
         )
     if provider == "openai":
         return call_chat_completions(
@@ -891,11 +969,24 @@ def call_model(
             model,
             api_key,
             label=label,
+            deadline=deadline,
         )
     if provider == "anthropic":
-        return call_anthropic(system_prompt, user_message, model, api_key)
+        return call_anthropic(
+            system_prompt,
+            user_message,
+            model,
+            api_key,
+            deadline=deadline,
+        )
     if provider == "google":
-        return call_gemini(system_prompt, user_message, model, api_key)
+        return call_gemini(
+            system_prompt,
+            user_message,
+            model,
+            api_key,
+            deadline=deadline,
+        )
     raise RuntimeError(f"Unsupported provider {provider!r}")
 
 
@@ -1277,6 +1368,24 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("EXPECTED_HEAD_SHA") or "",
         help="Skip if the PR head is no longer this SHA (workflow_run.head_sha)",
     )
+    parser.add_argument(
+        "--review-timeout-seconds",
+        type=int,
+        default=env_int(
+            "MERGE_WARDEN_REVIEW_TIMEOUT_SECONDS",
+            DEFAULT_REVIEW_TIMEOUT_SECONDS,
+        ),
+        help="Total internal wall-clock review budget in seconds",
+    )
+    parser.add_argument(
+        "--shutdown-reserve-seconds",
+        type=int,
+        default=env_int(
+            "MERGE_WARDEN_SHUTDOWN_RESERVE_SECONDS",
+            DEFAULT_SHUTDOWN_RESERVE_SECONDS,
+        ),
+        help="Seconds reserved for writing outputs and posting the review",
+    )
     return parser.parse_args()
 
 
@@ -1297,6 +1406,24 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             file=sys.stderr,
         )
         return 1
+
+    review_timeout_seconds = int(
+        getattr(args, "review_timeout_seconds", DEFAULT_REVIEW_TIMEOUT_SECONDS)
+    )
+    shutdown_reserve_seconds = int(
+        getattr(args, "shutdown_reserve_seconds", DEFAULT_SHUTDOWN_RESERVE_SECONDS)
+    )
+    hard_deadline, provider_deadline = compute_review_deadlines(
+        review_timeout_seconds,
+        shutdown_reserve_seconds,
+    )
+    print(
+        f"Review budget: {review_timeout_seconds}s total; "
+        f"provider cutoff after "
+        f"{review_timeout_seconds - shutdown_reserve_seconds}s; "
+        f"{shutdown_reserve_seconds}s reserved for output/posting",
+        flush=True,
+    )
 
     system_prompt = Path(args.prompt_file).read_text(encoding="utf-8")
     pr = gh_json(
@@ -1340,7 +1467,8 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
     )
     print(
         f"Context corpus: {len(corpus.reviewable_chunks)} reviewable chunk(s), "
-        f"{format_char_count(corpus.total_chars)}"
+        f"{format_char_count(corpus.total_chars)}",
+        flush=True,
     )
     if corpus.limit_error:
         print(f"::warning::{corpus.limit_error}", file=sys.stderr)
@@ -1354,8 +1482,27 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             stage = "map"
         elif "merge-warden-reduce" in system_prompt:
             stage = "reduce"
-        print(f"Calling {PROVIDER_LABELS[provider]} ({model}) [{stage}]")
-        return call_model(provider, system_prompt, user_message, model, api_key)
+        remaining = remaining_deadline_seconds(provider_deadline)
+        if remaining is None or remaining <= 0:
+            raise PipelineDeadlineExceeded(
+                f"provider cutoff reached before {stage}"
+            )
+        print(
+            f"Calling {PROVIDER_LABELS[provider]} ({model}) [{stage}] "
+            f"({remaining:.0f}s provider budget remaining)",
+            flush=True,
+        )
+        try:
+            return call_model(
+                provider,
+                system_prompt,
+                user_message,
+                model,
+                api_key,
+                deadline=provider_deadline,
+            )
+        except RequestDeadlineExceeded as exc:
+            raise PipelineDeadlineExceeded(str(exc)) from exc
 
     review, coverage, _store, stats = run_hierarchical_review(
         corpus=corpus,
@@ -1379,17 +1526,26 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             f"::warning::Merge Warden coverage incomplete "
             f"({len(coverage.uncovered_chunk_ids)} chunk(s) not analyzed)",
             file=sys.stderr,
+            flush=True,
+        )
+    if stats.deadline_exhausted:
+        print(
+            "::warning::Merge Warden internal review deadline exhausted; "
+            "returning a fail-closed COMMENT before the outer CI timeout",
+            file=sys.stderr,
+            flush=True,
         )
     for note in stats.notes:
-        print(f"::warning::{note}", file=sys.stderr)
-    print(stats.footer())
-    if not coverage.complete:
+        print(f"::warning::{note}", file=sys.stderr, flush=True)
+    print(stats.footer(), flush=True)
+    incomplete = not coverage.complete or stats.deadline_exhausted
+    if incomplete:
         review["event"] = "COMMENT"
 
     comments = build_inline_comments(review, commentable)
     head_sha = pr.get("headRefOid") or ""
     event = normalize_event(str(review.get("event") or ""), str(review.get("body") or ""))
-    if not coverage.complete and event == "APPROVE":
+    if incomplete and event == "APPROVE":
         event = "COMMENT"
     payload = {
         "commit_id": head_sha,
@@ -1404,12 +1560,20 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
     )
     print(
         f"Wrote {args.output} and {args.json_output} "
-        f"(event={event}, {len(comments)} inline comment(s))"
+        f"(event={event}, {len(comments)} inline comment(s))",
+        flush=True,
     )
     posted_event: str | None = None
     posted_comments: list[dict] | None = None
     if args.post:
-        if expected and skip_stale_workflow_run(
+        if time.monotonic() >= hard_deadline:
+            print(
+                "::warning::Merge Warden hard review deadline reached before "
+                "posting; generated outputs were kept but no GitHub review was posted",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif expected and skip_stale_workflow_run(
             expected, current_pr_head_oid(repo, args.pr)
         ):
             write_action_outputs(
@@ -1421,18 +1585,19 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
                 posted_comment_count=None,
             )
             return 0
-        posted_event, posted_comments = post_review(repo, args.pr, payload)
-        Path(args.output).write_text(
-            render_markdown(
-                review,
-                comments,
-                event,
-                posted_event=posted_event,
-                posted_comments=posted_comments,
-                pipeline_footer=stats.footer(),
-            ),
-            encoding="utf-8",
-        )
+        else:
+            posted_event, posted_comments = post_review(repo, args.pr, payload)
+            Path(args.output).write_text(
+                render_markdown(
+                    review,
+                    comments,
+                    event,
+                    posted_event=posted_event,
+                    posted_comments=posted_comments,
+                    pipeline_footer=stats.footer(),
+                ),
+                encoding="utf-8",
+            )
     write_action_outputs(
         markdown_path=args.output,
         json_path=args.json_output,

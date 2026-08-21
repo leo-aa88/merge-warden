@@ -45,6 +45,7 @@ from review_pipeline import (
     VALIDATION_MISSING_CHUNK_RETRIES,
     EvidenceStore,
     Finding,
+    PipelineDeadlineExceeded,
     PipelineStats,
     apply_reduce_decision,
     canonical_finding_id,
@@ -237,6 +238,68 @@ class _ReviewRecorder:
                 "comments": [],
             }
         )
+
+
+class ReviewDeadlinePipelineTests(unittest.TestCase):
+    def _run(self, call_model):
+        corpus = _synthetic_corpus(
+            [_chunk("file:a.c:1", "a.c", "int main(void) { return 0; }\n")]
+        )
+        return run_hierarchical_review(
+            corpus=corpus,
+            synthesis_prompt="synthesis",
+            map_prompt="merge-warden-map",
+            reduce_prompt="merge-warden-reduce",
+            call_model=call_model,
+            commentable_section="(none)\n",
+            max_map_request_chars=225_000,
+            max_reduce_request_chars=225_000,
+            map_overhead_chars=24_000,
+        )
+
+    def test_deadline_during_map_stops_without_retry_storm(self) -> None:
+        calls = 0
+
+        def call_model(_system: str, _user: str) -> str:
+            nonlocal calls
+            calls += 1
+            raise PipelineDeadlineExceeded("provider cutoff reached during map")
+
+        review, coverage, _store, stats = self._run(call_model)
+        self.assertEqual(calls, 1)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertFalse(coverage.complete)
+        self.assertTrue(stats.deadline_exhausted)
+        self.assertIn("wall-clock review deadline", review["body"])
+        self.assertIn("deadline exhausted", stats.footer())
+
+    def test_deadline_before_synthesis_preserves_mapped_findings(self) -> None:
+        def call_model(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[
+                        {
+                            "id": "F1",
+                            "severity": "MAJOR",
+                            "path": "a.c",
+                            "side": "RIGHT",
+                            "line": 1,
+                            "body": "candidate defect",
+                            "confidence": "LIKELY",
+                            "evidence": ["line 1"],
+                        }
+                    ],
+                )
+            raise PipelineDeadlineExceeded("provider cutoff reached before synthesis")
+
+        review, coverage, store, stats = self._run(call_model)
+        self.assertTrue(coverage.complete)
+        self.assertTrue(stats.deadline_exhausted)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(len(store.kept_findings()), 1)
+        self.assertIn("candidate defect", review["body"])
+        self.assertIn("No approval decision was produced.", review["body"])
 
 
 class SplitTests(unittest.TestCase):

@@ -139,6 +139,8 @@ comment-count outputs) rather than assuming the generated event was published.
 | `post` | no | `true` | Post the GitHub review |
 | `skip-if-missing-key` | no | `false` | Skip instead of failing when the provider key is unset |
 | `expected-head-sha` | no | | Skip if the PR head is no longer this SHA (`workflow_run.head_sha`) |
+| `review-timeout-seconds` | no | `900` | Internal wall-clock review budget; exhaustion fail-closes to `COMMENT` |
+| `shutdown-reserve-seconds` | no | `60` | Time reserved inside the review budget for outputs and posting |
 
 The action never executes PR code. It checks out the default branch (caller
 must `actions/checkout`), fetches the PR head as a git ref, and reads files
@@ -180,9 +182,16 @@ diff and then emit `# APPROVE`.
 Each map/reduce call is capped around 225k characters so provider connections
 stay reliable. Map calls are also capped at 8 chunks so the required
 structured response stays bounded independently of input size. The total
-source size is not artificially bounded by those per-call budgets. Large
-PRs make several model calls and may need a higher job `timeout-minutes`
-than the 20-minute example above.
+source size is not artificially bounded by those per-call budgets.
+
+Merge Warden also enforces an internal wall-clock review budget. The default is
+900 seconds, with the final 60 seconds reserved for writing artifacts and
+posting the GitHub review. Provider request timeouts and retry sleeps are
+clamped to the remaining provider budget. If the deadline is exhausted at any
+map, validation, reduce, or synthesis stage, the pipeline preserves the
+evidence collected so far and returns a fail-closed `COMMENT` instead of
+waiting for the outer GitHub Actions timeout to kill the process. Keep the
+workflow job timeout comfortably above `review-timeout-seconds`.
 
 Optional environment overrides:
 
@@ -193,10 +202,13 @@ Optional environment overrides:
 | `MERGE_WARDEN_MAX_SINGLE_CHUNK_CHARS` | 100000 | Max size of one context chunk |
 | `MERGE_WARDEN_MAX_TOTAL_REVIEW_CHARS` | 10000000 | Hard cap on reviewable source text |
 | `MERGE_WARDEN_MAX_CONTEXT_CHUNKS` | 64 | Hard cap on coalesced reviewable chunks |
+| `MERGE_WARDEN_REVIEW_TIMEOUT_SECONDS` | 900 | Total internal wall-clock review budget |
+| `MERGE_WARDEN_SHUTDOWN_RESERVE_SECONDS` | 60 | Time reserved for outputs and posting |
 
 GitHub review bodies and inline comments still have posting size limits
 (60k / 8k). Those are GitHub API limits, not source truncation.
 
 Provider HTTP calls retry transient failures (disconnects, timeouts,
 HTTP 429/5xx) a few times with exponential backoff. HTTP 429 honors
-`Retry-After` when present, capped at 60 seconds.
+`Retry-After` when present, capped at 60 seconds. Every provider socket timeout
+and retry delay is also bounded by the remaining internal review budget.
