@@ -163,10 +163,12 @@ instructions to the reviewer.
 Merge Warden does **not** truncate the PR to fit a context window. It builds
 a complete context corpus, splits it at semantic boundaries (diff hunks,
 headings, source line ranges), packs those chunks into bounded map calls
-(~225k characters each), extracts structured evidence, runs a targeted
-cross-chunk validation pass when analyses request more context, then
-hierarchically reduces finding IDs (without rewriting their original bodies)
-and synthesizes the GitHub review.
+(~225k characters **and** at most 8 chunks each), extracts structured
+evidence, runs a targeted cross-chunk validation pass when analyses request
+more context, then hierarchically reduces finding IDs (without rewriting
+their original bodies) and synthesizes the GitHub review. Failed map batches
+split into smaller requests instead of abandoning sibling chunks; a global
+cap of 32 logical map attempts still fail-closes the review.
 
 Binary and generated files can be excluded, but that exclusion is explicit in
 the PR index. If reviewable context exceeds `MERGE_WARDEN_MAX_TOTAL_REVIEW_CHARS`
@@ -176,9 +178,11 @@ coalescing), or if any reviewable chunk is not analyzed, Merge Warden posts
 diff and then emit `# APPROVE`.
 
 Each map/reduce call is capped around 225k characters so provider connections
-stay reliable. The total source size is not artificially bounded by those
-per-call budgets. Large PRs make several model calls and may need a higher
-job `timeout-minutes` than the 20-minute example above.
+stay reliable. Map calls are also capped at 8 chunks so the required
+structured response stays bounded independently of input size. The total
+source size is not artificially bounded by those per-call budgets. Large
+PRs make several model calls and may need a higher job `timeout-minutes`
+than the 20-minute example above.
 
 Optional environment overrides:
 

@@ -19,6 +19,8 @@ DEFAULT_MAX_SINGLE_CHUNK_CHARS = 100_000
 DEFAULT_MAX_TOTAL_REVIEW_CHARS = 10_000_000
 DEFAULT_MAX_CONTEXT_CHUNKS = 64
 DEFAULT_MAP_OVERHEAD_CHARS = 24_000
+DEFAULT_ARCH_COALESCE_CHARS = 80_000
+MAX_FAILURE_NOTES_IN_REVIEW = 10
 
 
 @dataclass
@@ -475,17 +477,34 @@ def merge_chunk_pair(left: ContextChunk, right: ContextChunk, new_id: str) -> Co
     )
 
 
-def coalesce_same_source(chunks: list[ContextChunk], limit: int) -> list[ContextChunk]:
+def coalesce_same_source(
+    chunks: list[ContextChunk],
+    limit: int,
+    *,
+    kinds: set[str] | None = None,
+    skip_kinds: set[str] | None = None,
+    id_prefix: str = "coalesce",
+) -> list[ContextChunk]:
+    """Merge adjacent same-source chunks up to ``limit``.
+
+    Original section identities are preserved on ``member_ids``. ``kinds``
+    restricts which chunk kinds may merge; ``skip_kinds`` excludes kinds.
+    Neither argument silently drops content.
+    """
     if not chunks:
         return []
     merged: list[ContextChunk] = []
     current = chunks[0]
     serial = 1
     for chunk in chunks[1:]:
-        same = chunk.kind == current.kind and chunk.source == current.source
+        eligible = chunk.kind == current.kind and chunk.source == current.source
+        if kinds is not None:
+            eligible = eligible and current.kind in kinds and chunk.kind in kinds
+        if skip_kinds is not None:
+            eligible = eligible and current.kind not in skip_kinds and chunk.kind not in skip_kinds
         combined = current.size + chunk.size + 8
-        if same and combined <= limit:
-            current = merge_chunk_pair(current, chunk, f"coalesce:{serial}")
+        if eligible and combined <= limit:
+            current = merge_chunk_pair(current, chunk, f"{id_prefix}:{serial}")
             serial += 1
             continue
         merged.append(current)
@@ -837,7 +856,18 @@ def build_review_corpus(
             file_chunks[0].text = f"{header}\n{note}\n" + file_chunks[0].text
         chunks.extend(file_chunks)
 
-    chunks = coalesce_same_source(chunks, max_single_chunk_chars)
+    arch_limit = min(max_single_chunk_chars, DEFAULT_ARCH_COALESCE_CHARS)
+    chunks = coalesce_same_source(
+        chunks,
+        arch_limit,
+        kinds={"arch"},
+        id_prefix="coalesce:arch",
+    )
+    chunks = coalesce_same_source(
+        chunks,
+        max_single_chunk_chars,
+        skip_kinds={"arch"},
+    )
     excluded_chunks = [chunk for chunk in chunks if chunk.excluded]
     reviewable = [chunk for chunk in chunks if not chunk.excluded]
     reviewable = fit_chunk_count(reviewable, max_context_chunks, max_single_chunk_chars)
@@ -895,16 +925,46 @@ def incomplete_limit_body(message: str) -> str:
     )
 
 
-def incomplete_coverage_body(report: CoverageReport) -> str:
+def incomplete_coverage_body(
+    report: CoverageReport,
+    *,
+    analyzed: int | None = None,
+    total: int | None = None,
+    failure_notes: list[str] | None = None,
+) -> str:
     uncovered = report.uncovered_chunk_ids
     details = "\n".join(f"- `{chunk_id}`" for chunk_id in uncovered[:40])
     extra = ""
     if len(uncovered) > 40:
         extra = f"\n- … {len(uncovered) - 40} more\n"
-    return (
-        "# COMMENT\n\n"
-        "Merge Warden could not complete a full review because "
-        f"{len(uncovered)} context chunk(s) were not analyzed.\n\n"
-        f"{details}{extra}\n"
-        "No approval decision was produced.\n"
-    )
+    sections = [
+        "# COMMENT",
+        "",
+        (
+            "Merge Warden could not complete a full review because "
+            f"{len(uncovered)} context chunk(s) were not analyzed."
+        ),
+        "",
+    ]
+    if analyzed is not None and total is not None:
+        sections.extend(
+            [
+                f"Coverage: {analyzed} / {total} context chunks analyzed.",
+                "",
+            ]
+        )
+    if details or extra:
+        sections.append(details + extra)
+        if not extra:
+            sections.append("")
+    notes = [note for note in (failure_notes or []) if note]
+    if notes:
+        shown = notes[:MAX_FAILURE_NOTES_IN_REVIEW]
+        remainder = len(notes) - len(shown)
+        sections.append("Map failures:")
+        sections.extend(f"- {note}" for note in shown)
+        if remainder > 0:
+            sections.append(f"- … {remainder} more")
+        sections.append("")
+    sections.append("No approval decision was produced.")
+    return "\n".join(sections).rstrip() + "\n"
