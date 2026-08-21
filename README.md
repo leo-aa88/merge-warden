@@ -145,6 +145,7 @@ comment-count outputs) rather than assuming the generated event was published.
 | `expected-head-sha` | no | | Skip if the PR head is no longer this SHA (`workflow_run.head_sha`) |
 | `review-timeout-seconds` | no | `900` | Internal wall-clock review budget; exhaustion fail-closes to `COMMENT` |
 | `shutdown-reserve-seconds` | no | `60` | Time reserved inside the review budget for outputs and posting |
+| `map-concurrency` | no | `4` | Max independent map provider requests in flight (1–8) |
 
 The action never executes PR code. It checks out the default branch (caller
 must `actions/checkout`), fetches the PR head as a git ref, and reads files
@@ -172,9 +173,11 @@ headings, source line ranges), packs those chunks into bounded map calls
 (~225k characters **and** at most 8 chunks each), extracts structured
 evidence, runs a targeted cross-chunk validation pass when analyses request
 more context, then hierarchically reduces finding IDs (without rewriting
-their original bodies) and synthesizes the GitHub review. Failed map batches
-split into smaller requests instead of abandoning sibling chunks; a global
-cap of 32 logical map attempts still fail-closes the review.
+their original bodies) and synthesizes the GitHub review. Independent map
+batches run concurrently (default 4 in-flight provider calls) so provider
+latency overlaps; evidence ingestion stays single-threaded and deterministic.
+Failed map batches split into smaller requests instead of abandoning sibling
+chunks; a global cap of 32 logical map attempts still fail-closes the review.
 
 Binary and generated files can be excluded, but that exclusion is explicit in
 the PR index. If reviewable context exceeds `MERGE_WARDEN_MAX_TOTAL_REVIEW_CHARS`
@@ -185,8 +188,11 @@ diff and then emit `# APPROVE`.
 
 Each map/reduce call is capped around 225k characters so provider connections
 stay reliable. Map calls are also capped at 8 chunks so the required
-structured response stays bounded independently of input size. The total
-source size is not artificially bounded by those per-call budgets.
+structured response stays bounded independently of input size. Independent
+map batches share a bounded worker pool (`map-concurrency`, default 4, max
+8). Workers only perform provider I/O; coverage, evidence, and retry/split
+decisions stay on one thread. The total source size is not artificially
+bounded by those per-call budgets.
 
 Merge Warden also enforces an internal wall-clock review budget. The default is
 900 seconds, with the final 60 seconds reserved for writing artifacts and
@@ -208,6 +214,7 @@ Optional environment overrides:
 | `MERGE_WARDEN_MAX_CONTEXT_CHUNKS` | 64 | Hard cap on coalesced reviewable chunks |
 | `MERGE_WARDEN_REVIEW_TIMEOUT_SECONDS` | 900 | Total internal wall-clock review budget |
 | `MERGE_WARDEN_SHUTDOWN_RESERVE_SECONDS` | 60 | Time reserved for outputs and posting |
+| `MERGE_WARDEN_MAP_CONCURRENCY` | 4 | Max independent map provider requests in flight (1–8) |
 
 GitHub review bodies and inline comments still have posting size limits
 (60k / 8k). Those are GitHub API limits, not source truncation.

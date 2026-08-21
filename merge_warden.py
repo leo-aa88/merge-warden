@@ -21,9 +21,12 @@ from pathlib import Path
 
 from context_pipeline import CorpusInputs, build_review_corpus, format_char_count
 from review_pipeline import (
+    DEFAULT_MAP_CONCURRENCY,
     DEFAULT_PROMPT_MAP,
     DEFAULT_PROMPT_REDUCE,
+    VALIDATION_STAGE_TOKEN,
     PipelineDeadlineExceeded,
+    normalize_map_concurrency,
     run_hierarchical_review,
 )
 
@@ -328,6 +331,21 @@ def compute_review_deadlines(
     hard_deadline = started + float(timeout_seconds)
     provider_deadline = hard_deadline - float(reserve_seconds)
     return hard_deadline, provider_deadline
+
+
+def provider_call_stage(system_prompt: str, user_message: str) -> str:
+    """Label a provider call for Actions logs.
+
+    Validation reuses the map system prompt, so the stage is taken from the
+    user message token rather than the system prompt.
+    """
+    if f"<!-- {VALIDATION_STAGE_TOKEN} -->" in (user_message or ""):
+        return "validation"
+    if "merge-warden-map" in (system_prompt or ""):
+        return "map"
+    if "merge-warden-reduce" in (system_prompt or ""):
+        return "reduce"
+    return "synthesis"
 
 
 def parse_path_list(raw: str) -> list[str]:
@@ -1386,6 +1404,15 @@ def parse_args() -> argparse.Namespace:
         ),
         help="Seconds reserved for writing outputs and posting the review",
     )
+    parser.add_argument(
+        "--map-concurrency",
+        type=int,
+        default=env_int(
+            "MERGE_WARDEN_MAP_CONCURRENCY",
+            DEFAULT_MAP_CONCURRENCY,
+        ),
+        help="Max independent map provider requests in flight (1-8)",
+    )
     return parser.parse_args()
 
 
@@ -1417,11 +1444,15 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
         review_timeout_seconds,
         shutdown_reserve_seconds,
     )
+    map_concurrency = normalize_map_concurrency(
+        getattr(args, "map_concurrency", DEFAULT_MAP_CONCURRENCY)
+    )
     print(
         f"Review budget: {review_timeout_seconds}s total; "
         f"provider cutoff after "
         f"{review_timeout_seconds - shutdown_reserve_seconds}s; "
-        f"{shutdown_reserve_seconds}s reserved for output/posting",
+        f"{shutdown_reserve_seconds}s reserved for output/posting; "
+        f"map concurrency {map_concurrency}",
         flush=True,
     )
 
@@ -1477,11 +1508,7 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
     reduce_prompt = Path(DEFAULT_PROMPT_REDUCE).read_text(encoding="utf-8")
 
     def invoke(system_prompt: str, user_message: str) -> str:
-        stage = "synthesis"
-        if "merge-warden-map" in system_prompt:
-            stage = "map"
-        elif "merge-warden-reduce" in system_prompt:
-            stage = "reduce"
+        stage = provider_call_stage(system_prompt, user_message)
         remaining = remaining_deadline_seconds(provider_deadline)
         if remaining is None or remaining <= 0:
             raise PipelineDeadlineExceeded(
@@ -1492,8 +1519,10 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             f"({remaining:.0f}s provider budget remaining)",
             flush=True,
         )
+        started = time.monotonic()
+        outcome = "error"
         try:
-            return call_model(
+            raw = call_model(
                 provider,
                 system_prompt,
                 user_message,
@@ -1501,8 +1530,18 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
                 api_key,
                 deadline=provider_deadline,
             )
+            outcome = "ok"
+            return raw
         except RequestDeadlineExceeded as exc:
+            outcome = "deadline"
             raise PipelineDeadlineExceeded(str(exc)) from exc
+        finally:
+            extra = "" if outcome == "ok" else f" ({outcome})"
+            print(
+                f"Finished {PROVIDER_LABELS[provider]} [{stage}] in "
+                f"{time.monotonic() - started:.1f}s{extra}",
+                flush=True,
+            )
 
     review, coverage, _store, stats = run_hierarchical_review(
         corpus=corpus,
@@ -1520,6 +1559,7 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
         map_overhead_chars=env_int(
             "MERGE_WARDEN_MAX_MAP_OVERHEAD_CHARS", MAX_MAP_OVERHEAD_CHARS
         ),
+        map_concurrency=map_concurrency,
     )
     if not coverage.complete:
         print(

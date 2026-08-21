@@ -102,6 +102,12 @@ inputs:
       posting the GitHub review after provider work stops.
     required: false
     default: "60"
+  map-concurrency:
+    description: >
+      Maximum number of independent map provider requests in flight (1-8).
+      Bounded to avoid provider rate-limit explosions.
+    required: false
+    default: "4"
 
 outputs:
   markdown-path:
@@ -164,6 +170,7 @@ runs:
         EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
         REVIEW_TIMEOUT_SECONDS: ${{ inputs.review-timeout-seconds }}
         SHUTDOWN_RESERVE_SECONDS: ${{ inputs.shutdown-reserve-seconds }}
+        MAP_CONCURRENCY: ${{ inputs.map-concurrency }}
         PROMPT_FILE: ${{ inputs.prompt-file }}
         ACTION_PATH: ${{ github.action_path }}
       shell: bash
@@ -193,4 +200,5 @@ runs:
           --head-ref "${HEAD_REF}" \
           --review-timeout-seconds "${REVIEW_TIMEOUT_SECONDS}" \
           --shutdown-reserve-seconds "${SHUTDOWN_RESERVE_SECONDS}" \
+          --map-concurrency "${MAP_CONCURRENCY}" \
           "${extra[@]}"
