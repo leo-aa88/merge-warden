@@ -24,6 +24,10 @@ trigger itself — wrap it in a workflow in the consuming repo.
 
 Pin the commit. The moving `v1` tag may lag `main`.
 
+## Used by
+
+- [Brainrotlang/brainrot](https://github.com/Brainrotlang/brainrot) — the Brainrot programming language
+
 ## Usage
 
 Set the API key secret for the provider you choose. Existing Grok workflows
