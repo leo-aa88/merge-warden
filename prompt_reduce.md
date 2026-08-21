@@ -12,8 +12,11 @@ Do not emit APPROVE, COMMENT, or REQUEST CHANGES.
 Do not write a GitHub review body.
 
 Do not escalate severity through paraphrase. If two findings describe the same
-defect, merge them onto one canonical ID. Reject a finding only when another
-finding or contract contradicts it, or when it is unsupported.
+defect, merge them onto one canonical ID. Canonical selection chooses identity,
+location, and body only. Merge Warden joins severity, confidence, and evidence
+from every merged member, so choosing a canonical cannot drop BLOCKING
+severity or `validation:incomplete:` markers. Reject a finding only when
+another finding or contract contradicts it, or when it is unsupported.
 
 # OUTPUT
 
