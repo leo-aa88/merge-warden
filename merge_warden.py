@@ -19,7 +19,13 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from context_pipeline import CorpusInputs, build_review_corpus, format_char_count
+from context_pipeline import (
+    CorpusInputs,
+    build_review_corpus,
+    failed_complete_diff_placeholder,
+    format_char_count,
+    unified_diff_from_file_patches,
+)
 from review_pipeline import (
     DEFAULT_MAP_CONCURRENCY,
     DEFAULT_PROMPT_MAP,
@@ -1660,9 +1666,21 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
     files = collect_pr_files(repo, args.pr)
     commentable = commentable_by_path(files)
     diff_result = run(["gh", "pr", "diff", args.pr, "--repo", repo], check=False)
-    diff = diff_result.stdout if diff_result.returncode == 0 else ""
-    if diff_result.returncode != 0:
-        diff = f"(failed to load complete diff: {diff_result.stderr.strip()})\n"
+    if diff_result.returncode == 0:
+        diff = diff_result.stdout
+    else:
+        # Do not chunk the gh error string as reviewable source: that used to
+        # make coverage complete and APPROVE reachable without the PR changes.
+        reconstructed = unified_diff_from_file_patches(files)
+        if reconstructed:
+            print(
+                "::warning::gh pr diff failed; reviewing per-file patch "
+                "payloads from the Pulls Files API",
+                file=sys.stderr,
+            )
+            diff = reconstructed
+        else:
+            diff = failed_complete_diff_placeholder(diff_result.stderr)
 
     corpus = build_corpus(
         repo=repo,

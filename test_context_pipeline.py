@@ -138,6 +138,20 @@ def _chunk_ids_in_prompt(user: str) -> list[str]:
     return ids
 
 
+def _pipeline_model_response(
+    system_prompt: str,
+    user_message: str,
+    final: dict | None = None,
+) -> str:
+    if "merge-warden-map" in system_prompt:
+        return _map_chunks_json(_chunk_ids_in_prompt(user_message))
+    if "merge-warden-reduce" in system_prompt:
+        return json.dumps({"keep": [], "reject": [], "merge": []})
+    return json.dumps(
+        final or {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+    )
+
+
 def _map_chunks_json(
     chunk_ids: list[str],
     *,
@@ -734,6 +748,66 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("did not perform a complete review", corpus.limit_error)
         self.assertNotIn("APPROVE", incomplete_limit_body(corpus.limit_error))
         self.assertIn("MB", format_char_count(1_500_000))
+
+    def test_failed_complete_diff_without_patches_cannot_approve(self) -> None:
+        diff = "(failed to load complete diff: GraphQL: pull request diff is too large)\n"
+        corpus = build_review_corpus(
+            _inputs(
+                diff=diff,
+                files=[
+                    {
+                        "filename": "secret.c",
+                        "status": "modified",
+                        "additions": 50,
+                        "deletions": 2,
+                    }
+                ],
+            )
+        )
+        reviewable = "\n".join(chunk.text for chunk in corpus.reviewable_chunks)
+        self.assertTrue(corpus.limit_error)
+        self.assertFalse(corpus.coverage.complete)
+        self.assertIn("did not perform a complete review", corpus.limit_error)
+        self.assertNotIn("APPROVE", incomplete_limit_body(corpus.limit_error))
+        self.assertNotIn("failed to load complete diff", reviewable)
+        self.assertFalse(
+            any(
+                chunk.kind == "diff" and not chunk.excluded
+                for chunk in corpus.chunks
+            )
+        )
+
+    def test_failed_complete_diff_uses_file_patches_in_corpus(self) -> None:
+        corpus = build_review_corpus(
+            _inputs(
+                diff="(failed to load complete diff: GraphQL: pull request diff is too large)\n",
+                files=[
+                    {
+                        "filename": "secret.c",
+                        "status": "modified",
+                        "additions": 50,
+                        "deletions": 2,
+                        "patch": "@@ -1,2 +1,50 @@\n-old\n+new secret\n",
+                    }
+                ],
+                commentable={"secret.c": {"RIGHT": {1}, "LEFT": {1}}},
+            )
+        )
+        reviewable = "\n".join(chunk.text for chunk in corpus.reviewable_chunks)
+        self.assertFalse(corpus.limit_error)
+        self.assertIn("new secret", reviewable)
+        self.assertTrue(
+            any(
+                chunk.kind == "diff" and chunk.source == "secret.c"
+                for chunk in corpus.reviewable_chunks
+            )
+        )
+        self.assertFalse(
+            any(
+                chunk.source == "(unknown path)" and not chunk.excluded
+                for chunk in corpus.chunks
+            )
+        )
 
     def test_arch_docs_do_not_evict_diff(self) -> None:
         marker = "UNIQUE_DIFF_MARKER"
@@ -6318,6 +6392,98 @@ class ParallelValidationSchedulerTests(unittest.TestCase):
 
 
 class GenerateReviewPipelineTests(unittest.TestCase):
+    def _generate_args(self, tmp: str) -> argparse.Namespace:
+        return argparse.Namespace(
+            provider="xai",
+            model="grok-4.6",
+            prompt_file=str(mw.DEFAULT_PROMPT),
+            pr="1",
+            head_ref="pr-head",
+            output=str(Path(tmp) / "merge-warden.md"),
+            json_output=str(Path(tmp) / "merge-warden.json"),
+            post=False,
+            skip_if_missing_key=False,
+        )
+
+    def _run_generate_review(
+        self,
+        args: argparse.Namespace,
+        files: list[dict],
+        call_model,
+    ) -> int:
+        pr = _pr(number=1, title="t", body="b")
+        failed_diff = mock.Mock(
+            returncode=1,
+            stdout="",
+            stderr="GraphQL: pull request diff is too large",
+        )
+        with mock.patch.dict(os.environ, {"XAI_API_KEY": "sk"}):
+            with mock.patch.object(mw, "gh_json", return_value=pr):
+                with mock.patch.object(mw, "collect_pr_files", return_value=files):
+                    with mock.patch.object(mw, "run", return_value=failed_diff):
+                        with mock.patch.object(mw, "load_arch_docs", return_value=[]):
+                            with mock.patch.object(mw, "call_model", side_effect=call_model):
+                                return mw.generate_review(args, "o/r")
+
+    def test_generate_review_failed_diff_reviews_file_patches(self) -> None:
+        files = [
+            {
+                "filename": "secret.c",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 1,
+                "patch": "@@ -1,1 +1,1 @@\n-old\n+new secret\n",
+            }
+        ]
+        seen: list[str] = []
+
+        def call_model(_provider, system, user, _model, _key, **_kwargs):
+            seen.append(user)
+            return _pipeline_model_response(
+                system,
+                user,
+                {"event": "APPROVE", "body": "# APPROVE\nLooks good.\n", "comments": []},
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._generate_args(tmp)
+            rc = self._run_generate_review(args, files, call_model)
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        self.assertTrue(seen)
+        self.assertIn("new secret", "\n".join(seen))
+        self.assertNotIn("failed to load complete diff", "\n".join(seen))
+        self.assertEqual(payload["event"], "APPROVE")
+
+    def test_generate_review_failed_diff_without_patches_cannot_approve(self) -> None:
+        files = [
+            {
+                "filename": "secret.c",
+                "status": "modified",
+                "additions": 50,
+                "deletions": 2,
+            }
+        ]
+
+        def call_model(_provider, system, user, _model, _key, **_kwargs):
+            return _pipeline_model_response(
+                system,
+                user,
+                {"event": "APPROVE", "body": "# APPROVE\nLooks good.\n", "comments": []},
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._generate_args(tmp)
+            rc = self._run_generate_review(args, files, call_model)
+            markdown = Path(args.output).read_text(encoding="utf-8")
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(payload["event"], "COMMENT")
+        self.assertEqual(payload.get("comments") or [], [])
+        self.assertIn("did not perform a complete review", markdown)
+        self.assertNotEqual(mw.normalize_event(payload["event"], payload["body"]), "APPROVE")
+        self.assertNotIn("# APPROVE", markdown)
+
     def test_generate_review_does_not_approve_when_coverage_fails(self) -> None:
         pr = _pr(number=1, title="t", body="b")
         with tempfile.TemporaryDirectory() as tmp:
