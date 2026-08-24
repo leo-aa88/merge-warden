@@ -367,6 +367,12 @@ class PipelineDeadlineExceeded(RuntimeError):
     """The caller's wall-clock review budget was exhausted."""
 
 
+@dataclass
+class MapStageResult:
+    analyzed: list[ContextChunk] = field(default_factory=list)
+    deadline_error: PipelineDeadlineExceeded | None = None
+
+
 def sanitize_failure_note(note: str, *, max_chars: int = 240) -> str:
     """Redact secrets and bound a diagnostic note for GitHub review text."""
     text = " ".join((note or "").split())
@@ -462,9 +468,8 @@ def _deadline_result(
     analyzed: list[ContextChunk],
     error: PipelineDeadlineExceeded,
 ) -> tuple[dict, CoverageReport, EvidenceStore, PipelineStats]:
-    # A deadline can interrupt a map sub-batch before it returns its local
-    # acknowledgement list. Under-reporting that sub-batch is intentional:
-    # deadline degradation must be conservative, never optimistic.
+    # The map scheduler reports every sibling batch it already ingested before
+    # a deadline. Only the interrupted provider call remains uncovered.
     mark_chunks_covered(coverage, analyzed)
     stats.map_chunks_acknowledged = len(analyzed)
     stats.map_chunks_uncovered = max(stats.chunks - len(analyzed), 0)
@@ -1406,7 +1411,7 @@ def run_map_stage(
     stats: PipelineStats,
     max_request_chars: int,
     map_concurrency: int,
-) -> list[ContextChunk]:
+) -> MapStageResult:
     """Map packed chunks with bounded parallel provider calls.
 
     Independent batches share a worker pool. ``call_model()`` may overlap.
@@ -1587,9 +1592,7 @@ def run_map_stage(
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
-    if deadline_error is not None:
-        raise deadline_error
-    return analyzed
+    return MapStageResult(analyzed=analyzed, deadline_error=deadline_error)
 
 
 def _mark_incomplete_validation(
@@ -1768,27 +1771,25 @@ def run_hierarchical_review(
     packed = pack_chunks(corpus.reviewable_chunks, payload_limit)
     analyzed: list[ContextChunk] = []
 
-    try:
-        analyzed.extend(
-            run_map_stage(
-                corpus=corpus,
-                packed=packed,
-                store=store,
-                map_prompt=map_prompt,
-                call_model=call_model,
-                stats=stats,
-                max_request_chars=max_map_request_chars,
-                map_concurrency=map_concurrency,
-            )
-        )
-    except PipelineDeadlineExceeded as exc:
+    map_result = run_map_stage(
+        corpus=corpus,
+        packed=packed,
+        store=store,
+        map_prompt=map_prompt,
+        call_model=call_model,
+        stats=stats,
+        max_request_chars=max_map_request_chars,
+        map_concurrency=map_concurrency,
+    )
+    analyzed.extend(map_result.analyzed)
+    if map_result.deadline_error is not None:
         return _deadline_result(
             corpus=corpus,
             coverage=coverage,
             store=store,
             stats=stats,
             analyzed=analyzed,
-            error=exc,
+            error=map_result.deadline_error,
         )
 
     mark_chunks_covered(coverage, analyzed)

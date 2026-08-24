@@ -3582,6 +3582,48 @@ class ParallelMapSchedulerTests(unittest.TestCase):
         self.assertEqual(stats.map_calls_succeeded, 0)
         self.assertTrue(stats.deadline_exhausted)
 
+    def test_deadline_preserves_successful_sibling_acknowledgements(self) -> None:
+        corpus = _synthetic_corpus(_tiny_chunks(16))
+        success_ids = {f"C{index}" for index in range(1, 9)}
+        deadline_ids = {f"C{index}" for index in range(9, 17)}
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system and VALIDATION_STAGE_TOKEN not in user:
+                ids = _chunk_ids_in_prompt(user)
+                if "C1" in ids:
+                    return _map_chunks_json(
+                        ids,
+                        findings=[
+                            {
+                                "id": "F_DEADLINE_SURVIVOR",
+                                "severity": "MAJOR",
+                                "path": "c1.c",
+                                "body": "deadline survivor finding",
+                                "confidence": "LIKELY",
+                            }
+                        ],
+                    )
+                raise PipelineDeadlineExceeded("provider cutoff reached during map")
+            raise AssertionError("no later pipeline stage should run")
+
+        review, coverage, store, stats = self._run(
+            corpus, fake, map_concurrency=2
+        )
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertFalse(coverage.complete)
+        self.assertEqual(set(coverage.uncovered_chunk_ids), deadline_ids)
+        self.assertTrue(success_ids.isdisjoint(coverage.uncovered_chunk_ids))
+        self.assertEqual(stats.map_chunks_acknowledged, len(success_ids))
+        self.assertEqual(stats.map_chunks_uncovered, len(deadline_ids))
+        self.assertEqual(stats.map_calls_succeeded, 1)
+        self.assertEqual(stats.map_batches_split, 0)
+        self.assertTrue(stats.deadline_exhausted)
+        self.assertIn("deadline survivor finding", review["body"])
+        self.assertEqual(
+            _by_local_id(store, "F_DEADLINE_SURVIVOR").body,
+            "deadline survivor finding",
+        )
+
     def test_failed_batch_does_not_poison_successful_siblings(self) -> None:
         corpus = _synthetic_corpus(_tiny_chunks(16))
         poison = {f"C{index}" for index in range(9, 17)}
