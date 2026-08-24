@@ -204,16 +204,23 @@ Merge Warden also enforces an internal wall-clock review budget. The default is
 900 seconds, with the final 60 seconds reserved for writing artifacts and
 posting the GitHub review. Inside the remaining provider budget, the last 120
 seconds are reserved for reduction and the last 150 seconds for final
-synthesis. Validation cannot consume those reserves: once the validation-stage
-deadline is reached, remaining cross-context checks are marked
-`validation:incomplete:<path>` and the pipeline continues to reduction and
-synthesis. Incomplete validation is acceptable; a review with no synthesis is
-not. Provider request timeouts and retry sleeps are clamped to the remaining
-stage budget. If the global deadline is exhausted at any map, pre-reduce,
-reduce, or synthesis stage, the pipeline preserves the evidence collected so
-far and returns a fail-closed `COMMENT` instead of waiting for the outer
-GitHub Actions timeout to kill the process. Keep the workflow job timeout
-comfortably above `review-timeout-seconds`.
+synthesis. Provider request timeouts and retry sleeps are clamped to the
+stage cutoff:
+
+- pre-reduce and validation stop `270s` before the provider cutoff
+- reduce stops `150s` before the provider cutoff
+- synthesis uses the remaining provider budget
+
+Once a stage cutoff is reached, that stage stops scheduling new provider
+calls and the pipeline continues. Remaining cross-context checks are marked
+`validation:incomplete:<path>`. Remaining reduce groups are kept. Incomplete
+validation is acceptable; a review with no synthesis is not. Map still uses
+the full provider deadline; exhausting it fail-closes to `COMMENT` because
+primary coverage is incomplete. If synthesis itself hits the provider cutoff,
+the pipeline preserves the evidence collected so far and returns a fail-closed
+`COMMENT` instead of waiting for the outer GitHub Actions timeout to kill the
+process. Keep the workflow job timeout comfortably above
+`review-timeout-seconds`.
 
 Optional environment overrides:
 

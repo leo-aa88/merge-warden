@@ -27,6 +27,7 @@ from context_pipeline import (
 
 MAP_STAGE_TOKEN = "merge-warden-map"
 REDUCE_STAGE_TOKEN = "merge-warden-reduce"
+PRE_REDUCE_STAGE_TOKEN = "merge-warden-pre-reduce"
 VALIDATION_STAGE_TOKEN = "merge-warden-validation"
 DEFAULT_PROMPT_MAP = Path(__file__).resolve().parent / "prompt_map.md"
 DEFAULT_PROMPT_REDUCE = Path(__file__).resolve().parent / "prompt_reduce.md"
@@ -272,6 +273,7 @@ class PipelineStats:
     coverage_complete: bool = False
     deadline_exhausted: bool = False
     validation_deadline_exhausted: bool = False
+    reduce_deadline_exhausted: bool = False
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -301,6 +303,8 @@ class PipelineStats:
             extras.append("deadline exhausted")
         if self.validation_deadline_exhausted:
             extras.append("validation budget exhausted")
+        if self.reduce_deadline_exhausted:
+            extras.append("reduce budget exhausted")
         extra = f", {', '.join(extras)}" if extras else ""
         total_request_chars = (
             self.map_request_chars
@@ -397,11 +401,23 @@ class PipelineDeadlineExceeded(RuntimeError):
     """The caller's wall-clock review budget was exhausted."""
 
 
+def reduce_stage_deadline(provider_deadline: float | None) -> float | None:
+    """Latest monotonic time at which a new reduce call may start.
+
+    Synthesis keeps a reserved tail of the provider budget so reduction cannot
+    starve the stage that produces a review decision.
+    """
+    if provider_deadline is None:
+        return None
+    return provider_deadline - float(SYNTHESIS_RESERVE_SECONDS)
+
+
 def validation_stage_deadline(provider_deadline: float | None) -> float | None:
     """Latest monotonic time at which a new validation call may start.
 
-    Reduction and synthesis keep a reserved tail of the provider budget so
-    validation cannot starve the stages that produce a review decision.
+    Pre-reduce shares this cutoff so mapper triage cannot consume the reserved
+    reduce/synthesis tail. Reduction and synthesis keep that tail so later
+    stages can still produce a review decision.
     """
     if provider_deadline is None:
         return None
@@ -417,11 +433,14 @@ def provider_stage_deadline(
 ) -> float | None:
     """Clamp a provider call to the stage-specific cutoff.
 
-    Validation uses an earlier cutoff so in-flight HTTP work cannot consume
-    the reduce/synthesis reserves. Other stages use the full provider deadline.
+    Pre-reduce and validation stop before the reduce+synthesis reserves.
+    Reduce stops before the synthesis reserve. Map and synthesis use the
+    full provider deadline; a map cutoff currently fail-closes the review.
     """
-    if stage == "validation":
+    if stage in {"validation", "pre-reduce"}:
         return validation_stage_deadline(provider_deadline)
+    if stage == "reduce":
+        return reduce_stage_deadline(provider_deadline)
     return provider_deadline
 
 
@@ -1160,13 +1179,17 @@ def plan_requests(
 def format_reduce_user_message(
     findings: list[Finding],
     contracts: list[Contract],
+    *,
+    stage_token: str = "",
 ) -> str:
     payload = {
         "findings": [finding_record(item) for item in findings],
         "contracts": [contract_record(item) for item in contracts],
     }
+    prefix = f"<!-- {stage_token} -->\n\n" if stage_token else ""
     return (
-        "Decide keep / reject / merge for these finding IDs. "
+        prefix
+        + "Decide keep / reject / merge for these finding IDs. "
         "Do not rewrite finding bodies. Do not make the merge decision.\n\n"
         + json.dumps(payload, indent=2)
         + "\n"
@@ -1300,6 +1323,16 @@ def _reduce_view(store: EvidenceStore, finding_id: str) -> Finding:
     return aggregate_finding(store.findings.get(canonical_id, finding), members)
 
 
+def _record_reduce_deadline(stats: PipelineStats) -> None:
+    stats.reduce_deadline_exhausted = True
+    note = (
+        "reduce stage deadline exhausted; preserving remaining findings "
+        "so synthesis can run"
+    )
+    if note not in stats.notes:
+        stats.notes.append(note)
+
+
 def hierarchical_reduce(
     store: EvidenceStore,
     reduce_prompt: str,
@@ -1307,6 +1340,8 @@ def hierarchical_reduce(
     max_request_chars: int,
     stats: PipelineStats,
     findings: list[Finding] | None = None,
+    deadline: float | None = None,
+    stage_token: str = "",
 ) -> None:
     if findings is None:
         findings = list(store.findings.values())
@@ -1317,6 +1352,14 @@ def hierarchical_reduce(
     if len(findings) == 1:
         store.kept.add(findings[0].id)
         return
+
+    def deadline_reached() -> bool:
+        return deadline is not None and deadline - time.monotonic() <= 0
+
+    def stop_for_deadline() -> None:
+        _record_reduce_deadline(stats)
+        _preserve_unresolved_findings(store)
+
     groups: list[list[Finding]] = [
         findings[index : index + REDUCE_GROUP_SIZE]
         for index in range(0, len(findings), REDUCE_GROUP_SIZE)
@@ -1328,7 +1371,12 @@ def hierarchical_reduce(
         round_number += 1
         next_kept_ids: list[str] = []
         for group in groups:
-            payload = format_reduce_user_message(group, contracts)
+            if deadline_reached():
+                stop_for_deadline()
+                return
+            payload = format_reduce_user_message(
+                group, contracts, stage_token=stage_token
+            )
             if len(payload) > max_request_chars:
                 # Evidence stays in memory; do not truncate bodies. Keep the group.
                 stats.notes.append(
@@ -1342,7 +1390,8 @@ def hierarchical_reduce(
             try:
                 raw = _call(call_model, reduce_prompt, payload, stats, "reduce")
             except PipelineDeadlineExceeded:
-                raise
+                stop_for_deadline()
+                return
             except Exception as exc:  # pragma: no cover - defensive
                 stats.notes.append(f"reduce call failed ({exc}); keeping original findings")
                 for item in group:
@@ -1410,6 +1459,7 @@ def run_pre_reduce(
     call_model: CallModel,
     max_request_chars: int,
     stats: PipelineStats,
+    deadline: float | None = None,
 ) -> None:
     """Triage raw mapper findings before cross-context validation.
 
@@ -1420,7 +1470,13 @@ def run_pre_reduce(
     """
     stats.raw_finding_count = len(store.findings)
     hierarchical_reduce(
-        store, reduce_prompt, call_model, max_request_chars, stats
+        store,
+        reduce_prompt,
+        call_model,
+        max_request_chars,
+        stats,
+        deadline=deadline,
+        stage_token=PRE_REDUCE_STAGE_TOKEN,
     )
     store.reduced = True
     prune_context_needs(store)
@@ -1962,6 +2018,9 @@ def run_validation_pass(
             # Rejected or superseded findings must not generate validation work.
             continue
         related_for_prompt = validation_related_findings(store, related)[:12]
+        if cannot_start_provider_call():
+            _mark_incomplete_validation(store, related, path)
+            continue
         stats.validation_requests += 1
         extra = _load_source_chunks(corpus, path, context_loader)
         if not extra:
@@ -1969,9 +2028,6 @@ def run_validation_pass(
             stats.notes.append(
                 f"validation for {path} could not load requested context"
             )
-            continue
-        if cannot_start_provider_call():
-            _mark_incomplete_validation(store, related, path)
             continue
 
         def render_validation(batch: list[ContextChunk]) -> str:
@@ -2118,6 +2174,7 @@ def run_hierarchical_review(
             call_model,
             max_reduce_request_chars,
             stats,
+            deadline=validation_stage_deadline(deadline),
         )
         mapped_ids = set(store.findings)
         run_validation_pass(
@@ -2137,16 +2194,16 @@ def run_hierarchical_review(
             max_reduce_request_chars,
             stats,
             findings=seed_final_reduce(store, mapped_ids),
+            deadline=reduce_stage_deadline(deadline),
         )
     except PipelineDeadlineExceeded as exc:
-        return _deadline_result(
-            corpus=corpus,
-            coverage=coverage,
-            store=store,
-            stats=stats,
-            analyzed=analyzed,
-            error=exc,
-        )
+        # Stage cutoffs inside pre-reduce/validation/reduce are swallowed by
+        # those functions. If one still escapes, keep evidence and continue
+        # to synthesis rather than fail-closing the review.
+        _preserve_unresolved_findings(store)
+        note = sanitize_failure_note(f"stage deadline exhausted: {exc}")
+        if note and note not in stats.notes:
+            stats.notes.append(note)
     stats.coverage_complete = all_reviewable_context_covered(coverage)
 
     if not all_reviewable_context_covered(coverage):

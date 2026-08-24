@@ -24,6 +24,7 @@ from review_pipeline import (
     DEFAULT_MAP_CONCURRENCY,
     DEFAULT_PROMPT_MAP,
     DEFAULT_PROMPT_REDUCE,
+    PRE_REDUCE_STAGE_TOKEN,
     REDUCE_RESERVE_SECONDS,
     SYNTHESIS_RESERVE_SECONDS,
     VALIDATION_STAGE_TOKEN,
@@ -341,10 +342,13 @@ def provider_call_stage(system_prompt: str, user_message: str) -> str:
     """Label a provider call for Actions logs.
 
     Validation reuses the map system prompt, so the stage is taken from the
-    user message token rather than the system prompt.
+    user message token rather than the system prompt. Pre-reduce reuses the
+    reduce system prompt and is likewise labeled from the user message.
     """
     if f"<!-- {VALIDATION_STAGE_TOKEN} -->" in (user_message or ""):
         return "validation"
+    if f"<!-- {PRE_REDUCE_STAGE_TOKEN} -->" in (user_message or ""):
+        return "pre-reduce"
     if "merge-warden-map" in (system_prompt or ""):
         return "map"
     if "merge-warden-reduce" in (system_prompt or ""):
@@ -1615,6 +1619,13 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             "::warning::Merge Warden validation stage deadline exhausted; "
             "continuing to reduction and synthesis with incomplete "
             "cross-context checks",
+            file=sys.stderr,
+            flush=True,
+        )
+    if stats.reduce_deadline_exhausted:
+        print(
+            "::warning::Merge Warden reduce stage deadline exhausted; "
+            "preserving remaining findings so synthesis can run",
             file=sys.stderr,
             flush=True,
         )
