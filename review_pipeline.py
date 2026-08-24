@@ -22,7 +22,6 @@ from context_pipeline import (
     incomplete_coverage_body,
     incomplete_limit_body,
     mark_chunks_covered,
-    pack_chunks,
 )
 
 MAP_STAGE_TOKEN = "merge-warden-map"
@@ -37,12 +36,22 @@ MAX_VALIDATION_CALLS = 8
 # Cap on candidate findings in one validation prompt. Slice after ranking so
 # the findings that purchased the slot remain in the payload.
 MAX_VALIDATION_PROMPT_FINDINGS = 12
-# Protected tail of the provider budget. Pre-reduce and validation stop
-# REDUCE_RESERVE_SECONDS + SYNTHESIS_RESERVE_SECONDS before the provider
-# cutoff. Final reduce stops SYNTHESIS_RESERVE_SECONDS before it. Synthesis
-# keeps that last window so a review decision can still be produced.
+# Protected tail of the provider budget. Earlier stages may surrender unused
+# time to later stages, but they may never consume time reserved for later
+# stages. Map stops VALIDATION+REDUCE+SYNTHESIS before the provider cutoff.
+# Pre-reduce and validation stop REDUCE+SYNTHESIS before it. Final reduce
+# stops SYNTHESIS before it. Synthesis keeps that last window so a review
+# decision can still be produced.
+VALIDATION_RESERVE_SECONDS = 150
 REDUCE_RESERVE_SECONDS = 120
 SYNTHESIS_RESERVE_SECONDS = 150
+# Map calls get a tighter latency budget than the whole provider window so a
+# slow batch splits while downstream reserves are still intact.
+MAP_CALL_BUDGET_SECONDS = 120
+MAP_HTTP_TIMEOUT_SECONDS = 90
+MAP_HTTP_ATTEMPTS = 2
+# Soft packing target in chunk characters. Hard request limits still win.
+MAP_SOFT_REQUEST_TARGET_CHARS = 32_000
 CANDIDATE_FINDINGS_NOT_POSTED = (
     "Candidate findings were intentionally not posted as inline comments "
     "because final synthesis did not complete."
@@ -295,6 +304,7 @@ class PipelineStats:
     total_chars: int = 0
     coverage_complete: bool = False
     deadline_exhausted: bool = False
+    map_deadline_exhausted: bool = False
     validation_deadline_exhausted: bool = False
     pre_reduce_deadline_exhausted: bool = False
     reduce_deadline_exhausted: bool = False
@@ -325,6 +335,8 @@ class PipelineStats:
         extras: list[str] = []
         if self.deadline_exhausted:
             extras.append("deadline exhausted")
+        if self.map_deadline_exhausted:
+            extras.append("map budget exhausted")
         if self.validation_deadline_exhausted:
             extras.append("validation budget exhausted")
         if self.pre_reduce_deadline_exhausted:
@@ -470,6 +482,24 @@ class PipelineDeadlineExceeded(RuntimeError):
     """The caller's wall-clock review budget was exhausted."""
 
 
+class StageDeadlineExceeded(RuntimeError):
+    """A stage allocation expired; later stages may still run.
+
+    Distinct from ``PipelineDeadlineExceeded`` so map-stage exhaustion cannot
+    be mistaken for a dead review. Downstream reserves must stay usable.
+    """
+
+    def __init__(self, stage: str, message: str = "") -> None:
+        self.stage = stage
+        super().__init__(message or f"{stage} stage deadline exhausted")
+
+
+def remaining_stage_seconds(deadline: float | None, *, now: float | None = None) -> float | None:
+    if deadline is None:
+        return None
+    return deadline - (time.monotonic() if now is None else now)
+
+
 def reduce_stage_deadline(provider_deadline: float | None) -> float | None:
     """Latest monotonic time at which a new reduce call may start.
 
@@ -497,15 +527,33 @@ def validation_stage_deadline(provider_deadline: float | None) -> float | None:
     )
 
 
+def map_stage_deadline(provider_deadline: float | None) -> float | None:
+    """Latest monotonic time at which a new map call may start.
+
+    Map cannot consume the validation, reduce, or synthesis reserves. Unused
+    map time is surrendered to later stages; the reverse is forbidden.
+    """
+    if provider_deadline is None:
+        return None
+    return (
+        provider_deadline
+        - float(VALIDATION_RESERVE_SECONDS)
+        - float(REDUCE_RESERVE_SECONDS)
+        - float(SYNTHESIS_RESERVE_SECONDS)
+    )
+
+
 def provider_stage_deadline(
     stage: str, provider_deadline: float | None
 ) -> float | None:
     """Clamp a provider call to the stage-specific cutoff.
 
-    Pre-reduce and validation stop before the reduce+synthesis reserves.
-    Reduce stops before the synthesis reserve. Map and synthesis use the
-    full provider deadline; a map cutoff currently fail-closes the review.
+    Map stops before the validation+reduce+synthesis reserves. Pre-reduce and
+    validation stop before the reduce+synthesis reserves. Reduce stops before
+    the synthesis reserve. Synthesis uses the remaining provider deadline.
     """
+    if stage == "map":
+        return map_stage_deadline(provider_deadline)
     if stage in {"validation", "pre-reduce"}:
         return validation_stage_deadline(provider_deadline)
     if stage == "reduce":
@@ -517,6 +565,7 @@ def provider_stage_deadline(
 class MapStageResult:
     analyzed: list[ContextChunk] = field(default_factory=list)
     deadline_error: PipelineDeadlineExceeded | None = None
+    stage_exhausted: bool = False
 
 
 def sanitize_failure_note(note: str, *, max_chars: int = 240) -> str:
@@ -623,6 +672,7 @@ def _deadline_result(
     mark_chunks_covered(coverage, analyzed)
     stats.map_chunks_acknowledged = len(analyzed)
     stats.map_chunks_uncovered = max(stats.chunks - len(analyzed), 0)
+    stats.raw_finding_count = len(store.findings)
     stats.coverage_complete = all_reviewable_context_covered(coverage)
     stats.deadline_exhausted = True
     note = sanitize_failure_note(f"review deadline exhausted: {error}")
@@ -1494,7 +1544,7 @@ def hierarchical_reduce(
                 continue
             try:
                 raw = _call(call_model, reduce_prompt, payload, stats, "reduce")
-            except PipelineDeadlineExceeded:
+            except (PipelineDeadlineExceeded, StageDeadlineExceeded):
                 stop_for_deadline()
                 return
             except Exception as exc:  # pragma: no cover - defensive
@@ -1596,8 +1646,75 @@ def split_map_batch(
     return batch[:mid], batch[mid:]
 
 
+def pack_map_batches(
+    chunks: list[ContextChunk],
+    *,
+    max_chars: int,
+    max_chunks: int,
+    soft_target: int = MAP_SOFT_REQUEST_TARGET_CHARS,
+) -> list[list[ContextChunk]]:
+    """Pack map chunks by serialized size using deterministic LPT bin balancing.
+
+    Largest chunks are placed first into the currently smallest compatible
+    batch. Compatibility is ``max_chunks``, the hard ``max_chars`` cap, and a
+    soft request target so one 60k request is not scheduled beside several 3k
+    requests. A chunk larger than the soft target still occupies a batch of
+    its own. Original corpus order is restored inside each batch. Hard
+    serialized request limits are still enforced by ``plan_requests``.
+    """
+    if not chunks:
+        return []
+    if max_chars <= 0 or max_chunks <= 0:
+        return [[chunk] for chunk in chunks]
+
+    indexed = list(enumerate(chunks))
+    ordered = sorted(indexed, key=lambda item: (-item[1].size, item[0]))
+    bins: list[list[tuple[int, ContextChunk]]] = []
+    sizes: list[int] = []
+
+    def can_accept(bin_index: int, extra: int) -> bool:
+        members = bins[bin_index]
+        if len(members) >= max_chunks:
+            return False
+        new_size = sizes[bin_index] + extra
+        if new_size > max_chars:
+            return False
+        if sizes[bin_index] > 0 and new_size > soft_target:
+            return False
+        return True
+
+    for origin, chunk in ordered:
+        extra = chunk.size
+        eligible = [index for index in range(len(bins)) if can_accept(index, extra)]
+        if eligible:
+            choice = min(eligible, key=lambda index: (sizes[index], index))
+            bins[choice].append((origin, chunk))
+            sizes[choice] += extra
+            continue
+        bins.append([(origin, chunk)])
+        sizes.append(extra)
+
+    decorated: list[tuple[int, list[ContextChunk]]] = []
+    for members in bins:
+        members.sort(key=lambda item: item[0])
+        decorated.append((members[0][0], [chunk for _origin, chunk in members]))
+    decorated.sort(key=lambda item: item[0])
+    return [batch for _origin, batch in decorated]
+
+
 def _record_map_budget_exhausted(stats: PipelineStats) -> None:
     note = "map attempt budget exhausted; remaining chunks left uncovered"
+    if note not in stats.notes:
+        stats.notes.append(note)
+
+
+def _record_map_stage_exhausted(stats: PipelineStats, uncovered: int) -> None:
+    stats.map_deadline_exhausted = True
+    note = (
+        f"map stage budget exhausted with {uncovered} chunk(s) uncovered; "
+        f"continuing to downstream stages with {SYNTHESIS_RESERVE_SECONDS}s "
+        "synthesis reserve intact"
+    )
     if note not in stats.notes:
         stats.notes.append(note)
 
@@ -1745,8 +1862,14 @@ def _follow_up_batches(
     single_failures: dict[str, int],
     stats: PipelineStats,
     batch_tag: str,
+    *,
+    elapsed_seconds: float = 0.0,
 ) -> list[list[ContextChunk]]:
-    """Retry/split work for one ingested map result. Scheduler thread only."""
+    """Retry/split work for one ingested map result. Scheduler thread only.
+
+    Multi-chunk timeouts and provider failures split immediately rather than
+    retrying the same expensive shape. Single-chunk misses still get one retry.
+    """
     remaining = [chunk for chunk in result.missing if chunk.id not in mapped_ids]
     if result.complete or not remaining or result.budget_exhausted:
         return []
@@ -1776,10 +1899,15 @@ def _follow_up_batches(
         return []
     left, right = split_map_batch(current)
     stats.map_batches_split += 1
+    reason = (
+        f" exceeded call latency budget after {elapsed_seconds:.0f}s;"
+        if result.provider_failed and elapsed_seconds > 0
+        else ":"
+    )
     stats.notes.append(
         sanitize_failure_note(
-            f"map batch {batch_tag}: {len(current)}-chunk request was split "
-            f"into {len(left)} + {len(right)}"
+            f"map batch {batch_tag}{reason} {len(current)}-chunk request was "
+            f"split into {len(left)} + {len(right)}"
         )
     )
     return [part for part in (left, right) if part]
@@ -1827,6 +1955,17 @@ def _plan_primary_map_work(
     return items
 
 
+def _pending_uncovered_count(
+    pending: deque[MapWorkItem], mapped_ids: set[str]
+) -> int:
+    leftover: set[str] = set()
+    for item in pending:
+        for chunk in item.chunks:
+            if chunk.id not in mapped_ids:
+                leftover.add(chunk.id)
+    return len(leftover)
+
+
 def run_map_stage(
     *,
     corpus: ReviewCorpus,
@@ -1837,12 +1976,18 @@ def run_map_stage(
     stats: PipelineStats,
     max_request_chars: int,
     map_concurrency: int,
+    deadline: float | None = None,
 ) -> MapStageResult:
     """Map packed chunks with bounded parallel provider calls.
 
     Independent batches share a worker pool. ``call_model()`` may overlap.
     ``ingest_map_result()`` and stats updates stay on this thread in
     sequence order so completion order cannot change evidence identity.
+
+    ``deadline`` is the map-stage cutoff. Exhausting it stops new map calls
+    and leaves remaining chunks uncovered so validation, reduce, and
+    synthesis can still use their reserved windows. A global
+    ``PipelineDeadlineExceeded`` still aborts the whole review.
     """
     concurrency = normalize_map_concurrency(map_concurrency)
     pending: deque[MapWorkItem] = deque(
@@ -1868,9 +2013,35 @@ def run_map_stage(
     completed: dict[int, MapWorkerResult] = {}
     in_flight: dict[int, Future[MapWorkerResult]] = {}
     deadline_error: PipelineDeadlineExceeded | None = None
+    stage_exhausted = False
+
+    def remaining_map_seconds() -> float | None:
+        return remaining_stage_seconds(deadline)
+
+    def map_stage_reached() -> bool:
+        remaining = remaining_map_seconds()
+        return remaining is not None and remaining <= 0
+
+    def map_call_fits_remaining_budget() -> bool:
+        remaining = remaining_map_seconds()
+        if remaining is None:
+            return True
+        return remaining >= MAP_CALL_BUDGET_SECONDS
 
     def enqueue(parts: list[list[ContextChunk]], parent_tag: str) -> None:
         nonlocal next_sequence
+        if not map_call_fits_remaining_budget():
+            # Follow-up work exists, but not a full map call budget. Stop map
+            # so synthesis can still use its reserved window.
+            extra = {
+                chunk.id
+                for part in parts
+                for chunk in part
+                if chunk.id not in mapped_ids
+            }
+            if extra:
+                exhaust_map_stage(extra_uncovered=len(extra))
+            return
         for part in parts:
             leftover = [chunk for chunk in part if chunk.id not in mapped_ids]
             if not leftover:
@@ -1900,6 +2071,20 @@ def run_map_stage(
             deadline_error = deadline_error or error
         abandon_pending()
 
+    def exhaust_map_stage(*, extra_uncovered: int = 0) -> None:
+        nonlocal stage_exhausted
+        if not stage_exhausted:
+            uncovered = _pending_uncovered_count(pending, mapped_ids) + extra_uncovered
+            _record_map_stage_exhausted(stats, uncovered)
+            print(
+                f"Map stage budget exhausted with {uncovered} chunk(s) uncovered; "
+                f"continuing to downstream stages with "
+                f"{SYNTHESIS_RESERVE_SECONDS}s synthesis reserve intact.",
+                flush=True,
+            )
+        stage_exhausted = True
+        abandon_pending()
+
     executor = ThreadPoolExecutor(
         max_workers=concurrency,
         thread_name_prefix="mw-map",
@@ -1910,7 +2095,11 @@ def run_map_stage(
                 pending
                 and len(in_flight) < concurrency
                 and deadline_error is None
+                and not stage_exhausted
             ):
+                if map_stage_reached():
+                    exhaust_map_stage()
+                    break
                 item = pending.popleft()
                 item.chunks = [
                     chunk for chunk in item.chunks if chunk.id not in mapped_ids
@@ -1922,13 +2111,22 @@ def run_map_stage(
                     continue
                 if not item.message:
                     item.message = format_map_user_message(corpus, item.chunks)
+                remaining = remaining_map_seconds()
+                remaining_display = (
+                    "unbounded" if remaining is None else f"{remaining:.0f}s"
+                )
                 print(
-                    f"Map batch {item.batch_tag}: {len(item.chunks)} chunk(s), "
-                    f"{sum(chunk.size for chunk in item.chunks)} chunk chars, "
-                    f"{len(item.message)} request chars "
+                    f"Map batch {item.batch_tag}: chunks={len(item.chunks)} "
+                    f"request_chars={len(item.message)} "
+                    f"stage_remaining={remaining_display} "
+                    f"call_budget={MAP_CALL_BUDGET_SECONDS}s "
                     f"({len(in_flight) + 1} in flight)",
                     flush=True,
                 )
+                if map_stage_reached() or not map_call_fits_remaining_budget():
+                    pending.appendleft(item)
+                    exhaust_map_stage()
+                    break
                 if len(item.message) > max_request_chars:
                     completed[item.sequence] = MapWorkerResult(
                         item=item,
@@ -1964,6 +2162,20 @@ def run_map_stage(
                         flush=True,
                     )
                     continue
+                if isinstance(result.error, StageDeadlineExceeded):
+                    print(
+                        f"Map batch {result.item.batch_tag}: map stage cutoff "
+                        f"after {result.elapsed_seconds:.1f}s",
+                        flush=True,
+                    )
+                    exhaust_map_stage(
+                        extra_uncovered=sum(
+                            1
+                            for chunk in result.item.chunks
+                            if chunk.id not in mapped_ids
+                        )
+                    )
+                    continue
                 attempt = apply_map_response(store, stats, result)
                 print(
                     f"Map batch {result.item.batch_tag}: ingested "
@@ -1976,7 +2188,7 @@ def run_map_stage(
                         continue
                     mapped_ids.add(chunk.id)
                     analyzed.append(chunk)
-                if deadline_error is not None:
+                if deadline_error is not None or stage_exhausted:
                     continue
                 if stats.map_attempts >= MAX_MAP_ATTEMPTS:
                     _record_map_budget_exhausted(stats)
@@ -1989,12 +2201,17 @@ def run_map_stage(
                         single_failures,
                         stats,
                         result.item.batch_tag,
+                        elapsed_seconds=result.elapsed_seconds,
                     ),
                     result.item.batch_tag,
                 )
 
             if not in_flight:
-                if deadline_error is not None or stats.map_attempts >= MAX_MAP_ATTEMPTS:
+                if (
+                    deadline_error is not None
+                    or stage_exhausted
+                    or stats.map_attempts >= MAX_MAP_ATTEMPTS
+                ):
                     abandon_pending()
                 if not pending and not completed:
                     break
@@ -2016,10 +2233,22 @@ def run_map_stage(
                 completed[sequence] = worker_result
                 if isinstance(worker_result.error, PipelineDeadlineExceeded):
                     stop_scheduling(worker_result.error)
+                elif isinstance(worker_result.error, StageDeadlineExceeded):
+                    exhaust_map_stage(
+                        extra_uncovered=sum(
+                            1
+                            for chunk in worker_result.item.chunks
+                            if chunk.id not in mapped_ids
+                        )
+                    )
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
-    return MapStageResult(analyzed=analyzed, deadline_error=deadline_error)
+    return MapStageResult(
+        analyzed=analyzed,
+        deadline_error=deadline_error,
+        stage_exhausted=stage_exhausted or stats.map_deadline_exhausted,
+    )
 
 
 def _mark_incomplete_validation(
@@ -2447,7 +2676,9 @@ def run_validation_pass(
                 result = completed.pop(next_ingest)
                 task = task_by_sequence.pop(next_ingest)
                 next_ingest += 1
-                if isinstance(result.error, PipelineDeadlineExceeded):
+                if isinstance(
+                    result.error, (PipelineDeadlineExceeded, StageDeadlineExceeded)
+                ):
                     record_deadline_reached()
                     print(
                         f"Validation {result.item.path}: deadline exhausted "
@@ -2491,7 +2722,9 @@ def run_validation_pass(
                 in_flight.pop(sequence)
                 completed[sequence] = future.result()
                 error = completed[sequence].error
-                if isinstance(error, PipelineDeadlineExceeded):
+                if isinstance(
+                    error, (PipelineDeadlineExceeded, StageDeadlineExceeded)
+                ):
                     stop_validation = True
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
@@ -2535,8 +2768,24 @@ def run_hierarchical_review(
     # Overhead is a packing hint only. Actual serialized requests are split
     # and bounded in `run_map_stage` before every provider call.
     payload_limit = max(max_map_request_chars - map_overhead_chars, 1)
-    packed = pack_chunks(corpus.reviewable_chunks, payload_limit)
+    packed = pack_map_batches(
+        corpus.reviewable_chunks,
+        max_chars=payload_limit,
+        max_chunks=MAX_MAP_CHUNKS_PER_CALL,
+        soft_target=MAP_SOFT_REQUEST_TARGET_CHARS,
+    )
     analyzed: list[ContextChunk] = []
+    map_deadline = map_stage_deadline(deadline)
+    if deadline is not None:
+        now = time.monotonic()
+        print(
+            "Stage budgets: "
+            f"map cutoff +{max(map_deadline - now, 0):.0f}s, "
+            f"validation cutoff +{max(validation_stage_deadline(deadline) - now, 0):.0f}s, "
+            f"reduce cutoff +{max(reduce_stage_deadline(deadline) - now, 0):.0f}s, "
+            f"synthesis/provider cutoff +{max(deadline - now, 0):.0f}s",
+            flush=True,
+        )
 
     map_result = run_map_stage(
         corpus=corpus,
@@ -2547,8 +2796,10 @@ def run_hierarchical_review(
         stats=stats,
         max_request_chars=max_map_request_chars,
         map_concurrency=map_concurrency,
+        deadline=map_deadline,
     )
     analyzed.extend(map_result.analyzed)
+    stats.raw_finding_count = len(store.findings)
     if map_result.deadline_error is not None:
         return _deadline_result(
             corpus=corpus,
@@ -2562,6 +2813,8 @@ def run_hierarchical_review(
     mark_chunks_covered(coverage, analyzed)
     stats.map_chunks_acknowledged = len(analyzed)
     stats.map_chunks_uncovered = max(stats.chunks - len(analyzed), 0)
+    if map_result.stage_exhausted:
+        stats.map_deadline_exhausted = True
     try:
         run_pre_reduce(
             store,
@@ -2592,7 +2845,7 @@ def run_hierarchical_review(
             findings=seed_final_reduce(store, mapped_ids),
             deadline=reduce_stage_deadline(deadline),
         )
-    except PipelineDeadlineExceeded as exc:
+    except (PipelineDeadlineExceeded, StageDeadlineExceeded) as exc:
         # Stage cutoffs inside pre-reduce/validation/reduce are swallowed by
         # those functions. If one still escapes, keep evidence and continue
         # to synthesis rather than fail-closing the review.
@@ -2602,7 +2855,8 @@ def run_hierarchical_review(
             stats.notes.append(note)
     stats.coverage_complete = all_reviewable_context_covered(coverage)
 
-    if not all_reviewable_context_covered(coverage):
+    coverage_complete = all_reviewable_context_covered(coverage)
+    if not coverage_complete and not stats.map_deadline_exhausted:
         preamble = _incomplete_preamble(corpus, coverage, stats)
         if corpus.limit_error:
             preamble = incomplete_limit_body(corpus.limit_error)
