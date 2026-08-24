@@ -24,12 +24,14 @@ from review_pipeline import (
     DEFAULT_MAP_CONCURRENCY,
     DEFAULT_PROMPT_MAP,
     DEFAULT_PROMPT_REDUCE,
+    DEFAULT_VALIDATION_CONCURRENCY,
     PRE_REDUCE_STAGE_TOKEN,
     REDUCE_RESERVE_SECONDS,
     SYNTHESIS_RESERVE_SECONDS,
     VALIDATION_STAGE_TOKEN,
     PipelineDeadlineExceeded,
     normalize_map_concurrency,
+    normalize_validation_concurrency,
     provider_stage_deadline,
     run_hierarchical_review,
 )
@@ -1444,6 +1446,15 @@ def parse_args() -> argparse.Namespace:
         ),
         help="Max independent map provider requests in flight (1-8)",
     )
+    parser.add_argument(
+        "--validation-concurrency",
+        type=int,
+        default=env_int(
+            "MERGE_WARDEN_VALIDATION_CONCURRENCY",
+            DEFAULT_VALIDATION_CONCURRENCY,
+        ),
+        help="Max independent validation provider requests in flight (1-4)",
+    )
     return parser.parse_args()
 
 
@@ -1478,6 +1489,9 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
     map_concurrency = normalize_map_concurrency(
         getattr(args, "map_concurrency", DEFAULT_MAP_CONCURRENCY)
     )
+    validation_concurrency = normalize_validation_concurrency(
+        getattr(args, "validation_concurrency", DEFAULT_VALIDATION_CONCURRENCY)
+    )
     print(
         f"Review budget: {review_timeout_seconds}s total; "
         f"provider cutoff after "
@@ -1485,7 +1499,8 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
         f"{shutdown_reserve_seconds}s reserved for output/posting; "
         f"{REDUCE_RESERVE_SECONDS}s reserved for reduce, "
         f"{SYNTHESIS_RESERVE_SECONDS}s reserved for synthesis; "
-        f"map concurrency {map_concurrency}",
+        f"map concurrency {map_concurrency}; "
+        f"validation concurrency {validation_concurrency}",
         flush=True,
     )
 
@@ -1594,6 +1609,7 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             "MERGE_WARDEN_MAX_MAP_OVERHEAD_CHARS", MAX_MAP_OVERHEAD_CHARS
         ),
         map_concurrency=map_concurrency,
+        validation_concurrency=validation_concurrency,
         context_loader=make_context_loader(
             args.head_ref,
             env_int("MERGE_WARDEN_MAX_LAZY_CONTEXT_BYTES", MAX_LAZY_CONTEXT_BYTES),

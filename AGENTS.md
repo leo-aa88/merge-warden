@@ -89,9 +89,9 @@ Violating one of these is a blocking defect, not a style disagreement.
    SHA. New inputs need behavior-preserving defaults. Renaming or removing an
    input or output, or changing a default, breaks callers on their next SHA
    bump.
-7. **Determinism where it matters.** Map batches run concurrently, but evidence
-   ingestion, coverage accounting, and retry/split decisions stay
-   single-threaded.
+7. **Determinism where it matters.** Map batches and independent validation
+   requests run concurrently, but evidence ingestion, coverage accounting, and
+   retry/split decisions stay single-threaded.
 8. **Reduce stages decide finding IDs, not prose.** They keep, reject, or merge
    IDs. They never rewrite finding bodies and never escalate severity or
    confidence.

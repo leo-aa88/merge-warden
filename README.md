@@ -146,6 +146,7 @@ comment-count outputs) rather than assuming the generated event was published.
 | `review-timeout-seconds` | no | `900` | Internal wall-clock review budget; exhaustion fail-closes to `COMMENT` |
 | `shutdown-reserve-seconds` | no | `60` | Time reserved inside the review budget for outputs and posting |
 | `map-concurrency` | no | `4` | Max independent map provider requests in flight (1–8) |
+| `validation-concurrency` | no | `2` | Max independent validation provider requests in flight (1–4) |
 
 The action never executes PR code. It checks out the default branch (caller
 must `actions/checkout`), fetches the PR head as a git ref, and reads files
@@ -178,8 +179,11 @@ targeted source validation pass against those survivors when they still
 request more context, then hierarchically reduces finding IDs again
 (without rewriting their original bodies) and synthesizes the GitHub
 review. Independent map batches run concurrently (default 4 in-flight
-provider calls) so provider latency overlaps; evidence ingestion stays
-single-threaded and deterministic.
+provider calls) so provider latency overlaps. After pre-reduce, remaining
+cross-context validation is ordered by finding severity (BLOCKING, then
+MAJOR, then MINOR) and merge-decision impact, then independent paths run
+with a separate, more conservative worker pool (default 2 in-flight,
+max 4). Evidence ingestion stays single-threaded and deterministic.
 Failed map batches split into smaller requests instead of abandoning sibling
 chunks; a global cap of 32 logical map attempts still fail-closes the review.
 
@@ -194,10 +198,14 @@ Each map/reduce call is capped around 225k characters so provider connections
 stay reliable. Map calls are also capped at 8 chunks so the required
 structured response stays bounded independently of input size. Independent
 map batches share a bounded worker pool (`map-concurrency`, default 4, max
-8). Workers only perform provider I/O; coverage, evidence, and retry/split
-decisions stay on one thread. The pipeline footer reports primary map,
-raw vs pre-reduced finding counts, validation, reduce, synthesis, and total
-request characters so corpus changes can be benchmarked. The total source size is not artificially bounded by
+8). Independent validation paths share a separate pool
+(`validation-concurrency`, default 2, max 4) so a large validation request
+cannot inherit map's higher fan-out. Workers only perform provider I/O;
+coverage, evidence, retry/split, and lazy context loading stay on one
+thread. The pipeline footer reports primary map, raw vs pre-reduced finding
+counts, validation attempts, validation concurrency, deferred validation
+paths, reduce, synthesis, and total request characters so corpus changes can
+be benchmarked. The total source size is not artificially bounded by
 those per-call budgets.
 
 Merge Warden also enforces an internal wall-clock review budget. The default is
@@ -235,6 +243,7 @@ Optional environment overrides:
 | `MERGE_WARDEN_REVIEW_TIMEOUT_SECONDS` | 900 | Total internal wall-clock review budget |
 | `MERGE_WARDEN_SHUTDOWN_RESERVE_SECONDS` | 60 | Time reserved for outputs and posting |
 | `MERGE_WARDEN_MAP_CONCURRENCY` | 4 | Max independent map provider requests in flight (1–8) |
+| `MERGE_WARDEN_VALIDATION_CONCURRENCY` | 2 | Max independent validation provider requests in flight (1–4) |
 
 GitHub review bodies and inline comments still have posting size limits
 (60k / 8k). Those are GitHub API limits, not source truncation.
