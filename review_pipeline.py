@@ -34,8 +34,10 @@ DEFAULT_PROMPT_REDUCE = Path(__file__).resolve().parent / "prompt_reduce.md"
 REDUCE_GROUP_SIZE = 5
 MAX_REDUCE_ROUNDS = 8
 MAX_VALIDATION_CALLS = 8
-# Protected tail of the provider budget. Validation must stop before this
-# window so reduction and synthesis can still produce a review decision.
+# Protected tail of the provider budget. Pre-reduce and validation stop
+# REDUCE_RESERVE_SECONDS + SYNTHESIS_RESERVE_SECONDS before the provider
+# cutoff. Final reduce stops SYNTHESIS_RESERVE_SECONDS before it. Synthesis
+# keeps that last window so a review decision can still be produced.
 REDUCE_RESERVE_SECONDS = 120
 SYNTHESIS_RESERVE_SECONDS = 150
 MAP_MISSING_CHUNK_RETRIES = 1
@@ -273,6 +275,7 @@ class PipelineStats:
     coverage_complete: bool = False
     deadline_exhausted: bool = False
     validation_deadline_exhausted: bool = False
+    pre_reduce_deadline_exhausted: bool = False
     reduce_deadline_exhausted: bool = False
     notes: list[str] = field(default_factory=list)
 
@@ -303,6 +306,8 @@ class PipelineStats:
             extras.append("deadline exhausted")
         if self.validation_deadline_exhausted:
             extras.append("validation budget exhausted")
+        if self.pre_reduce_deadline_exhausted:
+            extras.append("pre-reduce budget exhausted")
         if self.reduce_deadline_exhausted:
             extras.append("reduce budget exhausted")
         extra = f", {', '.join(extras)}" if extras else ""
@@ -1323,12 +1328,19 @@ def _reduce_view(store: EvidenceStore, finding_id: str) -> Finding:
     return aggregate_finding(store.findings.get(canonical_id, finding), members)
 
 
-def _record_reduce_deadline(stats: PipelineStats) -> None:
-    stats.reduce_deadline_exhausted = True
-    note = (
-        "reduce stage deadline exhausted; preserving remaining findings "
-        "so synthesis can run"
-    )
+def _record_reduce_deadline(stats: PipelineStats, *, pre_reduce: bool = False) -> None:
+    if pre_reduce:
+        stats.pre_reduce_deadline_exhausted = True
+        note = (
+            "pre-reduce stage deadline exhausted; continuing to "
+            "validation, reduction, and synthesis"
+        )
+    else:
+        stats.reduce_deadline_exhausted = True
+        note = (
+            "reduce stage deadline exhausted; preserving remaining findings "
+            "so synthesis can run"
+        )
     if note not in stats.notes:
         stats.notes.append(note)
 
@@ -1357,7 +1369,9 @@ def hierarchical_reduce(
         return deadline is not None and deadline - time.monotonic() <= 0
 
     def stop_for_deadline() -> None:
-        _record_reduce_deadline(stats)
+        _record_reduce_deadline(
+            stats, pre_reduce=stage_token == PRE_REDUCE_STAGE_TOKEN
+        )
         _preserve_unresolved_findings(store)
 
     groups: list[list[Finding]] = [

@@ -1622,6 +1622,13 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             file=sys.stderr,
             flush=True,
         )
+    if stats.pre_reduce_deadline_exhausted:
+        print(
+            "::warning::Merge Warden pre-reduce stage deadline exhausted; "
+            "continuing to validation, reduction, and synthesis",
+            file=sys.stderr,
+            flush=True,
+        )
     if stats.reduce_deadline_exhausted:
         print(
             "::warning::Merge Warden reduce stage deadline exhausted; "

@@ -2856,10 +2856,18 @@ class ValidationStageBudgetTests(unittest.TestCase):
             )
         self.assertTrue(coverage.complete)
         self.assertFalse(stats.deadline_exhausted)
-        self.assertTrue(stats.reduce_deadline_exhausted)
+        self.assertTrue(stats.pre_reduce_deadline_exhausted)
+        self.assertFalse(stats.reduce_deadline_exhausted)
+        self.assertTrue(stats.validation_deadline_exhausted)
         self.assertEqual(stats.synthesis_calls, 1)
         self.assertIn("Synthesized review.", review["body"])
-        self.assertLessEqual(fake.synthesis_started[0], provider_deadline)
+        self.assertIn("pre-reduce budget exhausted", stats.footer())
+        synthesis_started = fake.synthesis_started[0]
+        self.assertLessEqual(synthesis_started, provider_deadline)
+        self.assertGreaterEqual(
+            provider_deadline - synthesis_started,
+            SYNTHESIS_RESERVE_SECONDS - 10.0,
+        )
 
     def test_real_sleep_validation_cannot_consume_synthesis_reserve(self) -> None:
         corpus, paths = self._paths_corpus(8)
