@@ -663,9 +663,9 @@ def findings_for_context_need(
     Each need is resolved independently, then the results are unioned.
     Explicit ``finding_ids`` are authoritative for that need and are followed
     through merge edges to the surviving canonical. Unknown and rejected IDs
-    are ignored. If a need has no usable IDs, fall back to surviving findings
-    that originated from that need's map chunk. Filename presence in finding
-    prose is not a relationship.
+    are ignored. Fallback to the originating chunk runs only when
+    ``finding_ids`` was empty. Filename presence in finding prose is not a
+    relationship.
     """
     related: list[Finding] = []
     seen: set[str] = set()
@@ -1353,6 +1353,16 @@ def hierarchical_reduce(
             ]
             for index in range(0, len(unique), REDUCE_GROUP_SIZE)
         ]
+
+
+def seed_final_reduce(store: EvidenceStore, mapped_ids: set[str]) -> list[Finding]:
+    """Pre-reduce survivors plus new validation findings, unique by ID."""
+    new_findings = [
+        store.findings[finding_id]
+        for finding_id in store.findings
+        if finding_id not in mapped_ids
+    ]
+    return list({item.id: item for item in store.kept_findings() + new_findings}.values())
 
 
 def run_pre_reduce(
@@ -2044,18 +2054,13 @@ def run_hierarchical_review(
             stats,
             context_loader=context_loader,
         )
-        new_findings = [
-            store.findings[finding_id]
-            for finding_id in store.findings
-            if finding_id not in mapped_ids
-        ]
         hierarchical_reduce(
             store,
             reduce_prompt,
             call_model,
             max_reduce_request_chars,
             stats,
-            findings=store.kept_findings() + new_findings,
+            findings=seed_final_reduce(store, mapped_ids),
         )
     except PipelineDeadlineExceeded as exc:
         return _deadline_result(

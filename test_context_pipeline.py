@@ -66,6 +66,7 @@ from review_pipeline import (
     prune_context_needs,
     run_hierarchical_review,
     run_pre_reduce,
+    seed_final_reduce,
     sanitize_failure_note,
     validation_related_findings,
 )
@@ -2186,6 +2187,80 @@ class PreReduceBeforeValidationTests(unittest.TestCase):
         self.assertEqual(len(canonical_ids), 1)
         self.assertIn(f"{stats.raw_finding_count} raw finding(s)", stats.footer())
         self.assertIn("1 after pre-reduce", stats.footer())
+
+    def test_seed_final_reduce_does_not_duplicate_validation_finding(self) -> None:
+        store = EvidenceStore()
+        store.findings["V1"] = _finding("V1", body="from validation")
+        seeded = seed_final_reduce(store, mapped_ids=set())
+        self.assertEqual([item.id for item in seeded], ["V1"])
+
+        store = EvidenceStore()
+        store.findings["A"] = _finding("A")
+        store.findings["B"] = _finding("B")
+        store.findings["V1"] = _finding("V1", body="from validation")
+        store.rejected["A"] = "unsupported"
+        store.rejected["B"] = "unsupported"
+        seeded = seed_final_reduce(store, mapped_ids={"A", "B"})
+        self.assertEqual([item.id for item in seeded], ["V1"])
+
+    def test_validation_finding_is_not_duplicated_when_map_kept_nothing(self) -> None:
+        map_chunk = _chunk(
+            "diff:src/foo.c:1",
+            "src/foo.c",
+            "+int main(void);\n",
+            kind="diff",
+        )
+        header = _chunk("file:include/foo.h:1", "include/foo.h", "int ownership;\n")
+        corpus = self._corpus([map_chunk], [header])
+        reduce_id_lists: list[list[str]] = []
+
+        def payload_for(_chunk_id: str) -> dict:
+            return {
+                "needs_context": [
+                    {"path": "include/foo.h", "reason": "Need the header"}
+                ]
+            }
+
+        def on_validation(_user: str, ids: list[str]) -> str:
+            return _map_chunks_json(
+                ids,
+                findings=[
+                    {
+                        "id": "V1",
+                        "severity": "MAJOR",
+                        "path": "include/foo.h",
+                        "body": "ownership is unclear",
+                        "confidence": "LIKELY",
+                        "evidence": [],
+                    }
+                ],
+            )
+
+        def reduce_handler(user: str) -> str:
+            ids = _reduce_payload_ids(user)
+            reduce_id_lists.append(ids)
+            return json.dumps({"keep": ids, "reject": [], "merge": []})
+
+        fake = self._pipeline(
+            payload_for,
+            reduce_handler=reduce_handler,
+            on_validation=on_validation,
+        )
+        _review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.raw_finding_count, 0)
+        self.assertEqual(stats.reduced_finding_count, 0)
+        self.assertTrue(fake.validation_messages)
+        val_ids = [
+            finding_id
+            for finding_id in store.findings
+            if finding_id.endswith("/V1")
+        ]
+        self.assertEqual(len(val_ids), 1)
+        self.assertEqual([item.id for item in store.kept_findings()], val_ids)
+        for ids in reduce_id_lists:
+            self.assertEqual(ids, list(dict.fromkeys(ids)))
+            self.assertEqual(len(ids), len(set(ids)))
 
 
 class ValidationAttemptBudgetTests(unittest.TestCase):
