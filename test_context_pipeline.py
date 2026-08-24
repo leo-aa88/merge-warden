@@ -431,6 +431,44 @@ class ReviewDeadlinePipelineTests(unittest.TestCase):
         self.assertIn(CANDIDATE_FINDINGS_NOT_POSTED, review["body"])
         self.assertIn("Primary context coverage:", review["body"])
 
+    def test_synthesis_retry_deadline_with_time_remaining_fail_closes(self) -> None:
+        """A synthesis RequestDeadlineExceeded with remaining > 0 is COMMENT.
+
+        Map classifies that shape as a split-worthy RuntimeError. Synthesis
+        must still take the unsynthesized fallback, not crash the action.
+        """
+        clock = {"now": 10_000.0}
+        provider_deadline = clock["now"] + 840.0
+
+        def call_model(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[self._mapped_finding()],
+                )
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            classified = mw.classify_deadline_exception(
+                stage,
+                provider_deadline,
+                rp.provider_stage_deadline(stage, provider_deadline),
+                mw.RequestDeadlineExceeded("retry would exceed remaining budget"),
+            )
+            raise classified
+
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            review, coverage, store, stats = self._run(
+                call_model, deadline=provider_deadline
+            )
+        self.assertTrue(coverage.complete)
+        self.assertTrue(stats.deadline_exhausted)
+        self.assertEqual(stats.synthesis_calls, 0)
+        _assert_unsynthesized_fallback(self, review)
+        self.assertTrue(store.kept_findings())
+        self.assertNotIn("candidate defect", review["body"])
+        self.assertIn(CANDIDATE_FINDINGS_NOT_POSTED, review["body"])
+
     def test_findings_as_review_never_emits_inline_comments(self) -> None:
         store = EvidenceStore()
         store.findings["F1"] = Finding(
@@ -3091,7 +3129,9 @@ class ValidationStageBudgetTests(unittest.TestCase):
         )
         with mock.patch.object(rp, "VALIDATION_RESERVE_SECONDS", 0.2), mock.patch.object(
             rp, "REDUCE_RESERVE_SECONDS", 0.2
-        ), mock.patch.object(rp, "SYNTHESIS_RESERVE_SECONDS", 0.2):
+        ), mock.patch.object(rp, "SYNTHESIS_RESERVE_SECONDS", 0.2), mock.patch.object(
+            rp, "MAP_CALL_BUDGET_SECONDS", 0.0
+        ):
             started = time.monotonic()
             review, coverage, _store, stats = _run_hierarchical(
                 corpus,
@@ -3395,6 +3435,39 @@ class MapSchedulerInvariantTests(unittest.TestCase):
                     clock["now"] = map_cutoff
                     raise RuntimeError("map call exceeded latency budget")
                 raise AssertionError("child map calls must not start at cutoff")
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n\nPartial.\n", "comments": []}
+            )
+
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            _review, _coverage, _store, stats = _run_hierarchical(
+                corpus, fake, deadline=provider_deadline
+            )
+        self.assertEqual(started, [8])
+        self.assertTrue(stats.map_deadline_exhausted)
+        self.assertEqual(stats.synthesis_calls, 1)
+
+    def test_child_batches_are_not_started_without_a_full_call_budget(self) -> None:
+        chunks = _tiny_chunks(8)
+        corpus = _synthetic_corpus(chunks)
+        clock = {"now": 10_000.0}
+        provider_deadline = clock["now"] + 840.0
+        map_cutoff = map_stage_deadline(provider_deadline)
+        started: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                started.append(len(ids))
+                if len(ids) >= 8:
+                    clock["now"] = map_cutoff - (MAP_CALL_BUDGET_SECONDS - 1.0)
+                    raise RuntimeError("map call exceeded latency budget")
+                raise AssertionError(
+                    "child map calls must not start without a full call budget"
+                )
             if stage in {"pre-reduce", "reduce"}:
                 return json.dumps({"keep": [], "reject": [], "merge": []})
             return json.dumps(

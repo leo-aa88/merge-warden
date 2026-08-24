@@ -353,7 +353,13 @@ def classify_deadline_exception(
     stage_deadline: float | None,
     exc: BaseException,
 ) -> BaseException:
-    """Turn an HTTP deadline into a stage, provider, or per-call failure."""
+    """Turn an HTTP deadline into a stage, provider, or per-call failure.
+
+    Map may still have later-stage reserves left after a timeout; that is a
+    split-worthy ``RuntimeError``, not a dead review. Every other stage treats
+    the same remaining-time timeout as ``PipelineDeadlineExceeded`` so
+    synthesis fail-closes to ``COMMENT`` instead of crashing the action.
+    """
     provider_remaining = remaining_deadline_seconds(provider_deadline)
     if provider_remaining is not None and provider_remaining <= 0:
         return PipelineDeadlineExceeded(str(exc))
@@ -362,7 +368,9 @@ def classify_deadline_exception(
         if stage == "map":
             return StageDeadlineExceeded(stage, str(exc))
         return PipelineDeadlineExceeded(str(exc))
-    return RuntimeError(f"{stage} call exceeded latency budget: {exc}")
+    if stage == "map":
+        return RuntimeError(f"{stage} call exceeded latency budget: {exc}")
+    return PipelineDeadlineExceeded(str(exc))
 
 
 def http_timeout_for_deadline(

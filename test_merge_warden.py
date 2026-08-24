@@ -1205,6 +1205,21 @@ class ReviewDeadlineTests(unittest.TestCase):
         self.assertNotIsInstance(classified, mw.StageDeadlineExceeded)
         self.assertIn("latency budget", str(classified))
 
+    def test_non_map_timeout_with_time_remaining_is_pipeline_deadline(self) -> None:
+        """Retry-would-cross still fail-closes every stage except map."""
+        for stage in ("synthesis", "reduce", "validation", "pre-reduce"):
+            with self.subTest(stage=stage):
+                with mock.patch.object(mw.time, "monotonic", return_value=1000.0):
+                    classified = mw.classify_deadline_exception(
+                        stage,
+                        provider_deadline=2000.0,
+                        stage_deadline=1800.0,
+                        exc=mw.RequestDeadlineExceeded(
+                            "retry would exceed remaining budget"
+                        ),
+                    )
+                self.assertIs(type(classified), mw.PipelineDeadlineExceeded)
+
     def test_map_stage_cutoff_is_not_a_global_deadline(self) -> None:
         with mock.patch.object(mw.time, "monotonic", return_value=1700.0):
             classified = mw.classify_deadline_exception(

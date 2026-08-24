@@ -2022,17 +2022,17 @@ def run_map_stage(
         remaining = remaining_map_seconds()
         return remaining is not None and remaining <= 0
 
-    def child_fits_remaining_budget() -> bool:
+    def map_call_fits_remaining_budget() -> bool:
         remaining = remaining_map_seconds()
         if remaining is None:
             return True
-        return remaining > 0
+        return remaining >= MAP_CALL_BUDGET_SECONDS
 
     def enqueue(parts: list[list[ContextChunk]], parent_tag: str) -> None:
         nonlocal next_sequence
-        if not child_fits_remaining_budget():
-            # A failed parent still has follow-up work, but the map window is
-            # gone. Mark the stage exhausted so synthesis can still run.
+        if not map_call_fits_remaining_budget():
+            # Follow-up work exists, but not a full map call budget. Stop map
+            # so synthesis can still use its reserved window.
             extra = {
                 chunk.id
                 for part in parts
@@ -2123,7 +2123,7 @@ def run_map_stage(
                     f"({len(in_flight) + 1} in flight)",
                     flush=True,
                 )
-                if map_stage_reached() or not child_fits_remaining_budget():
+                if map_stage_reached() or not map_call_fits_remaining_budget():
                     pending.appendleft(item)
                     exhaust_map_stage()
                     break

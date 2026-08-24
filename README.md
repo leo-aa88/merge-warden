@@ -226,7 +226,8 @@ time reserved for later stages:
 
 Map calls also have a tighter per-call latency budget (90s HTTP timeout, 120s
 logical call budget, 2 HTTP attempts) so a slow batch splits while downstream
-reserves are still intact. Exhausting the map-stage allocation leaves remaining
+reserves are still intact. A map follow-up is not started unless a full call
+budget remains. Exhausting the map-stage allocation leaves remaining
 primary chunks uncovered and **continues** into validation, reduction, and
 synthesis. Exhausting the global provider deadline still fail-closes immediately.
 
