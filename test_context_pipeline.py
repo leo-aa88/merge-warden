@@ -2190,16 +2190,27 @@ class PreReduceBeforeValidationTests(unittest.TestCase):
 
     def test_seed_final_reduce_does_not_duplicate_validation_finding(self) -> None:
         store = EvidenceStore()
+        run_pre_reduce(
+            store,
+            "<!-- merge-warden-reduce -->",
+            lambda *_args: "",
+            50_000,
+            PipelineStats(),
+        )
+        self.assertTrue(store.reduced)
         store.findings["V1"] = _finding("V1", body="from validation")
+        self.assertEqual(store.kept_findings(), [])
         seeded = seed_final_reduce(store, mapped_ids=set())
         self.assertEqual([item.id for item in seeded], ["V1"])
 
         store = EvidenceStore()
         store.findings["A"] = _finding("A")
         store.findings["B"] = _finding("B")
-        store.findings["V1"] = _finding("V1", body="from validation")
         store.rejected["A"] = "unsupported"
         store.rejected["B"] = "unsupported"
+        store.reduced = True
+        store.findings["V1"] = _finding("V1", body="from validation")
+        self.assertEqual(store.kept_findings(), [])
         seeded = seed_final_reduce(store, mapped_ids={"A", "B"})
         self.assertEqual([item.id for item in seeded], ["V1"])
 

@@ -120,6 +120,7 @@ class EvidenceStore:
     kept: set[str] = field(default_factory=set)
     rejected: dict[str, str] = field(default_factory=dict)
     merged_into: dict[str, str] = field(default_factory=dict)
+    reduced: bool = False
 
     def resolve_canonical(self, finding_id: str) -> str:
         """Follow merge edges to the root identity of an equivalence class.
@@ -171,7 +172,7 @@ class EvidenceStore:
             canonical_id = self.resolve_canonical(finding_id)
             if canonical_id in self.rejected or canonical_id in seen:
                 continue
-            if self.kept and canonical_id not in self.kept:
+            if (self.kept or self.reduced) and canonical_id not in self.kept:
                 continue
             if canonical_id not in self.findings:
                 continue
@@ -647,7 +648,7 @@ def _surviving_canonical_id(store: EvidenceStore, finding_id: str) -> str | None
     canonical_id = store.resolve_canonical(finding_id)
     if canonical_id in store.rejected:
         return None
-    if store.kept and canonical_id not in store.kept:
+    if (store.kept or store.reduced) and canonical_id not in store.kept:
         return None
     if canonical_id not in store.findings:
         return None
@@ -1272,7 +1273,7 @@ def hierarchical_reduce(
     if findings is None:
         findings = list(store.findings.values())
     else:
-        findings = list(findings)
+        findings = list({item.id: item for item in findings}.values())
     if not findings:
         return
     if len(findings) == 1:
@@ -1383,6 +1384,7 @@ def run_pre_reduce(
     hierarchical_reduce(
         store, reduce_prompt, call_model, max_request_chars, stats
     )
+    store.reduced = True
     prune_context_needs(store)
     stats.reduced_finding_count = len(store.kept_findings())
 
