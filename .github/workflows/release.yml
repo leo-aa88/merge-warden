@@ -48,9 +48,17 @@ jobs:
 
           git fetch --tags --force origin
 
+          version_exists=false
           if git rev-parse --verify --quiet "refs/tags/$VERSION" >/dev/null; then
-            echo "::error::release tag $VERSION already exists"
-            exit 1
+            release_commit="$(git rev-list -n 1 "$VERSION")"
+            current_commit="$(git rev-parse HEAD)"
+
+            if [[ "$release_commit" != "$current_commit" ]]; then
+              echo "::error::release tag $VERSION already exists at $release_commit, not $current_commit"
+              exit 1
+            fi
+
+            version_exists=true
           fi
 
           major_number="${VERSION#v}"
@@ -58,6 +66,7 @@ jobs:
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "major=$major" >> "$GITHUB_OUTPUT"
+          echo "version_exists=$version_exists" >> "$GITHUB_OUTPUT"
 
       - name: Configure git user
         run: |
@@ -69,11 +78,17 @@ jobs:
         env:
           VERSION: ${{ steps.release.outputs.version }}
           MAJOR: ${{ steps.release.outputs.major }}
+          VERSION_EXISTS: ${{ steps.release.outputs.version_exists }}
         run: |
           set -euo pipefail
 
-          git tag -a "$VERSION" -m "Merge Warden $VERSION"
-          git push origin "refs/tags/$VERSION"
+          if [[ "$VERSION_EXISTS" == "true" ]]; then
+            echo "::notice::release tag $VERSION already points at this commit; resuming major tag update"
+          else
+            git tag -a "$VERSION" -m "Merge Warden $VERSION"
+          fi
 
           git tag -f "$MAJOR" "$VERSION"
-          git push origin "refs/tags/$MAJOR" --force
+          git push --atomic origin \
+            "refs/tags/$VERSION:refs/tags/$VERSION" \
+            "+refs/tags/$MAJOR:refs/tags/$MAJOR"
