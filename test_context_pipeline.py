@@ -1495,7 +1495,13 @@ class ValidationAcknowledgementTests(unittest.TestCase):
         defaults.update(kwargs)
         return run_hierarchical_review(**defaults)
 
-    def _model(self, *, validation: str = "all"):
+    def _model(
+        self,
+        *,
+        validation: str = "all",
+        synthesis_event: str = "COMMENT",
+        synthesis_body: str = "# COMMENT\n",
+    ):
         """Map/reduce/synthesis stub with a validation acknowledgement policy.
 
         validation:
@@ -1541,7 +1547,11 @@ class ValidationAcknowledgementTests(unittest.TestCase):
                 return json.dumps({"keep": ["F17"], "reject": [], "merge": []})
             synthesis_messages.append(user)
             return json.dumps(
-                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+                {
+                    "event": synthesis_event,
+                    "body": synthesis_body,
+                    "comments": [],
+                }
             )
 
         fake.validation_messages = validation_messages  # type: ignore[attr-defined]
@@ -1659,6 +1669,55 @@ class ValidationAcknowledgementTests(unittest.TestCase):
         self.assertEqual(stats.synthesis_calls, 1)
         self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
         self.assertLess(stats.validation_chunks_acknowledged, len(matching))
+
+    def test_exact_approve_with_incomplete_validation_is_comment(self) -> None:
+        corpus, _matching = _header_validation_corpus(3)
+        fake = self._model(
+            validation="first",
+            synthesis_event="APPROVE",
+            synthesis_body="# APPROVE\n\nLooks good.\n",
+        )
+        review, coverage, store, _stats = self._run(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertIn("could not validate all requested context", review["body"])
+
+    def test_exact_approve_with_complete_validation_still_approves(self) -> None:
+        corpus, matching = _header_validation_corpus(3)
+        fake = self._model(
+            validation="all",
+            synthesis_event="APPROVE",
+            synthesis_body="# APPROVE\n\nLooks good.\n",
+        )
+        review, coverage, store, stats = self._run(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertNotIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
+        self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
+        self.assertEqual(review["event"], "APPROVE")
+
+    def test_alias_approve_events_cannot_pass_incomplete_validation(self) -> None:
+        aliases = ("lgtm", "APPROVED", "APPROVE\n", "APPROVE ", "approve.")
+        for event in aliases:
+            with self.subTest(event=repr(event)):
+                corpus, _matching = _header_validation_corpus(3)
+                fake = self._model(
+                    validation="first",
+                    synthesis_event=event,
+                    synthesis_body="# APPROVE\n\nLooks good.\n",
+                )
+                review, coverage, store, _stats = self._run(corpus, fake)
+                self.assertTrue(coverage.complete)
+                self.assertIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
+                self.assertEqual(review["event"], "COMMENT")
+                self.assertNotEqual(
+                    mw.normalize_event(review["event"], review["body"]),
+                    "APPROVE",
+                )
+                self.assertIn(
+                    "could not validate all requested context",
+                    review["body"],
+                )
 
 
 class ContextNeedOwnershipTests(unittest.TestCase):

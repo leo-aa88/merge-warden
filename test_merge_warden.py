@@ -512,6 +512,40 @@ class IncompletePipelinePostingTests(unittest.TestCase):
         self.assertEqual(len(payload["comments"]), 1)
         self.assertNotIn("Candidate findings (not posted)", markdown)
 
+    def test_generate_review_alias_approve_blocked_by_incomplete_validation(
+        self,
+    ) -> None:
+        review = {
+            "event": "lgtm",
+            "body": "# APPROVE\n\nLooks good.\n",
+            "comments": [self.RAW_COMMENT],
+        }
+        coverage, stats = self._stats(complete=True, deadline_exhausted=False)
+        stats.synthesis_calls = 1
+        store = EvidenceStore()
+        store.findings["F1"] = Finding(
+            id="F1",
+            severity="MAJOR",
+            path="a.c",
+            side="RIGHT",
+            line=1,
+            body="needs header",
+            confidence="LIKELY",
+            evidence=["validation:incomplete:foo.h"],
+        )
+        store.kept.add("F1")
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp)
+            rc = self._generate(args, review, coverage, stats, store=store)
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+            markdown = Path(args.output).read_text(encoding="utf-8")
+        self.assertEqual(rc, 0)
+        self.assertEqual(payload["event"], "COMMENT")
+        self.assertEqual(payload.get("comments") or [], [])
+        self.assertIn("could not validate all requested context", payload["body"])
+        self.assertIn("could not validate all requested context", markdown)
+        self.assertNotEqual(mw.normalize_event(payload["event"], payload["body"]), "APPROVE")
+
     def test_synthesized_incomplete_coverage_cannot_approve(self) -> None:
         review = {
             "event": "APPROVE",

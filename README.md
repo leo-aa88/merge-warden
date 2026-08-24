@@ -234,10 +234,13 @@ synthesis. Exhausting the global provider deadline still fail-closes immediately
 Once a stage cutoff is reached, that stage stops scheduling new provider
 calls and the pipeline continues. Remaining cross-context checks are marked
 `validation:incomplete:<path>`. Remaining reduce groups are kept. Incomplete
-validation is acceptable; a review with no synthesis is not. If synthesis
-itself hits the provider cutoff, the pipeline fail-closes to `COMMENT` with
-**no inline comments**. If map-stage exhaustion leaves primary coverage
-incomplete, synthesis still runs when time remains and must not `APPROVE`;
+validation is acceptable; a review with no synthesis is not. A surviving
+`validation:incomplete:` marker makes `APPROVE` unreachable, using the same
+event normalizer as posting, even when primary coverage is complete. If
+synthesis itself hits the provider cutoff, the pipeline fail-closes to
+`COMMENT` with **no inline comments**. If map-stage exhaustion leaves primary
+coverage incomplete, synthesis still runs when time remains and must not
+`APPROVE`;
 synthesized comments from covered chunks may be posted. Mapper candidates stay
 in `merge-warden.md` for debugging when synthesis does not complete;
 `merge-warden.json` remains the GitHub review payload (`commit_id`, `event`,

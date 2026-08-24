@@ -35,8 +35,10 @@ from review_pipeline import (
     VALIDATION_STAGE_TOKEN,
     PipelineDeadlineExceeded,
     StageDeadlineExceeded,
+    apply_incomplete_validation_guard,
     finding_record,
     map_stage_deadline,
+    normalize_event,
     normalize_map_concurrency,
     normalize_validation_concurrency,
     provider_stage_deadline,
@@ -1170,20 +1172,6 @@ def normalize_severity(value: str) -> str:
     return "minor"
 
 
-def normalize_event(event: str, body: str) -> str:
-    def canonical(text: str) -> str:
-        key = re.sub(r"[^A-Z]+", "_", text.upper()).strip("_")
-        if key in {"APPROVE", "COMMENT", "REQUEST_CHANGES"}:
-            return key
-        return ""
-
-    for candidate in (event, *(line.lstrip("#").strip() for line in (body or "").splitlines()[:8])):
-        mapped = canonical(candidate)
-        if mapped:
-            return mapped
-    return "COMMENT"
-
-
 def wrap_review_body(markdown: str) -> str:
     text = (markdown or "").strip()
     if not text:
@@ -1850,8 +1838,17 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
     event = normalize_event(str(review.get("event") or ""), str(review.get("body") or ""))
     if fail_closed_inline:
         event = "COMMENT"
-    elif not coverage.complete and event == "APPROVE":
-        event = "COMMENT"
+    else:
+        guarded_event, guarded_body = apply_incomplete_validation_guard(
+            event, str(review.get("body") or ""), store
+        )
+        if guarded_event != event:
+            review["event"] = guarded_event
+            review["body"] = guarded_body
+            comments = []
+        event = guarded_event
+        if not coverage.complete and event == "APPROVE":
+            event = "COMMENT"
     payload = {
         "commit_id": head_sha,
         "event": event,
