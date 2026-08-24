@@ -26,6 +26,7 @@ from context_pipeline import (
     build_coverage,
     build_review_corpus,
     chunk_diff,
+    chunks_matching_path,
     chunk_text,
     format_char_count,
     incomplete_coverage_body,
@@ -400,7 +401,7 @@ class CorpusTests(unittest.TestCase):
         self.assertFalse(corpus.limit_error)
         self.assertGreater(len(corpus.reviewable_chunks), 1)
 
-    def test_file_contents_are_chunked_not_truncated(self) -> None:
+    def test_file_contents_are_lazy_source_chunks_not_primary_map_chunks(self) -> None:
         lines = [f"line-{index:04d}-KEEP" for index in range(1, 201)]
         content = "\n".join(lines) + "\n"
         corpus = build_review_corpus(
@@ -411,7 +412,10 @@ class CorpusTests(unittest.TestCase):
             ),
             max_single_chunk_chars=800,
         )
-        texts = "\n".join(chunk.text for chunk in corpus.chunks if chunk.kind == "file")
+        primary_texts = "\n".join(chunk.text for chunk in corpus.reviewable_chunks)
+        self.assertNotIn("line-0001-KEEP", primary_texts)
+        self.assertNotIn("line-0200-KEEP", primary_texts)
+        texts = "\n".join(chunk.text for chunk in corpus.source_chunks if chunk.kind == "file")
         self.assertIn("line-0001-KEEP", texts)
         self.assertIn("line-0200-KEEP", texts)
         self.assertNotIn("truncated", texts)
@@ -711,6 +715,121 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertGreaterEqual(stats.validation_calls, 1)
         self.assertEqual(review["event"], "REQUEST_CHANGES")
+
+    def test_needs_context_lazy_loads_requested_file(self) -> None:
+        corpus = build_review_corpus(
+            _inputs(
+                files=[
+                    {"filename": "src/foo.c", "status": "modified", "additions": 1, "deletions": 0},
+                    {"filename": "include/foo.h", "status": "modified", "additions": 1, "deletions": 0},
+                ],
+                file_contents={},
+                diff=(
+                    "diff --git a/src/foo.c b/src/foo.c\n"
+                    "@@ -1 +1 @@\n"
+                    "-old\n"
+                    "+return borrowed_value();\n"
+                    "diff --git a/include/foo.h b/include/foo.h\n"
+                    "@@ -1 +1 @@\n"
+                    "-old\n"
+                    "+new\n"
+                ),
+            )
+        )
+        self.assertFalse(corpus.source_chunks)
+        loaded: list[str] = []
+
+        def load(path: str) -> str | None:
+            loaded.append(path)
+            if path == "include/foo.h":
+                return "const char *borrowed_value(void);\n"
+            return None
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system and "Context requests" not in user:
+                self.assertNotIn("borrowed_value(void)", user)
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[_likely_foo_finding()],
+                    needs_context=[
+                        {
+                            "path": "include/foo.h",
+                            "reason": "Need return ownership contract",
+                            "finding_ids": ["F17"],
+                        }
+                    ],
+                )
+            if "Context requests" in user:
+                self.assertIn("borrowed_value(void)", user)
+                return _map_chunks_json(_chunk_ids_in_prompt(user))
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps({"event": "COMMENT", "body": "# COMMENT\n", "comments": []})
+
+        _review, coverage, store, stats = run_hierarchical_review(
+            corpus=corpus,
+            synthesis_prompt="synth",
+            map_prompt="<!-- merge-warden-map -->",
+            reduce_prompt="<!-- merge-warden-reduce -->",
+            call_model=fake,
+            commentable_section="(none)\n",
+            max_map_request_chars=80_000,
+            max_reduce_request_chars=80_000,
+            map_overhead_chars=100,
+            context_loader=load,
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(loaded, ["include/foo.h"])
+        self.assertTrue(chunks_matching_path(corpus.source_chunks, "include/foo.h"))
+        self.assertNotIn(INCOMPLETE_FOO, _by_local_id(store, "F17").evidence)
+        self.assertGreater(stats.validation_request_chars, 0)
+
+    def test_unavailable_requested_context_blocks_approval(self) -> None:
+        corpus = build_review_corpus(
+            _inputs(
+                files=[{"filename": "src/foo.c", "status": "modified", "additions": 1, "deletions": 0}],
+                diff=(
+                    "diff --git a/src/foo.c b/src/foo.c\n"
+                    "@@ -1 +1 @@\n"
+                    "-old\n"
+                    "+return borrowed_value();\n"
+                ),
+            )
+        )
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[_likely_foo_finding()],
+                    needs_context=[
+                        {
+                            "path": "include/missing.h",
+                            "reason": "Need return ownership contract",
+                            "finding_ids": ["F17"],
+                        }
+                    ],
+                )
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [_fid("F17")], "reject": [], "merge": []})
+            return json.dumps({"event": "APPROVE", "body": "# APPROVE\n", "comments": []})
+
+        review, coverage, store, stats = run_hierarchical_review(
+            corpus=corpus,
+            synthesis_prompt="synth",
+            map_prompt="<!-- merge-warden-map -->",
+            reduce_prompt="<!-- merge-warden-reduce -->",
+            call_model=fake,
+            commentable_section="(none)\n",
+            max_map_request_chars=80_000,
+            max_reduce_request_chars=80_000,
+            map_overhead_chars=100,
+            context_loader=lambda _path: None,
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertIn("validation:incomplete:include/missing.h", _by_local_id(store, "F17").evidence)
+        self.assertTrue(any("could not load requested context" in note for note in stats.notes))
 
     def test_ingest_map_result_namespaces_duplicate_ids(self) -> None:
         store = EvidenceStore()
@@ -3192,9 +3311,12 @@ class MapFanoutAndDegradationTests(unittest.TestCase):
         self.assertFalse(
             any("|" in chunk.source and chunk.kind == "diff" for chunk in corpus.reviewable_chunks)
         )
-        file_chunks = [chunk for chunk in corpus.reviewable_chunks if chunk.kind == "file"]
+        file_chunks = [chunk for chunk in corpus.source_chunks if chunk.kind == "file"]
         self.assertTrue(any(chunk.source == "src/a.c" for chunk in file_chunks))
         self.assertTrue(any(chunk.source == "src/b.c" for chunk in file_chunks))
+        self.assertFalse(
+            any(chunk.kind == "file" and chunk.source in {"src/a.c", "src/b.c"} for chunk in corpus.reviewable_chunks)
+        )
 
     def test_failure_diagnostics_appear_in_incomplete_review(self) -> None:
         chunks = _tiny_chunks(10)
@@ -3384,9 +3506,17 @@ class MapFanoutAndDegradationTests(unittest.TestCase):
             for chunk in corpus.reviewable_chunks
             for member in chunk.member_ids
         ]
-        self.assertGreaterEqual(len(member_ids), 60)
-        self.assertLessEqual(len(member_ids), 90)
+        source_member_ids = [
+            member
+            for chunk in corpus.source_chunks
+            for member in chunk.member_ids
+        ]
+        self.assertTrue(source_member_ids)
+        self.assertTrue(all(not member.startswith("file:") for member in member_ids))
+        self.assertTrue(all(member.startswith("file:") for member in source_member_ids))
         self.assertGreater(len(corpus.reviewable_chunks), MAX_MAP_CHUNKS_PER_CALL)
+        self.assertIn("TAIL_SENTINEL_123", "\n".join(chunk.text for chunk in corpus.source_chunks))
+        self.assertNotIn("TAIL_SENTINEL_123", "\n".join(chunk.text for chunk in corpus.reviewable_chunks))
 
         def fake(system: str, user: str) -> str:
             if "merge-warden-map" in system:
@@ -3409,7 +3539,6 @@ class MapFanoutAndDegradationTests(unittest.TestCase):
         self.assertGreater(stats.batches, 1)
         self.assertEqual(stats.synthesis_calls, 1)
         self.assertEqual(review["event"], "COMMENT")
-        self.assertIn("TAIL_SENTINEL_123", "\n".join(chunk.text for chunk in corpus.reviewable_chunks))
 
 
 class ParallelMapSchedulerTests(unittest.TestCase):

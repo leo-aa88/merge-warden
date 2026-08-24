@@ -17,6 +17,7 @@ from context_pipeline import (
     CoverageReport,
     ReviewCorpus,
     all_reviewable_context_covered,
+    chunk_source_file,
     chunks_matching_path,
     format_chunk_for_prompt,
     incomplete_coverage_body,
@@ -82,6 +83,7 @@ CONFIDENCE_ORDER = {
 }
 
 CallModel = Callable[[str, str], str]
+ContextLoader = Callable[[str], str | None]
 
 
 @dataclass
@@ -253,6 +255,10 @@ class PipelineStats:
     validation_chunks_acknowledged: int = 0
     reduce_calls: int = 0
     synthesis_calls: int = 0
+    map_request_chars: int = 0
+    validation_request_chars: int = 0
+    reduce_request_chars: int = 0
+    synthesis_request_chars: int = 0
     batches: int = 0
     chunks: int = 0
     total_chars: int = 0
@@ -283,6 +289,12 @@ class PipelineStats:
     def footer(self) -> str:
         coverage = "complete" if self.coverage_complete else "incomplete"
         deadline = ", deadline exhausted" if self.deadline_exhausted else ""
+        total_request_chars = (
+            self.map_request_chars
+            + self.validation_request_chars
+            + self.reduce_request_chars
+            + self.synthesis_request_chars
+        )
         return (
             f"_Merge Warden context pipeline: {self.chunks} chunk(s), "
             f"{self.batches} planned map batch(es), "
@@ -290,6 +302,9 @@ class PipelineStats:
             f"{self.map_calls_succeeded} successful map response(s), "
             f"{self.map_chunks_acknowledged}/{self.chunks} primary chunks acknowledged, "
             f"{self.validation_calls} validation call(s), "
+            f"{total_request_chars} total request chars "
+            f"(primary map {self.map_request_chars}, validation {self.validation_request_chars}, "
+            f"reduce {self.reduce_request_chars}, synthesis {self.synthesis_request_chars}), "
             f"{self.reduce_calls} reduce call(s), {self.synthesis_calls} synthesis call(s), "
             f"coverage {coverage}{deadline}._"
         )
@@ -1104,6 +1119,12 @@ def _call(
             f"{kind} request is {len(user_message)} characters; limit is {max_chars}"
         )
     if kind == "validation":
+        stats.validation_request_chars += len(user_message)
+    elif kind == "reduce":
+        stats.reduce_request_chars += len(user_message)
+    elif kind == "synthesis":
+        stats.synthesis_request_chars += len(user_message)
+    if kind == "validation":
         stats.validation_attempts += 1
     raw = call_model(system_prompt, user_message)
     if kind == "validation":
@@ -1517,6 +1538,7 @@ def run_map_stage(
                     abandon_pending()
                     break
                 stats.map_attempts += 1
+                stats.map_request_chars += len(item.message)
                 in_flight[item.sequence] = executor.submit(
                     _map_worker,
                     item,
@@ -1608,12 +1630,55 @@ def _mark_incomplete_validation(
             finding.evidence.append(marker)
 
 
+def _has_incomplete_validation(findings: list[Finding]) -> bool:
+    return any(
+        item.startswith("validation:incomplete:")
+        for finding in findings
+        for item in finding.evidence
+    )
+
+
 def _format_id_list(ids: set[str], *, limit: int = MISSING_VALIDATION_ID_NOTE_LIMIT) -> str:
     ordered = sorted(ids)
     if len(ordered) <= limit:
         return ", ".join(ordered)
     shown = ", ".join(ordered[:limit])
     return f"{shown}, ... ({len(ordered) - limit} more)"
+
+
+def _load_source_chunks(
+    corpus: ReviewCorpus,
+    path: str,
+    context_loader: ContextLoader | None,
+) -> list[ContextChunk]:
+    chunks = chunks_matching_path(corpus.source_context_chunks, path)
+    if chunks:
+        return chunks
+
+    if context_loader is not None:
+        content = context_loader(path)
+        if content is None:
+            return []
+        loaded = chunk_source_file(path, content, corpus.source_chunk_limit)
+        corpus.source_chunks.extend(loaded)
+        return loaded
+
+    # Test corpora and older callers may still keep validation-only file
+    # chunks in the primary corpus. Do not fall back to diff chunks here:
+    # validation needs surrounding source context, not the already-mapped diff.
+    if not corpus.source_chunks:
+        primary_file_chunks = [
+            chunk
+            for chunk in chunks_matching_path(corpus.chunks, path)
+            if chunk.kind == "file"
+            and not chunk.excluded
+            and not chunk.id.endswith(":unavailable")
+            and not chunk.id.endswith(":deleted")
+        ]
+        if primary_file_chunks:
+            return primary_file_chunks
+
+    return []
 
 
 def run_validation_pass(
@@ -1623,6 +1688,7 @@ def run_validation_pass(
     call_model: CallModel,
     max_request_chars: int,
     stats: PipelineStats,
+    context_loader: ContextLoader | None = None,
 ) -> None:
     if not store.needs_context:
         return
@@ -1644,21 +1710,21 @@ def run_validation_pass(
         if not path or path in seen_paths:
             continue
         seen_paths.add(path)
-        extra = [
-            chunk
-            for chunk in chunks_matching_path(corpus.chunks, path)
-            if not chunk.excluded
-        ]
-        if not extra:
-            continue
         related_needs = [item for item in store.needs_context if item.path == path]
         related = findings_for_context_need(store, related_needs)
+        stats.validation_requests += 1
+        extra = _load_source_chunks(corpus, path, context_loader)
+        if not extra:
+            _mark_incomplete_validation(store, related, path)
+            stats.notes.append(
+                f"validation for {path} could not load requested context"
+            )
+            continue
         if stats.validation_attempts >= MAX_VALIDATION_CALLS:
             record_limit_reached()
             _mark_incomplete_validation(store, related, path)
             continue
 
-        stats.validation_requests += 1
         related_for_prompt = related[:12]
 
         def render_validation(batch: list[ContextChunk]) -> str:
@@ -1748,6 +1814,7 @@ def run_hierarchical_review(
     max_reduce_request_chars: int,
     map_overhead_chars: int,
     map_concurrency: int = DEFAULT_MAP_CONCURRENCY,
+    context_loader: ContextLoader | None = None,
 ) -> tuple[dict, CoverageReport, EvidenceStore, PipelineStats]:
     stats = PipelineStats(
         chunks=len(corpus.reviewable_chunks),
@@ -1803,6 +1870,7 @@ def run_hierarchical_review(
             call_model,
             max_map_request_chars,
             stats,
+            context_loader=context_loader,
         )
         hierarchical_reduce(
             store,
@@ -1864,6 +1932,17 @@ def run_hierarchical_review(
     event = str(parsed.get("event") or "COMMENT")
     body = str(parsed.get("body") or "")
     comments = parsed.get("comments") if isinstance(parsed.get("comments"), list) else []
+    if (
+        event.upper().replace(" ", "_") == "APPROVE"
+        and _has_incomplete_validation(store.kept_findings())
+    ):
+        event = "COMMENT"
+        body = (
+            "# COMMENT\n\n"
+            "Merge Warden could not validate all requested context for surviving "
+            "candidate findings, so it will not approve this pull request.\n\n"
+            + body.lstrip()
+        )
     if event.upper().replace(" ", "_") == "APPROVE" and not all_reviewable_context_covered(coverage):
         event = "COMMENT"
         body = _incomplete_preamble(corpus, coverage, stats) + "\n" + body

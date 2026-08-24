@@ -619,24 +619,28 @@ def collect_arch_doc_texts() -> list[tuple[str, str | None]]:
     return docs
 
 
-def collect_file_contents(
-    head_ref: str,
-    files: list[dict],
-) -> tuple[dict[str, str | None], set[str]]:
+def collect_skipped_paths(files: list[dict]) -> set[str]:
     skip_names = load_skip_names()
     skipped: set[str] = set()
-    contents: dict[str, str | None] = {}
     for file_info in files:
         path = file_info.get("filename") or ""
         if not path:
             continue
         if is_skipped_path(path, skip_names):
             skipped.add(path)
-            continue
-        if (file_info.get("status") or "") == "removed":
-            continue
-        contents[path] = git_show(head_ref, path)
-    return contents, skipped
+    return skipped
+
+
+def make_context_loader(head_ref: str):
+    skip_names = load_skip_names()
+
+    def load(path: str) -> str | None:
+        clean = (path or "").strip().strip("`")
+        if not clean or is_skipped_path(clean, skip_names):
+            return None
+        return git_show(head_ref, clean)
+
+    return load
 
 
 def build_corpus(
@@ -651,7 +655,7 @@ def build_corpus(
     closing = pr.get("closingIssuesReferences") or []
     body = pr.get("body") or ""
     issues, omitted = collect_issue_records(repo, body, closing)
-    file_contents, skipped_paths = collect_file_contents(head_ref, files)
+    skipped_paths = collect_skipped_paths(files)
     return build_review_corpus(
         CorpusInputs(
             pr=pr,
@@ -660,7 +664,7 @@ def build_corpus(
             arch_docs=collect_arch_doc_texts(),
             issues=issues,
             omitted_issue_count=omitted,
-            file_contents=file_contents,
+            file_contents={},
             commentable=commentable,
             skipped_paths=skipped_paths,
         ),
@@ -1560,6 +1564,7 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             "MERGE_WARDEN_MAX_MAP_OVERHEAD_CHARS", MAX_MAP_OVERHEAD_CHARS
         ),
         map_concurrency=map_concurrency,
+        context_loader=make_context_loader(args.head_ref),
     )
     if not coverage.complete:
         print(
