@@ -1,0 +1,48 @@
+name: Question
+description: Ask how to do something with Merge Warden
+title: "[question] "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Questions are welcome. If the answer turns out to be missing from the
+        docs, that is a docs bug and we'll treat it as one.
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: The end goal, not just the step you're stuck on.
+      placeholder: >-
+        I want Merge Warden to review fork PRs without exposing provider API
+        keys to `pull_request` from forks.
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Workflow YAML, commands, and what happened.
+      render: text
+
+  - type: checkboxes
+    id: docs
+    attributes:
+      label: Which docs have you already read?
+      description: So nobody sends you back to a page you've seen.
+      options:
+        - label: "[README — Usage](../blob/main/README.md#usage)"
+        - label: "[README — Inputs](../blob/main/README.md#inputs)"
+        - label: "[README — Outputs](../blob/main/README.md#outputs)"
+        - label: "[README — GitHub review events](../blob/main/README.md#github-review-events)"
+        - label: "[AGENTS.md — invariants](../blob/main/AGENTS.md)"
+
+  - type: input
+    id: version
+    attributes:
+      label: Merge Warden version
+      description: "Commit SHA you pinned (preferred) or the tag."
+      placeholder: a1b2c3d4e5f6

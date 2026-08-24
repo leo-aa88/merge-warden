@@ -1,0 +1,132 @@
+name: Bug report
+description: Something in the action, pipeline, or review output behaves incorrectly
+title: "[bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please fill in enough for someone to reproduce
+        this without guessing.
+
+        **Found a security vulnerability?** Do not open an issue — report
+        privately via a
+        [GitHub security advisory](https://github.com/leo-aa88/merge-warden/security/advisories/new).
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+      placeholder: |
+        The job posted COMMENT with "coverage incomplete" even though the PR
+        changed a single 40-line file. I expected APPROVE or REQUEST CHANGES
+        after a full review.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: >-
+        Workflow YAML and exact steps from a clean state. A reproduction we
+        can paste into a workflow gets fixed much faster.
+      placeholder: |
+        1. Pin leo-aa88/merge-warden@<sha> in a workflow_run job
+        2. Open a PR that changes one Python file
+        3. Wait for CI success, then Merge Warden
+        4. The posted review is COMMENT; generated-event is also COMMENT
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Merge Warden version
+      description: >-
+        Commit SHA you pinned (preferred) or the tag (`v1`, `v1.2.3`).
+      placeholder: a1b2c3d4e5f6
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >-
+        Provider, model, GitHub event (`workflow_run` / `pull_request`),
+        runner OS, and any `MERGE_WARDEN_*` overrides. Paste the relevant
+        job YAML if you can.
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      description: Which provider does this reproduce on?
+      multiple: true
+      options:
+        - xai / grok
+        - openai / chatgpt
+        - anthropic / claude
+        - google / gemini
+        - not provider related
+    validations:
+      required: true
+
+  - type: dropdown
+    id: trigger
+    attributes:
+      label: How is Merge Warden invoked?
+      description: The GitHub event or entry point that ran the review.
+      options:
+        - workflow_run (recommended)
+        - pull_request
+        - pull_request_target
+        - local CLI / unittest
+        - not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Where does the problem appear?
+      multiple: true
+      options:
+        - action.yml / composite action
+        - CLI / GitHub access / posting (merge_warden.py)
+        - context pipeline (chunking, packing, coverage)
+        - review pipeline (map, reduce, validate)
+        - providers / HTTP
+        - prompts
+        - resolve-pr
+        - docs
+        - tests
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      description: >-
+        Relevant action logs, generated review body, `generated-event` /
+        `posted-event`, or merge-warden.json excerpts. Redact API keys.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for a duplicate
+          required: true
+        - label: This reproduces on the latest release or on `main`
+          required: false

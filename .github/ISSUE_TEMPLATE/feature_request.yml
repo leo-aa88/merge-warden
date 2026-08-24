@@ -1,0 +1,91 @@
+name: Feature request
+description: Propose a capability, action input, or pipeline change
+title: "[feature] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Merge Warden's locked decisions live in
+        [`AGENTS.md`](../blob/main/AGENTS.md) and the Inputs / Outputs tables
+        in [`README.md`](../blob/main/README.md). These are deliberately
+        settled: standard library only, fail closed (never `APPROVE` without
+        full coverage), never truncate the corpus, never execute PR code, and
+        `action.yml` is a SHA-pinned public contract.
+
+        Proposals that reopen a locked decision need to argue against that
+        invariant, not just restate the alternative. New action inputs need
+        behavior-preserving defaults.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: >-
+        What are you trying to do that Merge Warden makes hard or impossible
+        today? Describe the situation, not the solution.
+      placeholder: >-
+        I need the review to wait for a named check besides the triggering
+        workflow, but there is no input for extra required checks.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed surface
+      description: >-
+        What would the input, output, environment variable, or prompt look
+        like? Concrete YAML and names beat prose.
+      placeholder: |
+        - uses: leo-aa88/merge-warden@PINNED_SHA
+          with:
+            extra-required-checks: |
+              lint
+              typecheck
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: similar
+    attributes:
+      label: Similar action or reviewer
+      description: >-
+        If another GitHub Action or review bot already does this, naming it
+        is the fastest way to convey the shape you want.
+      placeholder: "reviewdog, or GitHub Copilot code review"
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where do you think this belongs?
+      description: A guess is fine — maintainers will re-bucket.
+      options:
+        - action.yml inputs / outputs
+        - context pipeline
+        - review pipeline
+        - providers
+        - prompts
+        - resolve-pr
+        - docs
+        - not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and workarounds
+      description: >-
+        What are you doing today instead? Does an existing input, environment
+        override, or `prompt-file` already cover it?
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and README Inputs / Outputs
+          required: true
