@@ -44,8 +44,8 @@ MAX_VALIDATION_PROMPT_FINDINGS = 12
 REDUCE_RESERVE_SECONDS = 120
 SYNTHESIS_RESERVE_SECONDS = 150
 CANDIDATE_FINDINGS_NOT_POSTED = (
-    "Candidate findings were intentionally not posted because they were "
-    "not fully reduced and validated."
+    "Candidate findings were intentionally not posted as inline comments "
+    "because final synthesis did not complete."
 )
 MAP_MISSING_CHUNK_RETRIES = 1
 VALIDATION_MISSING_CHUNK_RETRIES = 1
@@ -1363,9 +1363,8 @@ def format_synthesis_user_message(
 def findings_as_review(store: EvidenceStore, preamble: str) -> dict:
     """Build a fail-closed COMMENT with no inline comments.
 
-    Unsynthesized mapper candidates are debugging artifacts, not GitHub
-    review findings. They stay on the review dict for local JSON/Markdown
-    output and are never attached as inline comments.
+    Unsynthesized mapper candidates stay in the evidence store. They are
+    not GitHub review findings and must not appear on this dict.
     """
     findings = store.kept_findings()
     body = preamble.rstrip() + "\n"
@@ -1378,7 +1377,6 @@ def findings_as_review(store: EvidenceStore, preamble: str) -> dict:
         "event": "COMMENT",
         "body": body,
         "comments": [],
-        "candidate_findings": [finding_record(item) for item in findings],
     }
 
 

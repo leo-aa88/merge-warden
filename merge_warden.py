@@ -30,6 +30,7 @@ from review_pipeline import (
     SYNTHESIS_RESERVE_SECONDS,
     VALIDATION_STAGE_TOKEN,
     PipelineDeadlineExceeded,
+    finding_record,
     normalize_map_concurrency,
     normalize_validation_concurrency,
     provider_stage_deadline,
@@ -1205,6 +1206,7 @@ def render_markdown(
     posted_event: str | None = None,
     posted_comments: list[dict] | None = None,
     pipeline_footer: str = "",
+    unposted_findings: list[dict] | None = None,
 ) -> str:
     body = wrap_review_body(str(review.get("body") or ""))
     if (
@@ -1221,9 +1223,7 @@ def render_markdown(
     extra = ["", status, ""]
     if pipeline_footer:
         extra.extend([pipeline_footer, ""])
-    appendix = format_unposted_candidate_findings(
-        review.get("candidate_findings") or []
-    )
+    appendix = format_unposted_candidate_findings(unposted_findings or [])
     if appendix:
         extra.extend([appendix, ""])
     return truncate(body.rstrip() + "\n" + "\n".join(extra), MAX_REVIEW_CHARS, "review")
@@ -1628,7 +1628,7 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
                 flush=True,
             )
 
-    review, coverage, _store, stats = run_hierarchical_review(
+    review, coverage, store, stats = run_hierarchical_review(
         corpus=corpus,
         synthesis_prompt=system_prompt,
         map_prompt=map_prompt,
@@ -1710,14 +1710,18 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
         "body": review_summary_body(review),
         "comments": comments,
     }
-    artifact = dict(payload)
-    candidates = review.get("candidate_findings") or []
-    if incomplete and candidates:
-        # Local debug artifact only; the GitHub payload keeps comments=[].
-        artifact["candidate_findings"] = candidates
-    Path(args.json_output).write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+    unposted = (
+        [finding_record(item) for item in store.kept_findings()] if incomplete else []
+    )
+    Path(args.json_output).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     Path(args.output).write_text(
-        render_markdown(review, comments, event, pipeline_footer=stats.footer()),
+        render_markdown(
+            review,
+            comments,
+            event,
+            pipeline_footer=stats.footer(),
+            unposted_findings=unposted,
+        ),
         encoding="utf-8",
     )
     print(
@@ -1757,6 +1761,7 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
                     posted_event=posted_event,
                     posted_comments=posted_comments,
                     pipeline_footer=stats.footer(),
+                    unposted_findings=unposted,
                 ),
                 encoding="utf-8",
             )

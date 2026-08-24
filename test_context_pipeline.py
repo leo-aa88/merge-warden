@@ -353,6 +353,7 @@ class _ReviewRecorder:
 def _assert_unsynthesized_fallback(test: unittest.TestCase, review: dict) -> None:
     test.assertEqual(review["event"], "COMMENT")
     test.assertEqual(review.get("comments") or [], [])
+    test.assertEqual(set(review), {"event", "body", "comments"})
     test.assertNotIn("# APPROVE", review["body"])
     test.assertNotIn("# REQUEST CHANGES", review["body"])
     test.assertIn("No approval decision was produced", review["body"])
@@ -420,10 +421,6 @@ class ReviewDeadlinePipelineTests(unittest.TestCase):
         _assert_unsynthesized_fallback(self, review)
         self.assertEqual(len(store.kept_findings()), 1)
         self.assertEqual(store.kept_findings()[0].body, "candidate defect")
-        self.assertEqual(
-            [item["body"] for item in review.get("candidate_findings") or []],
-            ["candidate defect"],
-        )
         self.assertNotIn("candidate defect", review["body"])
         self.assertIn(CANDIDATE_FINDINGS_NOT_POSTED, review["body"])
         self.assertIn("Primary context coverage:", review["body"])
@@ -446,9 +443,9 @@ class ReviewDeadlinePipelineTests(unittest.TestCase):
         _assert_unsynthesized_fallback(self, review)
         self.assertEqual(review["comments"], [])
         self.assertNotIn("raw mapper candidate", review["body"])
-        self.assertEqual(review["candidate_findings"][0]["body"], "raw mapper candidate")
-        self.assertEqual(review["candidate_findings"][0]["path"], "a.c")
-        self.assertEqual(review["candidate_findings"][0]["line"], 1)
+        self.assertEqual(store.kept_findings()[0].body, "raw mapper candidate")
+        self.assertEqual(store.kept_findings()[0].path, "a.c")
+        self.assertEqual(store.kept_findings()[0].line, 1)
         self.assertIn(CANDIDATE_FINDINGS_NOT_POSTED, review["body"])
 
     def test_synthesis_overflow_fail_closes_without_inline_comments(self) -> None:
@@ -3039,9 +3036,8 @@ class ValidationStageBudgetTests(unittest.TestCase):
         self.assertEqual(stats.synthesis_calls, 0)
         _assert_unsynthesized_fallback(self, review)
         self.assertTrue(store.kept_findings())
-        self.assertTrue(review.get("candidate_findings"))
-        for finding in review["candidate_findings"]:
-            self.assertNotIn(finding["body"], review["body"])
+        for finding in store.kept_findings():
+            self.assertNotIn(finding.body, review["body"])
         self.assertIn(CANDIDATE_FINDINGS_NOT_POSTED, review["body"])
 
     def test_reduce_deadline_then_synthesis_timeout_posts_no_inline_comments(
@@ -3076,7 +3072,6 @@ class ValidationStageBudgetTests(unittest.TestCase):
         self.assertEqual(stats.synthesis_calls, 0)
         _assert_unsynthesized_fallback(self, review)
         self.assertTrue(store.kept_findings())
-        self.assertTrue(review.get("candidate_findings"))
         self.assertIn(CANDIDATE_FINDINGS_NOT_POSTED, review["body"])
 
     def test_validation_deadline_with_successful_synthesis_keeps_inline_comments(
@@ -5074,7 +5069,7 @@ class ParallelMapSchedulerTests(unittest.TestCase):
         self.assertTrue(stats.deadline_exhausted)
         _assert_unsynthesized_fallback(self, review)
         self.assertEqual(
-            [item["body"] for item in review.get("candidate_findings") or []],
+            [item.body for item in store.kept_findings()],
             ["deadline survivor finding"],
         )
         self.assertNotIn("deadline survivor finding", review["body"])
