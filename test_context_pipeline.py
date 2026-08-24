@@ -60,10 +60,13 @@ from review_pipeline import (
     format_validation_user_message,
     hierarchical_reduce,
     ingest_map_result,
+    join_confidence,
     normalize_map_concurrency,
     plan_requests,
+    prune_context_needs,
     run_hierarchical_review,
     sanitize_failure_note,
+    validation_related_findings,
 )
 
 FOO_MAP_CHUNK = "diff:src/foo.c:1"
@@ -162,6 +165,75 @@ def _finding(
 def _reduce_payload_ids(user: str) -> list[str]:
     data = json.loads(user[user.find("{") :])
     return [item["id"] for item in data["findings"]]
+
+
+def _reduce_payload(user: str) -> dict:
+    return json.loads(user[user.find("{") :])
+
+
+def _validation_candidate_findings(user: str) -> list[dict]:
+    marker = "# Candidate findings that requested this context"
+    rest = user.split(marker, 1)[1]
+    start = rest.find("[")
+    end = rest.find("\n# Additional chunks")
+    blob = rest[start:end] if end != -1 else rest[start:]
+    data = json.loads(blob)
+    if not isinstance(data, list):
+        raise AssertionError(f"expected candidate findings list, got {type(data)}")
+    return data
+
+
+TYPE_NAME_BODY = (
+    "TYPE_NAME token is accepted in lexer/parser positions that should "
+    "only allow identifiers, so the grammar cannot distinguish types."
+)
+
+
+def _type_name_finding(*, path: str = "src/lexer.l") -> dict:
+    return {
+        "id": "F1",
+        "severity": "MAJOR",
+        "path": path,
+        "side": "RIGHT",
+        "line": 1,
+        "body": TYPE_NAME_BODY,
+        "confidence": "LIKELY",
+        "evidence": [],
+    }
+
+
+def _map_payloads_json(
+    chunk_ids: list[str],
+    payload_for,
+) -> str:
+    items: list[dict] = []
+    for chunk_id in chunk_ids:
+        extra = payload_for(chunk_id)
+        items.append(
+            {
+                "chunk_id": chunk_id,
+                "findings": list(extra.get("findings") or []),
+                "contracts": list(extra.get("contracts") or []),
+                "dependencies": list(extra.get("dependencies") or []),
+                "needs_context": list(extra.get("needs_context") or []),
+            }
+        )
+    return json.dumps({"chunks": items})
+
+
+def _merge_equivalent_reduce(user: str) -> str:
+    data = _reduce_payload(user)
+    by_body: dict[str, list[str]] = {}
+    for item in data["findings"]:
+        by_body.setdefault(item["body"], []).append(item["id"])
+    keep: list[str] = []
+    merge: list[dict] = []
+    for ids in by_body.values():
+        if len(ids) == 1:
+            keep.append(ids[0])
+        else:
+            merge.append({"ids": ids, "canonical": ids[0]})
+    return json.dumps({"keep": keep, "reject": [], "merge": merge})
 
 
 def _inputs(**overrides) -> CorpusInputs:
@@ -486,6 +558,10 @@ class PipelineTests(unittest.TestCase):
         prompt = mw.DEFAULT_PROMPT_REDUCE.read_text(encoding="utf-8")
         self.assertIn("Canonical selection chooses identity", prompt)
         self.assertIn("validation:incomplete:", prompt)
+        self.assertIn("before cross-context validation", prompt)
+        self.assertIn("needs_context", prompt)
+        self.assertIn("Do not reject a finding solely because it still needs", prompt)
+        self.assertIn("unresolved finding to CONFIRMED", prompt)
 
     def test_reduce_keeps_original_finding_bodies(self) -> None:
         store = EvidenceStore()
@@ -1767,6 +1843,348 @@ class ContextNeedOwnershipTests(unittest.TestCase):
         ]
         related = findings_for_context_need(store, needs)
         self.assertEqual({item.id for item in related}, {"F1", "F2"})
+
+
+class PreReduceBeforeValidationTests(unittest.TestCase):
+    """Map findings are triaged before cross-context validation."""
+
+    def _corpus(self, map_chunks: list[ContextChunk], sources: list[ContextChunk]):
+        corpus = _synthetic_corpus(
+            map_chunks,
+            index="Changed files:\n"
+            + "\n".join(f"- {chunk.source} +1 -0" for chunk in map_chunks + sources)
+            + "\n",
+        )
+        corpus.source_chunks = sources
+        return corpus
+
+    def _pipeline(
+        self,
+        payload_for,
+        *,
+        reduce_handler=None,
+        on_validation=None,
+        synthesis_event: str = "COMMENT",
+    ):
+        validation_messages: list[str] = []
+        reduce_messages: list[str] = []
+        synthesis_messages: list[str] = []
+        stages: list[str] = []
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                ids = _chunk_ids_in_prompt(user)
+                if "Context requests" in user or VALIDATION_STAGE_TOKEN in user:
+                    stages.append("validation")
+                    validation_messages.append(user)
+                    if on_validation is not None:
+                        return on_validation(user, ids)
+                    return _map_chunks_json(ids)
+                stages.append("map")
+                return _map_payloads_json(ids, payload_for)
+            if "merge-warden-reduce" in system:
+                stages.append("reduce")
+                reduce_messages.append(user)
+                if reduce_handler is not None:
+                    return reduce_handler(user)
+                return _merge_equivalent_reduce(user)
+            stages.append("synthesis")
+            synthesis_messages.append(user)
+            return json.dumps(
+                {
+                    "event": synthesis_event,
+                    "body": f"# {synthesis_event}\n",
+                    "comments": [],
+                }
+            )
+
+        fake.validation_messages = validation_messages  # type: ignore[attr-defined]
+        fake.reduce_messages = reduce_messages  # type: ignore[attr-defined]
+        fake.synthesis_messages = synthesis_messages  # type: ignore[attr-defined]
+        fake.stages = stages  # type: ignore[attr-defined]
+        return fake
+
+    def test_prune_drops_rejected_and_remaps_merged_ids(self) -> None:
+        store = EvidenceStore()
+        store.findings["A"] = _finding("A", evidence=["chunk:diff:a.c:1"])
+        store.findings["B"] = _finding("B", evidence=["chunk:diff:b.c:1"])
+        store.findings["C"] = _finding("C", evidence=["chunk:diff:c.c:1"])
+        store.kept.add("A")
+        store.merged_into["B"] = "A"
+        store.rejected["C"] = "unsupported"
+        store.needs_context = [
+            rp.ContextNeed(
+                path="shared.h",
+                reason="Need A",
+                from_chunk="diff:a.c:1",
+                finding_ids=["A"],
+            ),
+            rp.ContextNeed(
+                path="other.h",
+                reason="Need B",
+                from_chunk="diff:b.c:1",
+                finding_ids=["B"],
+            ),
+            rp.ContextNeed(
+                path="noise.h",
+                reason="Need C",
+                from_chunk="diff:c.c:1",
+                finding_ids=["C"],
+            ),
+        ]
+        prune_context_needs(store)
+        self.assertEqual(
+            [(need.path, need.finding_ids) for need in store.needs_context],
+            [("shared.h", ["A"]), ("other.h", ["A"])],
+        )
+        related = findings_for_context_need(store, store.needs_context)
+        self.assertEqual([item.id for item in related], ["A"])
+
+    def test_duplicate_findings_same_context_are_one_validation_target(self) -> None:
+        chunks = [
+            _chunk(f"diff:src/mod{index}.c:1", f"src/mod{index}.c", "+TYPE_NAME x;\n", kind="diff")
+            for index in range(1, 5)
+        ]
+        header = _chunk("file:src/parser.y:1", "src/parser.y", "%token TYPE_NAME\n")
+        corpus = self._corpus(chunks, [header])
+
+        def payload_for(chunk_id: str) -> dict:
+            finding = _type_name_finding(path=chunk_id.split(":")[1])
+            if chunk_id.endswith("mod1.c:1"):
+                finding["severity"] = "BLOCKING"
+                finding["confidence"] = "QUESTION"
+            return {
+                "findings": [finding],
+                "needs_context": [
+                    {
+                        "path": "src/parser.y",
+                        "reason": "Need the TYPE_NAME grammar production",
+                        "finding_ids": ["F1"],
+                    }
+                ],
+            }
+
+        fake = self._pipeline(payload_for)
+        _review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.raw_finding_count, 4)
+        self.assertEqual(stats.reduced_finding_count, 1)
+        self.assertEqual(stats.validation_requests, 1)
+        self.assertEqual(len(fake.validation_messages), 1)
+        candidates = _validation_candidate_findings(fake.validation_messages[0])
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["severity"], "BLOCKING")
+        self.assertEqual(candidates[0]["confidence"], "LIKELY")
+        self.assertEqual(len(store.kept_findings()), 1)
+        self.assertEqual(store.kept_findings()[0].severity, "BLOCKING")
+        self.assertEqual(store.kept_findings()[0].confidence, "LIKELY")
+        evidence = set(candidates[0]["evidence"])
+        for chunk in chunks:
+            self.assertIn(f"chunk:{chunk.id}", evidence)
+        self.assertIn("4 raw finding(s)", stats.footer())
+        self.assertIn("1 after pre-reduce", stats.footer())
+        self.assertLess(fake.stages.index("reduce"), fake.stages.index("validation"))
+
+    def test_duplicate_findings_union_distinct_context_requirements(self) -> None:
+        chunks = [
+            _chunk("diff:src/lexer.l:1", "src/lexer.l", "+TYPE_NAME\n", kind="diff"),
+            _chunk("diff:src/parser.y:1", "src/parser.y", "+type_name\n", kind="diff"),
+        ]
+        sources = [
+            _chunk("file:src/lexer.l:1", "src/lexer.l", "TYPE_NAME return IDENT;\n"),
+            _chunk("file:src/parser.y:1", "src/parser.y", "%token TYPE_NAME\n"),
+        ]
+        corpus = self._corpus(chunks, sources)
+
+        def payload_for(chunk_id: str) -> dict:
+            path = "src/lexer.l" if "lexer" in chunk_id else "src/parser.y"
+            context = "src/parser.y" if path == "src/lexer.l" else "src/lexer.l"
+            return {
+                "findings": [_type_name_finding(path=path)],
+                "needs_context": [
+                    {
+                        "path": context,
+                        "reason": f"Need {context} to confirm TYPE_NAME invariant",
+                        "finding_ids": ["F1"],
+                    }
+                ],
+            }
+
+        fake = self._pipeline(payload_for)
+        _review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.raw_finding_count, 2)
+        self.assertEqual(stats.reduced_finding_count, 1)
+        self.assertEqual(stats.validation_requests, 2)
+        self.assertEqual(len(fake.validation_messages), 2)
+        canonical_ids = {
+            candidate["id"]
+            for message in fake.validation_messages
+            for candidate in _validation_candidate_findings(message)
+        }
+        self.assertEqual(len(canonical_ids), 1)
+        self.assertEqual(
+            {need.path for need in store.needs_context},
+            {"src/lexer.l", "src/parser.y"},
+        )
+        for need in store.needs_context:
+            self.assertEqual(need.finding_ids, [next(iter(canonical_ids))])
+        kept = store.kept_findings()
+        self.assertEqual(len(kept), 1)
+        self.assertGreaterEqual(
+            {item for item in kept[0].evidence if item.startswith("chunk:")},
+            {f"chunk:{chunk.id}" for chunk in chunks},
+        )
+
+    def test_rejected_findings_do_not_trigger_validation(self) -> None:
+        chunks = [
+            _chunk("diff:src/real.c:1", "src/real.c", "+int real(void);\n", kind="diff"),
+            _chunk("diff:src/noise.c:1", "src/noise.c", "+int noise(void);\n", kind="diff"),
+        ]
+        sources = [
+            _chunk("file:include/real.h:1", "include/real.h", "int real(void);\n"),
+            _chunk("file:include/noise.h:1", "include/noise.h", "int noise(void);\n"),
+        ]
+        corpus = self._corpus(chunks, sources)
+
+        def payload_for(chunk_id: str) -> dict:
+            if "noise" in chunk_id:
+                return {
+                    "findings": [
+                        {
+                            "id": "F1",
+                            "severity": "MINOR",
+                            "path": "src/noise.c",
+                            "body": "speculative noise that is unsupported",
+                            "confidence": "QUESTION",
+                            "evidence": [],
+                        }
+                    ],
+                    "needs_context": [
+                        {
+                            "path": "include/noise.h",
+                            "reason": "Check the noise header",
+                            "finding_ids": ["F1"],
+                        }
+                    ],
+                }
+            return {
+                "findings": [
+                    {
+                        "id": "F1",
+                        "severity": "MAJOR",
+                        "path": "src/real.c",
+                        "body": "Ownership of the returned buffer is unclear.",
+                        "confidence": "LIKELY",
+                        "evidence": [],
+                    }
+                ],
+                "needs_context": [
+                    {
+                        "path": "include/real.h",
+                        "reason": "Need the real ownership contract",
+                        "finding_ids": ["F1"],
+                    }
+                ],
+            }
+
+        def reduce_handler(user: str) -> str:
+            data = _reduce_payload(user)
+            keep: list[str] = []
+            reject: list[dict] = []
+            for item in data["findings"]:
+                if "speculative noise" in item["body"]:
+                    reject.append({"id": item["id"], "reason": "unsupported"})
+                else:
+                    keep.append(item["id"])
+            return json.dumps({"keep": keep, "reject": reject, "merge": []})
+
+        fake = self._pipeline(payload_for, reduce_handler=reduce_handler)
+        _review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.raw_finding_count, 2)
+        self.assertEqual(stats.reduced_finding_count, 1)
+        self.assertEqual(stats.validation_requests, 1)
+        self.assertEqual(len(fake.validation_messages), 1)
+        joined = "\n".join(fake.validation_messages)
+        self.assertIn("`include/real.h`", joined)
+        self.assertNotIn("`include/noise.h`", joined)
+        self.assertTrue(any("unsupported" in reason for reason in store.rejected.values()))
+        self.assertEqual(len(store.kept_findings()), 1)
+        self.assertNotIn("speculative noise", store.kept_findings()[0].body)
+
+    def test_unresolved_merged_finding_is_not_presented_as_confirmed(self) -> None:
+        store = EvidenceStore()
+        store.findings["A"] = _finding("A", confidence="CONFIRMED", evidence=["chunk:a"])
+        store.findings["B"] = _finding("B", confidence="LIKELY", evidence=["chunk:b"])
+        store.kept.add("A")
+        store.merged_into["B"] = "A"
+        store.needs_context = [
+            rp.ContextNeed(
+                path="src/parser.y",
+                reason="Need grammar",
+                finding_ids=["A"],
+            )
+        ]
+        views = validation_related_findings(store, [store.findings["A"]])
+        self.assertEqual(len(views), 1)
+        self.assertEqual(views[0].id, "A")
+        self.assertEqual(views[0].confidence, "LIKELY")
+        self.assertEqual(store.findings["A"].confidence, "CONFIRMED")
+        self.assertEqual(join_confidence(store.merge_members("A")), "CONFIRMED")
+
+    def test_brainrot_shaped_duplicate_type_name_corpus_collapses_before_validation(
+        self,
+    ) -> None:
+        chunks = [
+            _chunk(
+                f"diff:src/lang_{index}.c:1",
+                f"src/lang_{index}.c",
+                f"+handle TYPE_NAME in path {index}\n",
+                kind="diff",
+            )
+            for index in range(1, 9)
+        ]
+        sources = [
+            _chunk("file:src/lexer.l:1", "src/lexer.l", "TYPE_NAME {\n  return IDENT;\n}\n"),
+            _chunk("file:src/parser.y:1", "src/parser.y", "%token TYPE_NAME\n%%\ntype: TYPE_NAME;\n"),
+        ]
+        corpus = self._corpus(chunks, sources)
+
+        def payload_for(chunk_id: str) -> dict:
+            index = int(chunk_id.rsplit("_", 1)[1].split(".", 1)[0])
+            context = "src/lexer.l" if index % 2 else "src/parser.y"
+            return {
+                "findings": [_type_name_finding(path=chunk_id.split(":")[1])],
+                "needs_context": [
+                    {
+                        "path": context,
+                        "reason": "Need the TYPE_NAME lexer/parser invariant",
+                        "finding_ids": ["F1"],
+                    }
+                ],
+            }
+
+        fake = self._pipeline(payload_for)
+        _review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.raw_finding_count, 8)
+        self.assertLessEqual(stats.reduced_finding_count, 2)
+        self.assertLess(stats.reduced_finding_count, stats.raw_finding_count)
+        candidate_counts = [
+            len(_validation_candidate_findings(message))
+            for message in fake.validation_messages
+        ]
+        self.assertTrue(candidate_counts)
+        self.assertLessEqual(max(candidate_counts), 2)
+        self.assertLess(sum(candidate_counts), 8)
+        self.assertLessEqual(stats.validation_requests, 2)
+        kept_bodies = {finding.body for finding in store.kept_findings()}
+        self.assertEqual(kept_bodies, {TYPE_NAME_BODY})
+        self.assertIn(f"{stats.raw_finding_count} raw finding(s)", stats.footer())
+        self.assertIn(
+            f"{stats.reduced_finding_count} after pre-reduce", stats.footer()
+        )
 
 
 class ValidationAttemptBudgetTests(unittest.TestCase):

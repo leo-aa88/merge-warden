@@ -172,12 +172,14 @@ untrusted data, not as instructions to the reviewer.
 Merge Warden does **not** truncate the PR to fit a context window. It builds
 a complete primary context corpus, splits it at semantic boundaries (diff
 hunks and headings), packs those chunks into bounded map calls (~225k
-characters **and** at most 8 chunks each), extracts structured evidence, runs
-a targeted source validation pass when analyses request more context, then
-hierarchically reduces finding IDs (without rewriting
-their original bodies) and synthesizes the GitHub review. Independent map
-batches run concurrently (default 4 in-flight provider calls) so provider
-latency overlaps; evidence ingestion stays single-threaded and deterministic.
+characters **and** at most 8 chunks each), extracts structured evidence,
+pre-reduces equivalent mapper findings onto canonical survivors, runs a
+targeted source validation pass against those survivors when they still
+request more context, then hierarchically reduces finding IDs again
+(without rewriting their original bodies) and synthesizes the GitHub
+review. Independent map batches run concurrently (default 4 in-flight
+provider calls) so provider latency overlaps; evidence ingestion stays
+single-threaded and deterministic.
 Failed map batches split into smaller requests instead of abandoning sibling
 chunks; a global cap of 32 logical map attempts still fail-closes the review.
 
@@ -194,15 +196,15 @@ structured response stays bounded independently of input size. Independent
 map batches share a bounded worker pool (`map-concurrency`, default 4, max
 8). Workers only perform provider I/O; coverage, evidence, and retry/split
 decisions stay on one thread. The pipeline footer reports primary map,
-validation, reduce, synthesis, and total request characters so corpus changes
-can be benchmarked. The total source size is not artificially bounded by
+raw vs pre-reduced finding counts, validation, reduce, synthesis, and total
+request characters so corpus changes can be benchmarked. The total source size is not artificially bounded by
 those per-call budgets.
 
 Merge Warden also enforces an internal wall-clock review budget. The default is
 900 seconds, with the final 60 seconds reserved for writing artifacts and
 posting the GitHub review. Provider request timeouts and retry sleeps are
 clamped to the remaining provider budget. If the deadline is exhausted at any
-map, validation, reduce, or synthesis stage, the pipeline preserves the
+map, pre-reduce, validation, reduce, or synthesis stage, the pipeline preserves the
 evidence collected so far and returns a fail-closed `COMMENT` instead of
 waiting for the outer GitHub Actions timeout to kill the process. Keep the
 workflow job timeout comfortably above `review-timeout-seconds`.
