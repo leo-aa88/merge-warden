@@ -5138,11 +5138,40 @@ class ParallelValidationSchedulerTests(unittest.TestCase):
             )
         tasks = plan_validation_tasks(store)
         self.assertEqual(tasks[0].path, "include/crowded.h")
-        self.assertEqual(len(tasks[0].related_for_prompt), 12)
+        self.assertEqual(
+            len(tasks[0].related_for_prompt), rp.MAX_VALIDATION_PROMPT_FINDINGS
+        )
+        self.assertTrue(
+            any(item.severity == "BLOCKING" for item in tasks[0].related_for_prompt),
+            "the BLOCKING finding that ranked this path must stay a prompt candidate",
+        )
+        self.assertEqual(tasks[0].related_for_prompt[0].id, "crowd13")
+        self.assertEqual(store.findings["crowd13"].severity, "BLOCKING")
         self.assertEqual(
             [task.path for task in tasks],
             ["include/crowded.h", "include/minor.h"],
         )
+
+    def test_prompt_demotion_copies_do_not_change_rank_views(self) -> None:
+        store = EvidenceStore()
+        store.findings["confirmed"] = _finding(
+            "confirmed", severity="MAJOR", confidence="CONFIRMED"
+        )
+        store.needs_context = [
+            rp.ContextNeed(
+                path="include/foo.h",
+                reason="still needs context",
+                finding_ids=["confirmed"],
+            )
+        ]
+        rank_views = rp.aggregated_related_findings(
+            store, [store.findings["confirmed"]]
+        )
+        self.assertEqual(rank_views[0].confidence, "CONFIRMED")
+        prompt = rp.validation_prompt_findings(store, rank_views, 0)
+        self.assertEqual(prompt[0].confidence, "LIKELY")
+        self.assertEqual(rank_views[0].confidence, "CONFIRMED")
+        self.assertEqual(store.findings["confirmed"].confidence, "CONFIRMED")
 
     def test_independent_validation_calls_overlap(self) -> None:
         paths = ["include/h1.h", "include/h2.h"]

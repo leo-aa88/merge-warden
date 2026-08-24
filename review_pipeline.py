@@ -8,7 +8,7 @@ import re
 import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
@@ -34,6 +34,9 @@ DEFAULT_PROMPT_REDUCE = Path(__file__).resolve().parent / "prompt_reduce.md"
 REDUCE_GROUP_SIZE = 5
 MAX_REDUCE_ROUNDS = 8
 MAX_VALIDATION_CALLS = 8
+# Cap on candidate findings in one validation prompt. Slice after ranking so
+# the findings that purchased the slot remain in the payload.
+MAX_VALIDATION_PROMPT_FINDINGS = 12
 # Protected tail of the provider budget. Pre-reduce and validation stop
 # REDUCE_RESERVE_SECONDS + SYNTHESIS_RESERVE_SECONDS before the provider
 # cutoff. Final reduce stops SYNTHESIS_RESERVE_SECONDS before it. Synthesis
@@ -902,6 +905,22 @@ def aggregated_related_findings(
     return views
 
 
+def _copy_finding(finding: Finding) -> Finding:
+    return replace(finding, evidence=list(finding.evidence))
+
+
+def _prompt_view(store: EvidenceStore, finding: Finding) -> Finding:
+    """Copy a ranked view and demote pending CONFIRMED for the model only."""
+    view = _copy_finding(finding)
+    if (
+        _finding_has_pending_context(store, view.id)
+        and CONFIDENCE_ORDER.get(view.confidence, -1)
+        >= CONFIDENCE_ORDER["CONFIRMED"]
+    ):
+        view.confidence = "LIKELY"
+    return view
+
+
 def validation_related_findings(
     store: EvidenceStore,
     related: list[Finding],
@@ -910,17 +929,33 @@ def validation_related_findings(
 
     Identity comes from the surviving representative. Severity, confidence,
     and evidence are joined from the merge class. Pending cross-context
-    work is not presented as ``CONFIRMED``.
+    work is not presented as ``CONFIRMED``. Demotion is applied to copies
+    so scheduler rank views keep the true confidence label.
     """
-    views = aggregated_related_findings(store, related)
-    for view in views:
-        if (
-            _finding_has_pending_context(store, view.id)
-            and CONFIDENCE_ORDER.get(view.confidence, -1)
-            >= CONFIDENCE_ORDER["CONFIRMED"]
-        ):
-            view.confidence = "LIKELY"
-    return views
+    return [
+        _prompt_view(store, view)
+        for view in aggregated_related_findings(store, related)
+    ]
+
+
+def validation_prompt_findings(
+    store: EvidenceStore,
+    rank_views: list[Finding],
+    original_index: int,
+    *,
+    limit: int = MAX_VALIDATION_PROMPT_FINDINGS,
+) -> list[Finding]:
+    """Prompt candidates: same joined rank as the queue, then cap, then demote.
+
+    FIFO prefixes drop a BLOCKING class that sits past the bound in needs
+    order. Rank first so the findings that purchased the slot stay in the
+    payload. Demote pending CONFIRMED on copies after the slice.
+    """
+    ranked = sorted(
+        rank_views,
+        key=lambda view: validation_path_sort_key([view], original_index),
+    )
+    return [_prompt_view(store, view) for view in ranked[:limit]]
 
 
 def _parse_finding(
@@ -2079,15 +2114,18 @@ def _validation_task_for_path(
     if not related and all(item.finding_ids for item in related_needs):
         # Rejected or superseded findings must not generate validation work.
         return None
-    # Rank the full merge class before slicing the prompt view. A BLOCKING
-    # member merged into a MINOR canonical is invisible on the raw record,
-    # and [:12] must not hide a high-severity class from the queue.
+    # Rank the full merge class for both the queue and the prompt. A BLOCKING
+    # member merged into a MINOR canonical is invisible on the raw record.
+    # Slice the prompt after that rank so the class that purchased the slot
+    # remains a candidate. Demote pending CONFIRMED on copies only.
     rank_views = aggregated_related_findings(store, related)
     return ValidationTask(
         path=path,
         related_needs=related_needs,
         related=related,
-        related_for_prompt=validation_related_findings(store, related)[:12],
+        related_for_prompt=validation_prompt_findings(
+            store, rank_views, original_index
+        ),
         original_index=original_index,
         sort_key=validation_path_sort_key(rank_views, original_index),
     )
