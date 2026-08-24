@@ -1324,7 +1324,13 @@ def hierarchical_reduce(
             seen.add(finding_id)
             unique.append(finding_id)
         state = tuple(unique)
-        if len(unique) <= REDUCE_GROUP_SIZE:
+        # Fitting in REDUCE_GROUP_SIZE is not the same as having been judged
+        # together. Two first-round groups that each collapse to one canonical
+        # leave two survivors that still need one more judge call.
+        if len(unique) <= 1:
+            _keep_finding_ids(store, unique)
+            return
+        if len(groups) == 1:
             _keep_finding_ids(store, unique)
             return
         if state == previous_state:

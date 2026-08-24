@@ -2169,22 +2169,22 @@ class PreReduceBeforeValidationTests(unittest.TestCase):
         _review, coverage, store, stats = _run_hierarchical(corpus, fake)
         self.assertTrue(coverage.complete)
         self.assertEqual(stats.raw_finding_count, 8)
-        self.assertLessEqual(stats.reduced_finding_count, 2)
-        self.assertLess(stats.reduced_finding_count, stats.raw_finding_count)
+        self.assertEqual(stats.reduced_finding_count, 1)
+        self.assertTrue(fake.validation_messages)
         candidate_counts = [
             len(_validation_candidate_findings(message))
             for message in fake.validation_messages
         ]
-        self.assertTrue(candidate_counts)
-        self.assertLessEqual(max(candidate_counts), 2)
-        self.assertLess(sum(candidate_counts), 8)
-        self.assertLessEqual(stats.validation_requests, 2)
-        kept_bodies = {finding.body for finding in store.kept_findings()}
-        self.assertEqual(kept_bodies, {TYPE_NAME_BODY})
+        self.assertEqual(set(candidate_counts), {1})
+        self.assertEqual(stats.validation_requests, 2)
+        canonical_ids = {
+            candidate["id"]
+            for message in fake.validation_messages
+            for candidate in _validation_candidate_findings(message)
+        }
+        self.assertEqual(len(canonical_ids), 1)
         self.assertIn(f"{stats.raw_finding_count} raw finding(s)", stats.footer())
-        self.assertIn(
-            f"{stats.reduced_finding_count} after pre-reduce", stats.footer()
-        )
+        self.assertIn("1 after pre-reduce", stats.footer())
 
 
 class ValidationAttemptBudgetTests(unittest.TestCase):
@@ -2908,7 +2908,8 @@ class ReducerTerminationTests(unittest.TestCase):
             return json.dumps({"keep": ids, "reject": [], "merge": []})
 
         hierarchical_reduce(store, "<!-- merge-warden-reduce -->", keep_all, 50_000, stats)
-        # Round 1: two groups. Round 2: same two groups, then fixed point.
+        # Round 1: two groups. Round 2: same two groups, then fixed point
+        # (survivors still do not fit in one judge call).
         self.assertEqual(stats.reduce_calls, 4)
         self.assertEqual(
             {item.id for item in store.kept_findings()},
@@ -2976,6 +2977,33 @@ class ReducerTerminationTests(unittest.TestCase):
         self.assertTrue(kept)
         self.assertGreater(len(kept), REDUCE_GROUP_SIZE)
         self.assertLess(len(kept), count)
+
+    def test_reducer_rejudges_survivors_that_fit_after_first_round_merges(self) -> None:
+        """A full map batch of identical findings must become one canonical.
+
+        First-round groups of 5 and 3 each collapse to one survivor. Stopping
+        there would leave two canonicals that never sat in the same judge
+        call. The tournament continues until those leftovers are co-judged.
+        """
+        store = EvidenceStore()
+        count = REDUCE_GROUP_SIZE + 3
+        body = "same TYPE_NAME lexer/parser defect"
+        for index in range(1, count + 1):
+            store.findings[f"F{index}"] = _finding(f"F{index}", body=body)
+        stats = PipelineStats()
+
+        hierarchical_reduce(
+            store,
+            "<!-- merge-warden-reduce -->",
+            lambda _system, user: _merge_equivalent_reduce(user),
+            50_000,
+            stats,
+        )
+        kept = store.kept_findings()
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].body, body)
+        self.assertEqual(stats.reduce_calls, 3)
+        self.assertGreaterEqual(len(store.merged_into), count - 1)
 
 
 class RequestPlannerTests(unittest.TestCase):
