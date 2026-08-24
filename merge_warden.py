@@ -30,6 +30,7 @@ from review_pipeline import (
     SYNTHESIS_RESERVE_SECONDS,
     VALIDATION_STAGE_TOKEN,
     PipelineDeadlineExceeded,
+    finding_record,
     normalize_map_concurrency,
     normalize_validation_concurrency,
     provider_stage_deadline,
@@ -1167,6 +1168,37 @@ def build_inline_comments(
     ]
 
 
+def format_unposted_candidate_findings(findings: list[dict]) -> str:
+    """Render mapper candidates for local artifacts only, never as GitHub comments."""
+    if not findings:
+        return ""
+    sections = [
+        "---",
+        "",
+        "# Candidate findings (not posted)",
+        "",
+        "These mapper candidates were not posted as GitHub inline comments "
+        "because final synthesis did not complete.",
+        "",
+    ]
+    for index, finding in enumerate(findings, 1):
+        location = ""
+        path = str(finding.get("path") or "")
+        line = finding.get("line")
+        if path:
+            location = f" `{path}`"
+            if line is not None:
+                location += f":{line}"
+        finding_id = finding.get("id") or f"F{index}"
+        severity = finding.get("severity") or "MINOR"
+        body = str(finding.get("body") or "").strip() or "(empty finding)"
+        sections.append(f"## {index}. {finding_id}{location}")
+        sections.append("")
+        sections.append(f"**{severity}.** {body}")
+        sections.append("")
+    return "\n".join(sections).rstrip() + "\n"
+
+
 def render_markdown(
     review: dict,
     comments: list[dict],
@@ -1174,6 +1206,7 @@ def render_markdown(
     posted_event: str | None = None,
     posted_comments: list[dict] | None = None,
     pipeline_footer: str = "",
+    unposted_findings: list[dict] | None = None,
 ) -> str:
     body = wrap_review_body(str(review.get("body") or ""))
     if (
@@ -1190,6 +1223,9 @@ def render_markdown(
     extra = ["", status, ""]
     if pipeline_footer:
         extra.extend([pipeline_footer, ""])
+    appendix = format_unposted_candidate_findings(unposted_findings or [])
+    if appendix:
+        extra.extend([appendix, ""])
     return truncate(body.rstrip() + "\n" + "\n".join(extra), MAX_REVIEW_CHARS, "review")
 
 
@@ -1592,7 +1628,7 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
                 flush=True,
             )
 
-    review, coverage, _store, stats = run_hierarchical_review(
+    review, coverage, store, stats = run_hierarchical_review(
         corpus=corpus,
         synthesis_prompt=system_prompt,
         map_prompt=map_prompt,
@@ -1657,12 +1693,16 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
     print(stats.footer(), flush=True)
     incomplete = not coverage.complete or stats.deadline_exhausted
     if incomplete:
+        # Synthesis did not complete. Mapper candidates are not review findings.
         review["event"] = "COMMENT"
+        review["comments"] = []
 
     comments = build_inline_comments(review, commentable)
+    if incomplete:
+        comments = []
     head_sha = pr.get("headRefOid") or ""
     event = normalize_event(str(review.get("event") or ""), str(review.get("body") or ""))
-    if incomplete and event == "APPROVE":
+    if incomplete:
         event = "COMMENT"
     payload = {
         "commit_id": head_sha,
@@ -1670,9 +1710,18 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
         "body": review_summary_body(review),
         "comments": comments,
     }
+    unposted = (
+        [finding_record(item) for item in store.kept_findings()] if incomplete else []
+    )
     Path(args.json_output).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     Path(args.output).write_text(
-        render_markdown(review, comments, event, pipeline_footer=stats.footer()),
+        render_markdown(
+            review,
+            comments,
+            event,
+            pipeline_footer=stats.footer(),
+            unposted_findings=unposted,
+        ),
         encoding="utf-8",
     )
     print(
@@ -1712,6 +1761,7 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
                     posted_event=posted_event,
                     posted_comments=posted_comments,
                     pipeline_footer=stats.footer(),
+                    unposted_findings=unposted,
                 ),
                 encoding="utf-8",
             )

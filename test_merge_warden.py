@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 import merge_warden as mw
+from review_pipeline import EvidenceStore, Finding
 
 
 def _chunk_ids_in_prompt(user: str) -> list[str]:
@@ -296,6 +297,198 @@ class InlineCommentLocationTests(unittest.TestCase):
         self.assertEqual(comments[0]["line"], 11)
         self.assertEqual(set(comments[0]), {"path", "side", "line", "body"})
         self.assertNotIn("subject_type", comments[0])
+
+
+class IncompletePipelinePostingTests(unittest.TestCase):
+    PR = {
+        "number": 1,
+        "title": "t",
+        "body": "b",
+        "url": "https://example.test/pr/1",
+        "author": {"login": "a"},
+        "baseRefName": "main",
+        "headRefName": "feat",
+        "headRefOid": "deadbeef",
+        "labels": [],
+        "closingIssuesReferences": [],
+    }
+    FILE = {
+        "filename": "a.c",
+        "status": "modified",
+        "additions": 1,
+        "deletions": 1,
+        "patch": "@@ -1,1 +1,1 @@\n-old\n+new\n",
+    }
+    RAW_COMMENT = {
+        "path": "a.c",
+        "side": "RIGHT",
+        "line": 1,
+        "severity": "MAJOR",
+        "body": "raw mapper candidate",
+    }
+    CANDIDATE = {
+        "id": "F1",
+        "severity": "MAJOR",
+        "path": "a.c",
+        "side": "RIGHT",
+        "line": 1,
+        "body": "raw mapper candidate",
+        "confidence": "LIKELY",
+        "evidence": [],
+    }
+
+    def _args(self, tmp: str, *, post: bool = False) -> argparse.Namespace:
+        return argparse.Namespace(
+            provider="xai",
+            model="grok-4.6",
+            prompt_file=str(mw.DEFAULT_PROMPT),
+            pr="1",
+            head_ref="pr-head",
+            output=str(Path(tmp) / "merge-warden.md"),
+            json_output=str(Path(tmp) / "merge-warden.json"),
+            post=post,
+            skip_if_missing_key=False,
+        )
+
+    def _store(self) -> EvidenceStore:
+        store = EvidenceStore()
+        store.findings["F1"] = Finding(
+            id="F1",
+            severity="MAJOR",
+            path="a.c",
+            side="RIGHT",
+            line=1,
+            body="raw mapper candidate",
+            confidence="LIKELY",
+        )
+        store.kept.add("F1")
+        return store
+
+    def _stats(self, *, complete: bool, deadline_exhausted: bool):
+        coverage = mock.Mock(
+            complete=complete,
+            uncovered_chunk_ids=[] if complete else ["chunk-1"],
+        )
+        stats = mock.Mock(
+            deadline_exhausted=deadline_exhausted,
+            validation_deadline_exhausted=False,
+            pre_reduce_deadline_exhausted=False,
+            reduce_deadline_exhausted=False,
+            notes=[],
+        )
+        stats.footer.return_value = "pipeline footer"
+        return coverage, stats
+
+    def _leaky_review(self) -> dict:
+        return {
+            "event": "REQUEST_CHANGES",
+            "body": "# COMMENT\n\nNo approval decision was produced.\n",
+            "comments": [self.RAW_COMMENT],
+        }
+
+    def _generate(self, args: argparse.Namespace, review, coverage, stats, store=None):
+        if store is None:
+            store = EvidenceStore()
+        with mock.patch.dict(os.environ, {"XAI_API_KEY": "sk"}):
+            with mock.patch.object(mw, "gh_json", return_value=self.PR):
+                with mock.patch.object(mw, "collect_pr_files", return_value=[self.FILE]):
+                    with mock.patch.object(
+                        mw,
+                        "run",
+                        return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+                    ):
+                        with mock.patch.object(mw, "load_arch_docs", return_value=[]):
+                            with mock.patch.object(
+                                mw,
+                                "run_hierarchical_review",
+                                return_value=(review, coverage, store, stats),
+                            ):
+                                return mw.generate_review(args, "o/r")
+
+    def _assert_github_payload(self, payload: dict) -> None:
+        self.assertEqual(set(payload), {"commit_id", "event", "body", "comments"})
+        self.assertEqual(payload["event"], "COMMENT")
+        self.assertEqual(payload["comments"], [])
+        self.assertNotIn("raw mapper candidate", payload["body"])
+
+    def test_format_unposted_candidate_findings_is_debug_only(self) -> None:
+        text = mw.format_unposted_candidate_findings([self.CANDIDATE])
+        self.assertIn("Candidate findings (not posted)", text)
+        self.assertIn("raw mapper candidate", text)
+        self.assertIn("`a.c`:1", text)
+        self.assertEqual(mw.format_unposted_candidate_findings([]), "")
+
+    def test_deadline_exhausted_strips_inline_comments_from_posted_payload(
+        self,
+    ) -> None:
+        coverage, stats = self._stats(complete=True, deadline_exhausted=True)
+        posted: list[dict] = []
+
+        def capture_post(_repo: str, _pr: str, payload: dict):
+            posted.append(payload)
+            return "COMMENT", []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp, post=True)
+            with mock.patch.object(mw, "post_review", side_effect=capture_post):
+                with mock.patch.object(mw.time, "monotonic", return_value=0.0):
+                    rc = self._generate(
+                        args,
+                        self._leaky_review(),
+                        coverage,
+                        stats,
+                        store=self._store(),
+                    )
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+            markdown = Path(args.output).read_text(encoding="utf-8")
+        self.assertEqual(rc, 0)
+        self._assert_github_payload(payload)
+        self.assertIn("raw mapper candidate", markdown)
+        self.assertIn("Candidate findings (not posted)", markdown)
+        self.assertEqual(posted[0]["event"], "COMMENT")
+        self.assertEqual(posted[0]["comments"], [])
+        self.assertEqual(set(posted[0]), {"commit_id", "event", "body", "comments"})
+        self.assertNotIn("raw mapper candidate", posted[0]["body"])
+
+    def test_incomplete_coverage_strips_inline_comments_from_posted_payload(
+        self,
+    ) -> None:
+        coverage, stats = self._stats(complete=False, deadline_exhausted=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp)
+            rc = self._generate(
+                args,
+                self._leaky_review(),
+                coverage,
+                stats,
+                store=self._store(),
+            )
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+            markdown = Path(args.output).read_text(encoding="utf-8")
+        self.assertEqual(rc, 0)
+        self._assert_github_payload(payload)
+        self.assertIn("raw mapper candidate", markdown)
+        self.assertIn("Candidate findings (not posted)", markdown)
+
+    def test_synthesized_review_still_posts_inline_comments(self) -> None:
+        review = {
+            "event": "REQUEST_CHANGES",
+            "body": "# REQUEST CHANGES\n\nA real synthesized finding.\n",
+            "comments": [self.RAW_COMMENT],
+        }
+        coverage, stats = self._stats(complete=True, deadline_exhausted=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp)
+            rc = self._generate(args, review, coverage, stats, store=self._store())
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+            markdown = Path(args.output).read_text(encoding="utf-8")
+        self.assertEqual(rc, 0)
+        self.assertEqual(payload["event"], "REQUEST_CHANGES")
+        self.assertEqual(set(payload), {"commit_id", "event", "body", "comments"})
+        self.assertEqual(len(payload["comments"]), 1)
+        self.assertEqual(payload["comments"][0]["path"], "a.c")
+        self.assertIn("raw mapper candidate", payload["comments"][0]["body"])
+        self.assertNotIn("Candidate findings (not posted)", markdown)
 
 
 class ReviewJsonTests(unittest.TestCase):

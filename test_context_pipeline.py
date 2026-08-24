@@ -37,6 +37,7 @@ from context_pipeline import (
     split_text_by_lines,
 )
 from review_pipeline import (
+    CANDIDATE_FINDINGS_NOT_POSTED,
     DEFAULT_MAP_CONCURRENCY,
     DEFAULT_VALIDATION_CONCURRENCY,
     MAP_MISSING_CHUNK_RETRIES,
@@ -349,12 +350,21 @@ class _ReviewRecorder:
         )
 
 
+def _assert_unsynthesized_fallback(test: unittest.TestCase, review: dict) -> None:
+    test.assertEqual(review["event"], "COMMENT")
+    test.assertEqual(review.get("comments") or [], [])
+    test.assertEqual(set(review), {"event", "body", "comments"})
+    test.assertNotIn("# APPROVE", review["body"])
+    test.assertNotIn("# REQUEST CHANGES", review["body"])
+    test.assertIn("No approval decision was produced", review["body"])
+
+
 class ReviewDeadlinePipelineTests(unittest.TestCase):
-    def _run(self, call_model):
+    def _run(self, call_model, **kwargs):
         corpus = _synthetic_corpus(
             [_chunk("file:a.c:1", "a.c", "int main(void) { return 0; }\n")]
         )
-        return run_hierarchical_review(
+        defaults = dict(
             corpus=corpus,
             synthesis_prompt="synthesis",
             map_prompt="merge-warden-map",
@@ -365,6 +375,20 @@ class ReviewDeadlinePipelineTests(unittest.TestCase):
             max_reduce_request_chars=225_000,
             map_overhead_chars=24_000,
         )
+        defaults.update(kwargs)
+        return run_hierarchical_review(**defaults)
+
+    def _mapped_finding(self, *, body: str = "candidate defect") -> dict:
+        return {
+            "id": "F1",
+            "severity": "MAJOR",
+            "path": "a.c",
+            "side": "RIGHT",
+            "line": 1,
+            "body": body,
+            "confidence": "LIKELY",
+            "evidence": ["line 1"],
+        }
 
     def test_deadline_during_map_stops_without_retry_storm(self) -> None:
         calls = 0
@@ -376,7 +400,7 @@ class ReviewDeadlinePipelineTests(unittest.TestCase):
 
         review, coverage, _store, stats = self._run(call_model)
         self.assertEqual(calls, 1)
-        self.assertEqual(review["event"], "COMMENT")
+        _assert_unsynthesized_fallback(self, review)
         self.assertFalse(coverage.complete)
         self.assertTrue(stats.deadline_exhausted)
         self.assertIn("wall-clock review deadline", review["body"])
@@ -387,28 +411,64 @@ class ReviewDeadlinePipelineTests(unittest.TestCase):
             if "merge-warden-map" in system:
                 return _map_chunks_json(
                     _chunk_ids_in_prompt(user),
-                    findings=[
-                        {
-                            "id": "F1",
-                            "severity": "MAJOR",
-                            "path": "a.c",
-                            "side": "RIGHT",
-                            "line": 1,
-                            "body": "candidate defect",
-                            "confidence": "LIKELY",
-                            "evidence": ["line 1"],
-                        }
-                    ],
+                    findings=[self._mapped_finding()],
                 )
             raise PipelineDeadlineExceeded("provider cutoff reached before synthesis")
 
         review, coverage, store, stats = self._run(call_model)
         self.assertTrue(coverage.complete)
         self.assertTrue(stats.deadline_exhausted)
-        self.assertEqual(review["event"], "COMMENT")
+        _assert_unsynthesized_fallback(self, review)
         self.assertEqual(len(store.kept_findings()), 1)
-        self.assertIn("candidate defect", review["body"])
-        self.assertIn("No approval decision was produced.", review["body"])
+        self.assertEqual(store.kept_findings()[0].body, "candidate defect")
+        self.assertNotIn("candidate defect", review["body"])
+        self.assertIn(CANDIDATE_FINDINGS_NOT_POSTED, review["body"])
+        self.assertIn("Primary context coverage:", review["body"])
+
+    def test_findings_as_review_never_emits_inline_comments(self) -> None:
+        store = EvidenceStore()
+        store.findings["F1"] = Finding(
+            id="F1",
+            severity="MAJOR",
+            path="a.c",
+            side="RIGHT",
+            line=1,
+            body="raw mapper candidate",
+            confidence="LIKELY",
+        )
+        store.kept.add("F1")
+        review = findings_as_review(
+            store, "# COMMENT\n\nNo approval decision was produced.\n"
+        )
+        _assert_unsynthesized_fallback(self, review)
+        self.assertEqual(review["comments"], [])
+        self.assertNotIn("raw mapper candidate", review["body"])
+        self.assertEqual(store.kept_findings()[0].body, "raw mapper candidate")
+        self.assertEqual(store.kept_findings()[0].path, "a.c")
+        self.assertEqual(store.kept_findings()[0].line, 1)
+        self.assertIn(CANDIDATE_FINDINGS_NOT_POSTED, review["body"])
+
+    def test_synthesis_overflow_fail_closes_without_inline_comments(self) -> None:
+        def call_model(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[self._mapped_finding(body="overflow candidate")],
+                )
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            raise AssertionError("synthesis must not run when the payload overflows")
+
+        review, coverage, store, stats = self._run(
+            call_model, max_reduce_request_chars=80
+        )
+        self.assertFalse(coverage.complete)
+        self.assertEqual(stats.synthesis_calls, 0)
+        _assert_unsynthesized_fallback(self, review)
+        self.assertTrue(store.kept_findings())
+        self.assertIn("overflow candidate", [item.body for item in store.kept_findings()])
+        self.assertNotIn("overflow candidate", review["body"])
+        self.assertEqual(review.get("comments") or [], [])
 
 
 class SplitTests(unittest.TestCase):
@@ -640,10 +700,8 @@ class PipelineTests(unittest.TestCase):
             map_overhead_chars=100,
         )
         self.assertFalse(coverage.complete)
-        self.assertEqual(review["event"], "COMMENT")
+        _assert_unsynthesized_fallback(self, review)
         self.assertIn("could not complete a full review", review["body"])
-        self.assertIn("No approval decision was produced", review["body"])
-        self.assertNotIn("# APPROVE", review["body"])
 
     def test_limit_error_does_not_call_model(self) -> None:
         corpus = build_review_corpus(
@@ -670,6 +728,7 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(calls, [])
         self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(review.get("comments") or [], [])
         self.assertIn("did not perform a complete review", review["body"])
         self.assertTrue(coverage.limit_error)
 
@@ -704,7 +763,15 @@ class PipelineTests(unittest.TestCase):
                 {
                     "event": "REQUEST_CHANGES",
                     "body": "# REQUEST CHANGES\n\noriginal evidence body\n",
-                    "comments": [],
+                    "comments": [
+                        {
+                            "path": "src/foo.c",
+                            "side": "RIGHT",
+                            "line": 1,
+                            "severity": "MAJOR",
+                            "body": "original evidence body",
+                        }
+                    ],
                 }
             )
 
@@ -724,6 +791,9 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(_by_local_id(store, "F1").body, "original evidence body")
         self.assertGreaterEqual(stats.map_calls, 1)
         self.assertEqual(stats.synthesis_calls, 1)
+        self.assertEqual(len(review["comments"]), 1)
+        self.assertEqual(review["comments"][0]["path"], "src/foo.c")
+        self.assertEqual(review["comments"][0]["body"], "original evidence body")
 
     def test_needs_context_triggers_validation(self) -> None:
         corpus = build_review_corpus(
@@ -1046,6 +1116,7 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("`D1`", body)
         review = findings_as_review(EvidenceStore(), body)
         self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(review.get("comments") or [], [])
 
 
 class MapAcknowledgementTests(unittest.TestCase):
@@ -1081,8 +1152,7 @@ class MapAcknowledgementTests(unittest.TestCase):
         )
         self.assertFalse(coverage.complete)
         self.assertIn(second_chunk.member_ids[0], coverage.uncovered_chunk_ids)
-        self.assertEqual(review["event"], "COMMENT")
-        self.assertIn("No approval decision was produced", review["body"])
+        _assert_unsynthesized_fallback(self, review)
         self.assertGreaterEqual(stats.map_calls, 2)
 
     def test_hallucinated_chunk_ids_do_not_count_toward_coverage(self) -> None:
@@ -1136,8 +1206,7 @@ class MapAcknowledgementTests(unittest.TestCase):
         )
         self.assertFalse(coverage.complete)
         self.assertTrue(coverage.uncovered_chunk_ids)
-        self.assertEqual(review["event"], "COMMENT")
-        self.assertIn("No approval decision was produced", review["body"])
+        _assert_unsynthesized_fallback(self, review)
 
     def test_complete_acknowledgement_still_succeeds(self) -> None:
         corpus = build_review_corpus(_inputs(diff="@@ -1 +1 @@\n-a\n+b\n"))
@@ -2924,6 +2993,130 @@ class ValidationStageBudgetTests(unittest.TestCase):
         self.assertEqual(fake.state["synthesis"], 1)
         self.assertIn("Synthesized review.", review["body"])
 
+    def _locatable_findings(
+        self, paths: list[str]
+    ) -> tuple[list[dict], list[dict]]:
+        findings, needs = self._owned_findings(paths)
+        for item in findings:
+            item["side"] = "RIGHT"
+            item["line"] = 1
+        return findings, needs
+
+    def test_validation_deadline_then_synthesis_timeout_posts_no_inline_comments(
+        self,
+    ) -> None:
+        corpus, paths = self._paths_corpus(4)
+        findings, needs = self._locatable_findings(paths)
+
+        def on_validation(n: int, _user: str, ids: list[str]) -> str:
+            if n >= 2:
+                raise PipelineDeadlineExceeded(
+                    "provider cutoff reached before validation"
+                )
+            return _map_chunks_json(ids)
+
+        inner = self._pipeline(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "synthesis":
+                raise PipelineDeadlineExceeded(
+                    "provider cutoff reached before synthesis"
+                )
+            return inner(system, user)
+
+        review, coverage, store, stats = _run_hierarchical(
+            corpus, fake, validation_concurrency=1
+        )
+        self.assertTrue(coverage.complete)
+        self.assertTrue(stats.deadline_exhausted)
+        self.assertTrue(stats.validation_deadline_exhausted)
+        self.assertEqual(stats.synthesis_calls, 0)
+        _assert_unsynthesized_fallback(self, review)
+        self.assertTrue(store.kept_findings())
+        for finding in store.kept_findings():
+            self.assertNotIn(finding.body, review["body"])
+        self.assertIn(CANDIDATE_FINDINGS_NOT_POSTED, review["body"])
+
+    def test_reduce_deadline_then_synthesis_timeout_posts_no_inline_comments(
+        self,
+    ) -> None:
+        corpus, paths = self._paths_corpus(8)
+        findings, needs = self._locatable_findings(paths)
+
+        def on_reduce(stage: str, _user: str) -> str:
+            if stage == "reduce":
+                raise PipelineDeadlineExceeded(
+                    "provider cutoff reached before reduce"
+                )
+            return json.dumps({"keep": [], "reject": [], "merge": []})
+
+        inner = self._pipeline(
+            findings=findings, needs_context=needs, on_reduce=on_reduce
+        )
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "synthesis":
+                raise PipelineDeadlineExceeded(
+                    "provider cutoff reached before synthesis"
+                )
+            return inner(system, user)
+
+        review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertTrue(stats.deadline_exhausted)
+        self.assertTrue(stats.reduce_deadline_exhausted)
+        self.assertEqual(stats.synthesis_calls, 0)
+        _assert_unsynthesized_fallback(self, review)
+        self.assertTrue(store.kept_findings())
+        self.assertIn(CANDIDATE_FINDINGS_NOT_POSTED, review["body"])
+
+    def test_validation_deadline_with_successful_synthesis_keeps_inline_comments(
+        self,
+    ) -> None:
+        corpus, paths = self._paths_corpus(4)
+        findings, needs = self._locatable_findings(paths)
+        synthesized = [
+            {
+                "path": "src/foo.c",
+                "side": "RIGHT",
+                "line": 1,
+                "severity": "MAJOR",
+                "body": "synthesized finding after incomplete validation",
+            }
+        ]
+        inner = self._pipeline(findings=findings, needs_context=needs)
+        clock = {"now": 10_000.0}
+        provider_deadline = (
+            clock["now"] + REDUCE_RESERVE_SECONDS + SYNTHESIS_RESERVE_SECONDS
+        )
+
+        def fake(system: str, user: str) -> str:
+            raw = inner(system, user)
+            if mw.provider_call_stage(system, user) == "synthesis":
+                return json.dumps(
+                    {
+                        "event": "REQUEST_CHANGES",
+                        "body": "# REQUEST CHANGES\n\nSynthesized review.\n",
+                        "comments": synthesized,
+                    }
+                )
+            return raw
+
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            review, coverage, _store, stats = _run_hierarchical(
+                corpus, fake, deadline=provider_deadline
+            )
+        self.assertTrue(coverage.complete)
+        self.assertFalse(stats.deadline_exhausted)
+        self.assertTrue(stats.validation_deadline_exhausted)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertEqual(review["event"], "REQUEST_CHANGES")
+        self.assertEqual(review["comments"], synthesized)
+
 
 class ReducerDecisionValidationTests(unittest.TestCase):
     """Reducer JSON is untrusted; only current group_ids may mutate state."""
@@ -3788,8 +3981,7 @@ class SerializedRequestBudgetTests(unittest.TestCase):
         )
         self.assertFalse(coverage.complete)
         self.assertIn(chunk.id, coverage.uncovered_chunk_ids)
-        self.assertEqual(review["event"], "COMMENT")
-        self.assertIn("No approval decision was produced", review["body"])
+        _assert_unsynthesized_fallback(self, review)
         self.assertEqual(recorder.map_messages, [])
         self.assertEqual(stats.map_calls, 0)
         self.assertEqual(stats.synthesis_calls, 0)
@@ -4078,8 +4270,7 @@ class SerializedRequestBudgetTests(unittest.TestCase):
             map_overhead_chars=1,
         )
         self.assertFalse(coverage.complete)
-        self.assertEqual(review["event"], "COMMENT")
-        self.assertIn("No approval decision was produced", review["body"])
+        _assert_unsynthesized_fallback(self, review)
         self.assertIn("could not complete a full review", review["body"])
 
 
@@ -4280,11 +4471,10 @@ class MapFanoutAndDegradationTests(unittest.TestCase):
         review, coverage, _store, stats = self._run(corpus, self._ack_model(handler))
         self.assertFalse(coverage.complete)
         self.assertEqual(coverage.uncovered_chunk_ids, ["C3"])
-        self.assertEqual(review["event"], "COMMENT")
+        _assert_unsynthesized_fallback(self, review)
         self.assertIn("1 context chunk(s)", review["body"])
         self.assertNotIn("`C1`", review["body"])
         self.assertIn("`C3`", review["body"])
-        self.assertIn("No approval decision was produced", review["body"])
         self.assertEqual(stats.map_chunks_acknowledged, 3)
         self.assertEqual(stats.map_chunks_uncovered, 1)
         self.assertEqual(stats.synthesis_calls, 0)
@@ -4460,10 +4650,10 @@ class MapFanoutAndDegradationTests(unittest.TestCase):
         review, coverage, _store, stats = self._run(corpus, self._ack_model(handler))
         self.assertFalse(coverage.complete)
         self.assertEqual(set(coverage.uncovered_chunk_ids), fail)
+        _assert_unsynthesized_fallback(self, review)
         self.assertIn("8 / 10 context chunks analyzed", review["body"])
         self.assertIn("Map failures:", review["body"])
         self.assertIn("non-JSON", review["body"])
-        self.assertIn("No approval decision was produced", review["body"])
         self.assertIn("planned map batch", stats.footer())
         self.assertIn("map attempt", stats.footer())
         self.assertIn("8/10 primary chunks acknowledged", stats.footer())
@@ -4544,8 +4734,7 @@ class MapFanoutAndDegradationTests(unittest.TestCase):
 
         review, coverage, _store, stats = self._run(corpus, fake)
         self.assertFalse(coverage.complete)
-        self.assertEqual(review["event"], "COMMENT")
-        self.assertNotIn("# APPROVE", review["body"])
+        _assert_unsynthesized_fallback(self, review)
         self.assertEqual(stats.synthesis_calls, 0)
 
     def test_tail_sentinel_is_mapped_or_explicitly_uncovered(self) -> None:
@@ -4816,7 +5005,7 @@ class ParallelMapSchedulerTests(unittest.TestCase):
         self.assertEqual(stats.map_batches_split, 0)
         self.assertTrue(stats.deadline_exhausted)
         self.assertFalse(coverage.complete)
-        self.assertEqual(review["event"], "COMMENT")
+        _assert_unsynthesized_fallback(self, review)
         self.assertIn("wall-clock review deadline", review["body"])
 
     def test_deadline_does_not_trigger_retry_or_split_storm(self) -> None:
@@ -4856,6 +5045,8 @@ class ParallelMapSchedulerTests(unittest.TestCase):
                                 "id": "F_DEADLINE_SURVIVOR",
                                 "severity": "MAJOR",
                                 "path": "c1.c",
+                                "side": "RIGHT",
+                                "line": 1,
                                 "body": "deadline survivor finding",
                                 "confidence": "LIKELY",
                             }
@@ -4876,7 +5067,12 @@ class ParallelMapSchedulerTests(unittest.TestCase):
         self.assertEqual(stats.map_calls_succeeded, 1)
         self.assertEqual(stats.map_batches_split, 0)
         self.assertTrue(stats.deadline_exhausted)
-        self.assertIn("deadline survivor finding", review["body"])
+        _assert_unsynthesized_fallback(self, review)
+        self.assertEqual(
+            [item.body for item in store.kept_findings()],
+            ["deadline survivor finding"],
+        )
+        self.assertNotIn("deadline survivor finding", review["body"])
         self.assertEqual(
             _by_local_id(store, "F_DEADLINE_SURVIVOR").body,
             "deadline survivor finding",
@@ -5596,6 +5792,7 @@ class GenerateReviewPipelineTests(unittest.TestCase):
             payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
         self.assertEqual(rc, 0)
         self.assertEqual(payload["event"], "COMMENT")
+        self.assertEqual(payload.get("comments") or [], [])
         self.assertIn("could not complete a full review", markdown)
         self.assertNotIn("# APPROVE", markdown)
 

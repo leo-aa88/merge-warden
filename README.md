@@ -155,7 +155,8 @@ with `git show`.
 ## Outputs
 
 - `markdown-path` — `merge-warden.md`
-- `json-path` — `merge-warden.json`
+- `json-path` — `merge-warden.json`, the GitHub review payload
+  (`commit_id`, `event`, `body`, `comments`)
 - `generated-event` — event the model produced
 - `generated-comment-count` — inline comments before GitHub accepts the review
 - `posted-event` — event GitHub accepted (empty when `post` is false)
@@ -225,10 +226,12 @@ calls and the pipeline continues. Remaining cross-context checks are marked
 validation is acceptable; a review with no synthesis is not. Map still uses
 the full provider deadline; exhausting it fail-closes to `COMMENT` because
 primary coverage is incomplete. If synthesis itself hits the provider cutoff,
-the pipeline preserves the evidence collected so far and returns a fail-closed
-`COMMENT` instead of waiting for the outer GitHub Actions timeout to kill the
-process. Keep the workflow job timeout comfortably above
-`review-timeout-seconds`.
+or if coverage is incomplete so synthesis never runs, the pipeline fail-closes
+to `COMMENT` with **no inline comments**. Mapper candidates stay in
+`merge-warden.md` for debugging; `merge-warden.json` remains the GitHub review
+payload (`commit_id`, `event`, `body`, `comments`) and is not a debug dump.
+An unsynthesized mapper candidate is not a review finding. Keep the workflow
+job timeout comfortably above `review-timeout-seconds`.
 
 Optional environment overrides:
 
