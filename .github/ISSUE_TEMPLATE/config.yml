@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/leo-aa88/merge-warden/blob/main/README.md
+    about: Usage, inputs, outputs, pipeline stages, and environment overrides.
+  - name: Security vulnerability
+    url: https://github.com/leo-aa88/merge-warden/security/advisories/new
+    about: Report privately via a GitHub security advisory — never in a public issue.
+  - name: Architecture and invariants
+    url: https://github.com/leo-aa88/merge-warden/blob/main/AGENTS.md
+    about: Project invariants, repository map, and review pipeline conventions.
