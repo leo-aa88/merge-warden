@@ -2275,6 +2275,43 @@ def _has_incomplete_validation(store: EvidenceStore) -> bool:
     )
 
 
+def normalize_event(event: str, body: str) -> str:
+    """Canonicalize a review event the same way the posting path does.
+
+    Synthesis often returns aliases (``lgtm``, ``APPROVED``, ``approve.``) or
+    puts the verdict only in a markdown heading. Posting recovers ``APPROVE``
+    from those forms, so fail-closed guards must use this helper rather than
+    comparing the raw ``event`` string to ``APPROVE``.
+    """
+
+    def canonical(text: str) -> str:
+        key = re.sub(r"[^A-Z]+", "_", text.upper()).strip("_")
+        if key in {"APPROVE", "COMMENT", "REQUEST_CHANGES"}:
+            return key
+        return ""
+
+    heading_lines = (line.lstrip("#").strip() for line in (body or "").splitlines()[:8])
+    for candidate in (event, *heading_lines):
+        mapped = canonical(candidate)
+        if mapped:
+            return mapped
+    return "COMMENT"
+
+
+def apply_incomplete_validation_guard(
+    event: str, body: str, store: EvidenceStore
+) -> tuple[str, str]:
+    """Make APPROVE unreachable while a kept finding has incomplete validation."""
+    if normalize_event(event, body) == "APPROVE" and _has_incomplete_validation(store):
+        return "COMMENT", (
+            "# COMMENT\n\n"
+            "Merge Warden could not validate all requested context for surviving "
+            "candidate findings, so it will not approve this pull request.\n\n"
+            + body.lstrip()
+        )
+    return event, body
+
+
 def _format_id_list(ids: set[str], *, limit: int = MISSING_VALIDATION_ID_NOTE_LIMIT) -> str:
     ordered = sorted(ids)
     if len(ordered) <= limit:
@@ -2898,18 +2935,10 @@ def run_hierarchical_review(
     event = str(parsed.get("event") or "COMMENT")
     body = str(parsed.get("body") or "")
     comments = parsed.get("comments") if isinstance(parsed.get("comments"), list) else []
-    if (
-        event.upper().replace(" ", "_") == "APPROVE"
-        and _has_incomplete_validation(store)
+    event, body = apply_incomplete_validation_guard(event, body, store)
+    if normalize_event(event, body) == "APPROVE" and not all_reviewable_context_covered(
+        coverage
     ):
-        event = "COMMENT"
-        body = (
-            "# COMMENT\n\n"
-            "Merge Warden could not validate all requested context for surviving "
-            "candidate findings, so it will not approve this pull request.\n\n"
-            + body.lstrip()
-        )
-    if event.upper().replace(" ", "_") == "APPROVE" and not all_reviewable_context_covered(coverage):
         event = "COMMENT"
         body = _incomplete_preamble(corpus, coverage, stats) + "\n" + body
     review = {"event": event, "body": body, "comments": comments}
