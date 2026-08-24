@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Map/reduce/synthesize a Merge Warden review from a context corpus."""
+"""Map, pre-reduce, validate, reduce, and synthesize a Merge Warden review."""
 
 from __future__ import annotations
 
@@ -120,6 +120,7 @@ class EvidenceStore:
     kept: set[str] = field(default_factory=set)
     rejected: dict[str, str] = field(default_factory=dict)
     merged_into: dict[str, str] = field(default_factory=dict)
+    reduced: bool = False
 
     def resolve_canonical(self, finding_id: str) -> str:
         """Follow merge edges to the root identity of an equivalence class.
@@ -171,7 +172,7 @@ class EvidenceStore:
             canonical_id = self.resolve_canonical(finding_id)
             if canonical_id in self.rejected or canonical_id in seen:
                 continue
-            if self.kept and canonical_id not in self.kept:
+            if (self.kept or self.reduced) and canonical_id not in self.kept:
                 continue
             if canonical_id not in self.findings:
                 continue
@@ -253,6 +254,8 @@ class PipelineStats:
     validation_requests: int = 0
     validation_chunks_sent: int = 0
     validation_chunks_acknowledged: int = 0
+    raw_finding_count: int = 0
+    reduced_finding_count: int = 0
     reduce_calls: int = 0
     synthesis_calls: int = 0
     map_request_chars: int = 0
@@ -301,6 +304,8 @@ class PipelineStats:
             f"{self.map_attempts} map attempt(s), "
             f"{self.map_calls_succeeded} successful map response(s), "
             f"{self.map_chunks_acknowledged}/{self.chunks} primary chunks acknowledged, "
+            f"{self.raw_finding_count} raw finding(s), "
+            f"{self.reduced_finding_count} after pre-reduce, "
             f"{self.validation_calls} validation call(s), "
             f"{total_request_chars} total request chars "
             f"(primary map {self.map_request_chars}, validation {self.validation_request_chars}, "
@@ -638,6 +643,18 @@ def _parse_context_need(
     )
 
 
+def _surviving_canonical_id(store: EvidenceStore, finding_id: str) -> str | None:
+    """Return the surviving canonical ID, or ``None`` if rejected/unknown."""
+    canonical_id = store.resolve_canonical(finding_id)
+    if canonical_id in store.rejected:
+        return None
+    if (store.kept or store.reduced) and canonical_id not in store.kept:
+        return None
+    if canonical_id not in store.findings:
+        return None
+    return canonical_id
+
+
 def findings_for_context_need(
     store: EvidenceStore,
     needs: list[ContextNeed],
@@ -645,37 +662,131 @@ def findings_for_context_need(
     """Resolve findings whose confidence depends on the given context needs.
 
     Each need is resolved independently, then the results are unioned.
-    Explicit ``finding_ids`` are authoritative for that need. Unknown IDs are
-    ignored. If a need has no usable IDs, fall back to findings that originated
-    from that need's map chunk. Filename presence in finding prose is not a
+    Explicit ``finding_ids`` are authoritative for that need and are followed
+    through merge edges to the surviving canonical. Unknown and rejected IDs
+    are ignored. Fallback to the originating chunk runs only when
+    ``finding_ids`` was empty. Filename presence in finding prose is not a
     relationship.
     """
     related: list[Finding] = []
     seen: set[str] = set()
 
-    def add(finding: Finding) -> None:
-        if finding.id in seen:
-            return
-        seen.add(finding.id)
-        related.append(finding)
+    def add_canonical(finding_id: str) -> bool:
+        canonical_id = _surviving_canonical_id(store, finding_id)
+        if canonical_id is None:
+            return False
+        if canonical_id in seen:
+            return True
+        seen.add(canonical_id)
+        related.append(store.findings[canonical_id])
+        return True
 
     for need in needs:
+        had_explicit = bool(need.finding_ids)
         resolved = False
         for finding_id in need.finding_ids:
-            finding = store.findings.get(finding_id)
-            if finding is None:
-                continue
-            resolved = True
-            add(finding)
-        if resolved:
+            if add_canonical(finding_id):
+                resolved = True
+        if resolved or had_explicit:
             continue
         if not need.from_chunk:
             continue
         marker = f"chunk:{need.from_chunk}"
         for finding in store.findings.values():
             if marker in finding.evidence:
-                add(finding)
+                add_canonical(finding.id)
     return related
+
+
+def prune_context_needs(store: EvidenceStore) -> None:
+    """Drop needs that only serve rejected or superseded findings.
+
+    Surviving ``finding_ids`` are rewritten to canonical identities so later
+    validation work targets merge representatives. Needs with no explicit IDs
+    stay when they are dependency-only or when the originating chunk still
+    has a surviving finding. Order of remaining needs is preserved.
+    """
+    rewritten: list[ContextNeed] = []
+    for need in store.needs_context:
+        if need.finding_ids:
+            new_ids: list[str] = []
+            seen: set[str] = set()
+            for finding_id in need.finding_ids:
+                canonical_id = _surviving_canonical_id(store, finding_id)
+                if canonical_id is None or canonical_id in seen:
+                    continue
+                seen.add(canonical_id)
+                new_ids.append(canonical_id)
+            if not new_ids:
+                continue
+            rewritten.append(
+                ContextNeed(
+                    path=need.path,
+                    reason=need.reason,
+                    from_chunk=need.from_chunk,
+                    finding_ids=new_ids,
+                )
+            )
+            continue
+        if need.from_chunk:
+            marker = f"chunk:{need.from_chunk}"
+            originated = [
+                finding
+                for finding in store.findings.values()
+                if marker in finding.evidence
+            ]
+            if originated and not any(
+                _surviving_canonical_id(store, finding.id) is not None
+                for finding in originated
+            ):
+                continue
+        rewritten.append(need)
+    store.needs_context = rewritten
+
+
+def _finding_has_pending_context(store: EvidenceStore, finding_id: str) -> bool:
+    canonical_id = store.resolve_canonical(finding_id)
+    for need in store.needs_context:
+        if canonical_id in need.finding_ids:
+            return True
+        if need.finding_ids:
+            continue
+        marker = f"chunk:{need.from_chunk}"
+        for member in store.merge_members(canonical_id):
+            if marker in member.evidence:
+                return True
+    return False
+
+
+def validation_related_findings(
+    store: EvidenceStore,
+    related: list[Finding],
+) -> list[Finding]:
+    """Aggregated canonical views for a validation prompt.
+
+    Identity comes from the surviving representative. Severity, confidence,
+    and evidence are joined from the merge class. Pending cross-context
+    work is not presented as ``CONFIRMED``.
+    """
+    views: list[Finding] = []
+    seen: set[str] = set()
+    for finding in related:
+        canonical_id = store.resolve_canonical(finding.id)
+        if canonical_id in seen or canonical_id not in store.findings:
+            continue
+        seen.add(canonical_id)
+        members = store.merge_members(canonical_id)
+        if not members:
+            continue
+        view = aggregate_finding(store.findings[canonical_id], members)
+        if (
+            _finding_has_pending_context(store, canonical_id)
+            and CONFIDENCE_ORDER.get(view.confidence, -1)
+            >= CONFIDENCE_ORDER["CONFIRMED"]
+        ):
+            view.confidence = "LIKELY"
+        views.append(view)
+    return views
 
 
 def _parse_finding(
@@ -1141,14 +1252,28 @@ def _keep_finding_ids(store: EvidenceStore, finding_ids: list[str]) -> None:
         store.kept.add(finding_id)
 
 
+def _reduce_view(store: EvidenceStore, finding_id: str) -> Finding:
+    """Reducer-facing representative for ``finding_id``'s merge class."""
+    finding = store.findings[finding_id]
+    canonical_id = store.resolve_canonical(finding_id)
+    members = store.merge_members(canonical_id)
+    if not members:
+        return finding
+    return aggregate_finding(store.findings.get(canonical_id, finding), members)
+
+
 def hierarchical_reduce(
     store: EvidenceStore,
     reduce_prompt: str,
     call_model: CallModel,
     max_request_chars: int,
     stats: PipelineStats,
+    findings: list[Finding] | None = None,
 ) -> None:
-    findings = list(store.findings.values())
+    if findings is None:
+        findings = list(store.findings.values())
+    else:
+        findings = list({item.id: item for item in findings}.values())
     if not findings:
         return
     if len(findings) == 1:
@@ -1200,7 +1325,12 @@ def hierarchical_reduce(
             seen.add(finding_id)
             unique.append(finding_id)
         state = tuple(unique)
-        if len(unique) <= REDUCE_GROUP_SIZE:
+        # Survivors from multiple groups still need a co-judge round even
+        # when they already fit in REDUCE_GROUP_SIZE.
+        if len(unique) <= 1:
+            _keep_finding_ids(store, unique)
+            return
+        if len(groups) == 1:
             _keep_finding_ids(store, unique)
             return
         if state == previous_state:
@@ -1218,9 +1348,45 @@ def hierarchical_reduce(
             return
         previous_state = state
         groups = [
-            [store.findings[finding_id] for finding_id in unique[index : index + REDUCE_GROUP_SIZE]]
+            [
+                _reduce_view(store, finding_id)
+                for finding_id in unique[index : index + REDUCE_GROUP_SIZE]
+            ]
             for index in range(0, len(unique), REDUCE_GROUP_SIZE)
         ]
+
+
+def seed_final_reduce(store: EvidenceStore, mapped_ids: set[str]) -> list[Finding]:
+    """Pre-reduce survivors plus new validation findings, unique by ID."""
+    new_findings = [
+        store.findings[finding_id]
+        for finding_id in store.findings
+        if finding_id not in mapped_ids
+    ]
+    return list({item.id: item for item in store.kept_findings() + new_findings}.values())
+
+
+def run_pre_reduce(
+    store: EvidenceStore,
+    reduce_prompt: str,
+    call_model: CallModel,
+    max_request_chars: int,
+    stats: PipelineStats,
+) -> None:
+    """Triage raw mapper findings before cross-context validation.
+
+    Equivalent findings collapse onto one canonical identity. Rejected and
+    superseded findings are dropped from later validation work. Evidence,
+    severity, confidence, and ``needs_context`` requirements are joined
+    onto the surviving representatives.
+    """
+    stats.raw_finding_count = len(store.findings)
+    hierarchical_reduce(
+        store, reduce_prompt, call_model, max_request_chars, stats
+    )
+    store.reduced = True
+    prune_context_needs(store)
+    stats.reduced_finding_count = len(store.kept_findings())
 
 
 def split_map_batch(
@@ -1720,6 +1886,10 @@ def run_validation_pass(
         seen_paths.add(path)
         related_needs = [item for item in store.needs_context if item.path == path]
         related = findings_for_context_need(store, related_needs)
+        if not related and all(item.finding_ids for item in related_needs):
+            # Rejected or superseded findings must not generate validation work.
+            continue
+        related_for_prompt = validation_related_findings(store, related)[:12]
         stats.validation_requests += 1
         extra = _load_source_chunks(corpus, path, context_loader)
         if not extra:
@@ -1732,8 +1902,6 @@ def run_validation_pass(
             record_limit_reached()
             _mark_incomplete_validation(store, related, path)
             continue
-
-        related_for_prompt = related[:12]
 
         def render_validation(batch: list[ContextChunk]) -> str:
             return format_validation_user_message(
@@ -1871,6 +2039,14 @@ def run_hierarchical_review(
     stats.map_chunks_acknowledged = len(analyzed)
     stats.map_chunks_uncovered = max(stats.chunks - len(analyzed), 0)
     try:
+        run_pre_reduce(
+            store,
+            reduce_prompt,
+            call_model,
+            max_reduce_request_chars,
+            stats,
+        )
+        mapped_ids = set(store.findings)
         run_validation_pass(
             corpus,
             store,
@@ -1886,6 +2062,7 @@ def run_hierarchical_review(
             call_model,
             max_reduce_request_chars,
             stats,
+            findings=seed_final_reduce(store, mapped_ids),
         )
     except PipelineDeadlineExceeded as exc:
         return _deadline_result(
