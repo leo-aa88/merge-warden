@@ -82,6 +82,7 @@ MAX_SINGLE_CHUNK_CHARS = 100_000
 MAX_TOTAL_REVIEW_CHARS = 10_000_000
 MAX_CONTEXT_CHUNKS = 64
 MAX_MAP_OVERHEAD_CHARS = 24_000
+MAX_LAZY_CONTEXT_BYTES = 1_000_000
 MAX_USER_CHARS = MAX_MAP_REQUEST_CHARS
 MAX_COMMENTS = 25
 MAX_COMMENT_CHARS = 8000
@@ -388,6 +389,23 @@ def git_show(ref: str, path: str) -> str | None:
     return result.stdout
 
 
+def git_blob_size(ref: str, path: str) -> int | None:
+    result = run(["git", "cat-file", "-s", f"{ref}:{path}"], check=False)
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+def git_show_bounded(ref: str, path: str, max_bytes: int) -> str | None:
+    size = git_blob_size(ref, path)
+    if size is None or size > max_bytes:
+        return None
+    return git_show(ref, path)
+
+
 def number_lines(text: str) -> str:
     lines = text.splitlines()
     width = max(len(str(len(lines))), 1)
@@ -631,14 +649,14 @@ def collect_skipped_paths(files: list[dict]) -> set[str]:
     return skipped
 
 
-def make_context_loader(head_ref: str):
+def make_context_loader(head_ref: str, max_bytes: int = MAX_LAZY_CONTEXT_BYTES):
     skip_names = load_skip_names()
 
     def load(path: str) -> str | None:
-        clean = (path or "").strip().strip("`")
+        clean = (path or "").strip().strip("`").lstrip("./")
         if not clean or is_skipped_path(clean, skip_names):
             return None
-        return git_show(head_ref, clean)
+        return git_show_bounded(head_ref, clean, max_bytes)
 
     return load
 
@@ -1564,7 +1582,10 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             "MERGE_WARDEN_MAX_MAP_OVERHEAD_CHARS", MAX_MAP_OVERHEAD_CHARS
         ),
         map_concurrency=map_concurrency,
-        context_loader=make_context_loader(args.head_ref),
+        context_loader=make_context_loader(
+            args.head_ref,
+            env_int("MERGE_WARDEN_MAX_LAZY_CONTEXT_BYTES", MAX_LAZY_CONTEXT_BYTES),
+        ),
     )
     if not coverage.complete:
         print(

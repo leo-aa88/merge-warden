@@ -18,7 +18,6 @@ from context_pipeline import (
     ReviewCorpus,
     all_reviewable_context_covered,
     chunk_source_file,
-    chunks_matching_path,
     format_chunk_for_prompt,
     incomplete_coverage_body,
     incomplete_limit_body,
@@ -117,6 +116,7 @@ class EvidenceStore:
     findings: dict[str, Finding] = field(default_factory=dict)
     contracts: dict[str, Contract] = field(default_factory=dict)
     needs_context: list[ContextNeed] = field(default_factory=list)
+    incomplete_context: dict[str, set[str]] = field(default_factory=dict)
     kept: set[str] = field(default_factory=set)
     rejected: dict[str, str] = field(default_factory=dict)
     merged_into: dict[str, str] = field(default_factory=dict)
@@ -1623,17 +1623,20 @@ def _mark_incomplete_validation(
     path: str,
 ) -> None:
     marker = f"validation:incomplete:{path}"
+    failed = store.incomplete_context.setdefault(path, set())
     for finding in related:
-        if finding.confidence not in {"QUESTION", "LIKELY"}:
-            continue
+        failed.add(finding.id)
         if marker not in finding.evidence:
             finding.evidence.append(marker)
 
 
-def _has_incomplete_validation(findings: list[Finding]) -> bool:
+def _has_incomplete_validation(store: EvidenceStore) -> bool:
+    kept_ids = {finding.id for finding in store.kept_findings()}
+    if any(ids & kept_ids for ids in store.incomplete_context.values()):
+        return True
     return any(
         item.startswith("validation:incomplete:")
-        for finding in findings
+        for finding in store.kept_findings()
         for item in finding.evidence
     )
 
@@ -1646,37 +1649,39 @@ def _format_id_list(ids: set[str], *, limit: int = MISSING_VALIDATION_ID_NOTE_LI
     return f"{shown}, ... ({len(ordered) - limit} more)"
 
 
+def _context_path_key(path: str) -> str:
+    return (path or "").strip().strip("`").lstrip("./")
+
+
+def _source_chunks_by_exact_path(corpus: ReviewCorpus) -> dict[str, list[ContextChunk]]:
+    grouped: dict[str, list[ContextChunk]] = {}
+    for chunk in corpus.source_context_chunks:
+        key = _context_path_key(chunk.source)
+        if not key:
+            continue
+        grouped.setdefault(key, []).append(chunk)
+    return grouped
+
+
 def _load_source_chunks(
     corpus: ReviewCorpus,
     path: str,
     context_loader: ContextLoader | None,
 ) -> list[ContextChunk]:
-    chunks = chunks_matching_path(corpus.source_context_chunks, path)
+    key = _context_path_key(path)
+    if not key:
+        return []
+    chunks = _source_chunks_by_exact_path(corpus).get(key, [])
     if chunks:
         return chunks
 
     if context_loader is not None:
-        content = context_loader(path)
+        content = context_loader(key)
         if content is None:
             return []
-        loaded = chunk_source_file(path, content, corpus.source_chunk_limit)
+        loaded = chunk_source_file(key, content, corpus.source_chunk_limit)
         corpus.source_chunks.extend(loaded)
         return loaded
-
-    # Test corpora and older callers may still keep validation-only file
-    # chunks in the primary corpus. Do not fall back to diff chunks here:
-    # validation needs surrounding source context, not the already-mapped diff.
-    if not corpus.source_chunks:
-        primary_file_chunks = [
-            chunk
-            for chunk in chunks_matching_path(corpus.chunks, path)
-            if chunk.kind == "file"
-            and not chunk.excluded
-            and not chunk.id.endswith(":unavailable")
-            and not chunk.id.endswith(":deleted")
-        ]
-        if primary_file_chunks:
-            return primary_file_chunks
 
     return []
 
@@ -1934,7 +1939,7 @@ def run_hierarchical_review(
     comments = parsed.get("comments") if isinstance(parsed.get("comments"), list) else []
     if (
         event.upper().replace(" ", "_") == "APPROVE"
-        and _has_incomplete_validation(store.kept_findings())
+        and _has_incomplete_validation(store)
     ):
         event = "COMMENT"
         body = (

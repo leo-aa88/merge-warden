@@ -850,15 +850,6 @@ def build_review_corpus(
             continue
         content = inputs.file_contents[path]
         if content is None:
-            chunks.append(
-                ContextChunk(
-                    id=f"file:{path}:unavailable",
-                    kind="file",
-                    source=path,
-                    text=f"{header}\n{note}\n(contents unavailable at PR head)\n",
-                    member_ids=[f"file:{path}:unavailable"],
-                )
-            )
             continue
         file_chunks = chunk_source_file(path, content, max_single_chunk_chars)
         if file_chunks:

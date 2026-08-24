@@ -26,7 +26,6 @@ from context_pipeline import (
     build_coverage,
     build_review_corpus,
     chunk_diff,
-    chunks_matching_path,
     chunk_text,
     format_char_count,
     incomplete_coverage_body,
@@ -420,6 +419,18 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("line-0200-KEEP", texts)
         self.assertNotIn("truncated", texts)
 
+    def test_unavailable_file_content_is_not_primary_context(self) -> None:
+        corpus = build_review_corpus(
+            _inputs(
+                files=[{"filename": "src/foo.c", "status": "modified", "additions": 1, "deletions": 0}],
+                file_contents={"src/foo.c": None},
+                diff="diff --git a/src/foo.c b/src/foo.c\n@@ -1 +1 @@\n-old\n+new\n",
+            )
+        )
+        self.assertFalse(any(chunk.kind == "file" for chunk in corpus.reviewable_chunks))
+        self.assertFalse(corpus.source_chunks)
+        self.assertIn("new", "\n".join(chunk.text for chunk in corpus.reviewable_chunks))
+
     def test_binary_exclusion_is_explicit_and_does_not_block_coverage(self) -> None:
         corpus = build_review_corpus(
             _inputs(
@@ -721,7 +732,6 @@ class PipelineTests(unittest.TestCase):
             _inputs(
                 files=[
                     {"filename": "src/foo.c", "status": "modified", "additions": 1, "deletions": 0},
-                    {"filename": "include/foo.h", "status": "modified", "additions": 1, "deletions": 0},
                 ],
                 file_contents={},
                 diff=(
@@ -729,10 +739,6 @@ class PipelineTests(unittest.TestCase):
                     "@@ -1 +1 @@\n"
                     "-old\n"
                     "+return borrowed_value();\n"
-                    "diff --git a/include/foo.h b/include/foo.h\n"
-                    "@@ -1 +1 @@\n"
-                    "-old\n"
-                    "+new\n"
                 ),
             )
         )
@@ -780,7 +786,7 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertTrue(coverage.complete)
         self.assertEqual(loaded, ["include/foo.h"])
-        self.assertTrue(chunks_matching_path(corpus.source_chunks, "include/foo.h"))
+        self.assertTrue(any(chunk.source == "include/foo.h" for chunk in corpus.source_chunks))
         self.assertNotIn(INCOMPLETE_FOO, _by_local_id(store, "F17").evidence)
         self.assertGreater(stats.validation_request_chars, 0)
 
@@ -799,9 +805,11 @@ class PipelineTests(unittest.TestCase):
 
         def fake(system: str, user: str) -> str:
             if "merge-warden-map" in system:
+                finding = _likely_foo_finding()
+                finding["confidence"] = "CONFIRMED"
                 return _map_chunks_json(
                     _chunk_ids_in_prompt(user),
-                    findings=[_likely_foo_finding()],
+                    findings=[finding],
                     needs_context=[
                         {
                             "path": "include/missing.h",
@@ -814,6 +822,8 @@ class PipelineTests(unittest.TestCase):
                 return json.dumps({"keep": [_fid("F17")], "reject": [], "merge": []})
             return json.dumps({"event": "APPROVE", "body": "# APPROVE\n", "comments": []})
 
+        loaded: list[str] = []
+
         review, coverage, store, stats = run_hierarchical_review(
             corpus=corpus,
             synthesis_prompt="synth",
@@ -824,12 +834,73 @@ class PipelineTests(unittest.TestCase):
             max_map_request_chars=80_000,
             max_reduce_request_chars=80_000,
             map_overhead_chars=100,
-            context_loader=lambda _path: None,
+            context_loader=lambda path: loaded.append(path) or None,
         )
         self.assertTrue(coverage.complete)
         self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(loaded, ["include/missing.h"])
         self.assertIn("validation:incomplete:include/missing.h", _by_local_id(store, "F17").evidence)
         self.assertTrue(any("could not load requested context" in note for note in stats.notes))
+
+    def test_lazy_source_cache_uses_exact_requested_path(self) -> None:
+        map_chunk = _chunk(
+            "diff:src/foo.c:1",
+            "src/foo.c",
+            "+return borrowed_value();\n",
+            kind="diff",
+        )
+        corpus = _synthetic_corpus(
+            [map_chunk],
+            index="Changed files:\n- src/foo.c +1 -0\n",
+        )
+        corpus.source_chunks = [
+            _chunk("file:vendor/lib/foo.h:1", "vendor/lib/foo.h", "int vendor_only;\n")
+        ]
+        loaded: list[str] = []
+
+        def load(path: str) -> str | None:
+            loaded.append(path)
+            if path == "foo.h":
+                return "int requested_header;\n"
+            return None
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system and "Context requests" not in user:
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[_likely_foo_finding()],
+                    needs_context=[
+                        {
+                            "path": "foo.h",
+                            "reason": "Need exact requested header",
+                            "finding_ids": ["F17"],
+                        }
+                    ],
+                )
+            if "Context requests" in user:
+                self.assertIn("requested_header", user)
+                self.assertNotIn("vendor_only", user)
+                return _map_chunks_json(_chunk_ids_in_prompt(user))
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps({"event": "COMMENT", "body": "# COMMENT\n", "comments": []})
+
+        _review, coverage, store, stats = run_hierarchical_review(
+            corpus=corpus,
+            synthesis_prompt="synth",
+            map_prompt="<!-- merge-warden-map -->",
+            reduce_prompt="<!-- merge-warden-reduce -->",
+            call_model=fake,
+            commentable_section="(none)\n",
+            max_map_request_chars=80_000,
+            max_reduce_request_chars=80_000,
+            map_overhead_chars=100,
+            context_loader=load,
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(loaded, ["foo.h"])
+        self.assertNotIn("validation:incomplete:foo.h", _by_local_id(store, "F17").evidence)
+        self.assertGreater(stats.validation_request_chars, 0)
 
     def test_ingest_map_result_namespaces_duplicate_ids(self) -> None:
         store = EvidenceStore()
@@ -1070,9 +1141,10 @@ def _header_validation_corpus(parts: int = 3) -> tuple[ReviewCorpus, list[Contex
         for index in range(1, parts + 1)
     ]
     corpus = _synthetic_corpus(
-        [map_chunk, *matching],
+        [map_chunk],
         index="Changed files:\n- src/foo.c +1 -0\n- include/foo.h +4 -0\n",
     )
+    corpus.source_chunks = matching
     return corpus, matching
 
 
@@ -1441,9 +1513,10 @@ class ContextNeedOwnershipTests(unittest.TestCase):
         a_chunk = _chunk("file:a.h:1", "a.h", "int a_contract;\n")
         b_chunk = _chunk("file:b.h:1", "b.h", "int b_contract;\n")
         corpus = _synthetic_corpus(
-            [map_chunk, a_chunk, b_chunk],
+            [map_chunk],
             index="Changed files:\n- src/foo.c +1 -0\n- a.h +1 -0\n- b.h +1 -0\n",
         )
+        corpus.source_chunks = [a_chunk, b_chunk]
         findings = [
             {
                 "id": "F1",
@@ -1690,15 +1763,15 @@ class ContextNeedOwnershipTests(unittest.TestCase):
 class ValidationAttemptBudgetTests(unittest.TestCase):
     def _paths_corpus(self, count: int) -> tuple[ReviewCorpus, list[str]]:
         paths = [f"include/h{index}.h" for index in range(1, count + 1)]
-        chunks = [
-            _chunk("diff:src/foo.c:1", "src/foo.c", "+int main(void);\n", kind="diff")
-        ]
+        map_chunk = _chunk("diff:src/foo.c:1", "src/foo.c", "+int main(void);\n", kind="diff")
+        source_chunks: list[ContextChunk] = []
         for path in paths:
-            chunks.append(_chunk(f"file:{path}:1", path, f"/* {path} */\nint field;\n"))
+            source_chunks.append(_chunk(f"file:{path}:1", path, f"/* {path} */\nint field;\n"))
         corpus = _synthetic_corpus(
-            chunks,
+            [map_chunk],
             index="Changed files:\n- src/foo.c +1 -0\n",
         )
+        corpus.source_chunks = source_chunks
         return corpus, paths
 
     def _owned_findings(self, paths: list[str]) -> tuple[list[dict], list[dict]]:
@@ -2693,7 +2766,8 @@ class SerializedRequestBudgetTests(unittest.TestCase):
             "include/foo.h",
             "/* part 4 */\nUNIQUE_CONTEXT_TAIL_999\n" + ("H" * 350),
         )
-        corpus = _synthetic_corpus([map_chunk, *matching], index="Changed files:\n- include/foo.h +4 -0\n")
+        corpus = _synthetic_corpus([map_chunk], index="Changed files:\n- include/foo.h +4 -0\n")
+        corpus.source_chunks = matching
         recorder = _ReviewRecorder(
             findings=[
                 {
@@ -2766,7 +2840,8 @@ class SerializedRequestBudgetTests(unittest.TestCase):
             )
             for index in range(1, 5)
         ]
-        corpus = _synthetic_corpus([map_chunk, *matching])
+        corpus = _synthetic_corpus([map_chunk])
+        corpus.source_chunks = matching
         recorder = _ReviewRecorder(
             findings=[
                 {
@@ -2838,9 +2913,10 @@ class SerializedRequestBudgetTests(unittest.TestCase):
             for index in range(1, 5)
         ]
         corpus = _synthetic_corpus(
-            [map_chunk, *matching],
+            [map_chunk],
             index="Changed files:\n- include/foo.h +4 -0\n",
         )
+        corpus.source_chunks = matching
         related = [
             Finding(
                 id="F17",
@@ -3447,7 +3523,8 @@ class MapFanoutAndDegradationTests(unittest.TestCase):
             )
             for index in range(1, 11)
         ]
-        corpus = _synthetic_corpus([map_chunk, *matching])
+        corpus = _synthetic_corpus([map_chunk])
+        corpus.source_chunks = matching
         recorder = _ReviewRecorder(
             findings=[_likely_foo_finding()],
             needs_context=[{"path": "include/foo.h", "reason": "cross-context check"}],

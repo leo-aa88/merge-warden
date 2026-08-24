@@ -216,6 +216,7 @@ Optional environment overrides:
 | `MERGE_WARDEN_MAX_SINGLE_CHUNK_CHARS` | 100000 | Max size of one context chunk |
 | `MERGE_WARDEN_MAX_TOTAL_REVIEW_CHARS` | 10000000 | Hard cap on reviewable source text |
 | `MERGE_WARDEN_MAX_CONTEXT_CHUNKS` | 64 | Hard cap on coalesced reviewable chunks |
+| `MERGE_WARDEN_MAX_LAZY_CONTEXT_BYTES` | 1000000 | Max blob size for one lazily loaded validation file |
 | `MERGE_WARDEN_REVIEW_TIMEOUT_SECONDS` | 900 | Total internal wall-clock review budget |
 | `MERGE_WARDEN_SHUTDOWN_RESERVE_SECONDS` | 60 | Time reserved for outputs and posting |
 | `MERGE_WARDEN_MAP_CONCURRENCY` | 4 | Max independent map provider requests in flight (1–8) |
