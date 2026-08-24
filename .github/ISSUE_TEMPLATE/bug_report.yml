@@ -103,7 +103,7 @@ body:
         - action.yml / composite action
         - CLI / GitHub access / posting (merge_warden.py)
         - context pipeline (chunking, packing, coverage)
-        - review pipeline (map, reduce, validation, synthesis)
+        - review pipeline (map, reduce, validate)
         - providers / HTTP
         - prompts
         - resolve-pr
