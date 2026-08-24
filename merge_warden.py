@@ -653,7 +653,9 @@ def make_context_loader(head_ref: str, max_bytes: int = MAX_LAZY_CONTEXT_BYTES):
     skip_names = load_skip_names()
 
     def load(path: str) -> str | None:
-        clean = (path or "").strip().strip("`").lstrip("./")
+        clean = (path or "").strip().strip("`")
+        while clean.startswith("./"):
+            clean = clean[2:]
         if not clean or is_skipped_path(clean, skip_names):
             return None
         return git_show_bounded(head_ref, clean, max_bytes)

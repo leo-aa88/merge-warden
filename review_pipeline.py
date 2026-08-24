@@ -1650,7 +1650,10 @@ def _format_id_list(ids: set[str], *, limit: int = MISSING_VALIDATION_ID_NOTE_LI
 
 
 def _context_path_key(path: str) -> str:
-    return (path or "").strip().strip("`").lstrip("./")
+    clean = (path or "").strip().strip("`")
+    while clean.startswith("./"):
+        clean = clean[2:]
+    return clean
 
 
 def _source_chunks_by_exact_path(corpus: ReviewCorpus) -> dict[str, list[ContextChunk]]:

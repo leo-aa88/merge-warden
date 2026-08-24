@@ -334,6 +334,21 @@ class LazyContextLoaderTests(unittest.TestCase):
             self.assertEqual(loader("`./src/ok.c`"), "int ok;\n")
         show.assert_called_once_with("HEAD", "src/ok.c", 123)
 
+    def test_context_loader_preserves_dot_paths(self) -> None:
+        with mock.patch.object(mw, "git_show_bounded", return_value="ok") as show:
+            loader = mw.make_context_loader("HEAD", max_bytes=123)
+            self.assertEqual(loader(".gitignore"), "ok")
+            self.assertEqual(loader("./.github/workflows/ci.yml"), "ok")
+            self.assertEqual(loader("../shared/config.yml"), "ok")
+        self.assertEqual(
+            show.call_args_list,
+            [
+                mock.call("HEAD", ".gitignore", 123),
+                mock.call("HEAD", ".github/workflows/ci.yml", 123),
+                mock.call("HEAD", "../shared/config.yml", 123),
+            ],
+        )
+
 
 class PostReviewTests(unittest.TestCase):
     def test_approve_fallback_returns_comment_event(self) -> None:

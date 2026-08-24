@@ -902,6 +902,15 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("validation:incomplete:foo.h", _by_local_id(store, "F17").evidence)
         self.assertGreater(stats.validation_request_chars, 0)
 
+    def test_context_path_key_preserves_dot_paths(self) -> None:
+        self.assertEqual(rp._context_path_key("`./src/ok.c`"), "src/ok.c")
+        self.assertEqual(rp._context_path_key(".gitignore"), ".gitignore")
+        self.assertEqual(
+            rp._context_path_key("./.github/workflows/ci.yml"),
+            ".github/workflows/ci.yml",
+        )
+        self.assertEqual(rp._context_path_key("../shared/config.yml"), "../shared/config.yml")
+
     def test_ingest_map_result_namespaces_duplicate_ids(self) -> None:
         store = EvidenceStore()
         batch = [
