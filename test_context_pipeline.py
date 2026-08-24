@@ -65,6 +65,7 @@ from review_pipeline import (
     plan_requests,
     prune_context_needs,
     run_hierarchical_review,
+    run_pre_reduce,
     sanitize_failure_note,
     validation_related_findings,
 )
@@ -3004,6 +3005,46 @@ class ReducerTerminationTests(unittest.TestCase):
         self.assertEqual(kept[0].body, body)
         self.assertEqual(stats.reduce_calls, 3)
         self.assertGreaterEqual(len(store.merged_into), count - 1)
+
+    def test_run_pre_reduce_collapses_identical_bodies_before_validation(self) -> None:
+        store = EvidenceStore()
+        count = REDUCE_GROUP_SIZE + 3
+        body = "same TYPE_NAME lexer/parser defect"
+        for index in range(1, count + 1):
+            finding_id = f"diff:src/lang_{index}.c:1/F1"
+            store.findings[finding_id] = _finding(
+                finding_id,
+                body=body,
+                evidence=[f"chunk:diff:src/lang_{index}.c:1"],
+            )
+            store.needs_context.append(
+                rp.ContextNeed(
+                    path="src/parser.y" if index % 2 == 0 else "src/lexer.l",
+                    reason="Need TYPE_NAME invariant",
+                    from_chunk=f"diff:src/lang_{index}.c:1",
+                    finding_ids=[finding_id],
+                )
+            )
+        stats = PipelineStats()
+        run_pre_reduce(
+            store,
+            "<!-- merge-warden-reduce -->",
+            lambda _system, user: _merge_equivalent_reduce(user),
+            50_000,
+            stats,
+        )
+        self.assertEqual(stats.raw_finding_count, count)
+        self.assertEqual(stats.reduced_finding_count, 1)
+        self.assertEqual(stats.validation_attempts, 0)
+        kept = store.kept_findings()
+        self.assertEqual(len(kept), 1)
+        canonical = kept[0].id
+        self.assertTrue(store.needs_context)
+        self.assertEqual({need.finding_ids[0] for need in store.needs_context}, {canonical})
+        self.assertEqual(
+            {need.path for need in store.needs_context},
+            {"src/lexer.l", "src/parser.y"},
+        )
 
 
 class RequestPlannerTests(unittest.TestCase):
