@@ -77,8 +77,10 @@ Violating one of these is a blocking defect, not a style disagreement.
    `pull/{n}/head` as a git ref, and reads blobs with `git show`. It does not
    check out the PR head or run anything from it.
 3. **Fail closed, never fail open.** Incomplete coverage, an exhausted
-   wall-clock budget, or an unanalyzed chunk produces `COMMENT`. `APPROVE` is
-   unreachable unless the review actually covered the change.
+   wall-clock budget, or an unanalyzed chunk produces `COMMENT` with no
+   inline comments. `APPROVE` is unreachable unless the review actually
+   covered the change. An unsynthesized mapper candidate is not a review
+   finding.
 4. **Never truncate to fit a context window.** Context is chunked, packed, and
    accounted for. Silently dropping the tail of a diff and then emitting a
    verdict is the specific failure this tool exists to prevent.

@@ -43,6 +43,10 @@ MAX_VALIDATION_PROMPT_FINDINGS = 12
 # keeps that last window so a review decision can still be produced.
 REDUCE_RESERVE_SECONDS = 120
 SYNTHESIS_RESERVE_SECONDS = 150
+CANDIDATE_FINDINGS_NOT_POSTED = (
+    "Candidate findings were intentionally not posted because they were "
+    "not fully reduced and validated."
+)
 MAP_MISSING_CHUNK_RETRIES = 1
 VALIDATION_MISSING_CHUNK_RETRIES = 1
 MISSING_VALIDATION_ID_NOTE_LIMIT = 12
@@ -581,14 +585,18 @@ def _deadline_preamble(
         "Merge Warden exhausted its internal wall-clock review deadline and "
         "stopped before the outer CI timeout could kill the process."
     )
+    total = reviewable_member_count(corpus.reviewable_chunks)
+    uncovered_n = len(coverage.uncovered_chunk_ids)
+    analyzed = max(total - uncovered_n, 0)
     if not all_reviewable_context_covered(coverage):
         base = _incomplete_preamble(corpus, coverage, stats)
         return base.replace("# COMMENT\n\n", f"# COMMENT\n\n{notice}\n\n", 1)
     return (
         "# COMMENT\n\n"
         f"{notice}\n\n"
-        "Primary context coverage reached 100%, but validation, reduction, "
-        "or final synthesis did not finish within the review budget.\n\n"
+        f"Primary context coverage: {analyzed}/{total} chunks.\n\n"
+        "Validation/reduction/synthesis did not complete, so no merge "
+        "recommendation was produced.\n\n"
         "No approval decision was produced.\n"
     )
 
@@ -1353,40 +1361,24 @@ def format_synthesis_user_message(
 
 
 def findings_as_review(store: EvidenceStore, preamble: str) -> dict:
+    """Build a fail-closed COMMENT with no inline comments.
+
+    Unsynthesized mapper candidates are debugging artifacts, not GitHub
+    review findings. They stay on the review dict for local JSON/Markdown
+    output and are never attached as inline comments.
+    """
     findings = store.kept_findings()
-    sections = [preamble.rstrip(), ""]
-    comments: list[dict] = []
+    body = preamble.rstrip() + "\n"
     if findings:
-        sections.append(
-            "Candidate findings from the chunks that were analyzed are listed "
-            "below as informational only. They are not a merge decision.\n"
-        )
-    for index, finding in enumerate(findings, 1):
-        location = ""
-        if finding.path:
-            location = f" `{finding.path}`"
-            if finding.line is not None:
-                location += f":{finding.line}"
-        sections.append(f"## {index}. {finding.id}{location}")
-        sections.append("")
-        sections.append(f"**{finding.severity}.** {finding.body}")
-        sections.append("")
-        if finding.path and finding.line is not None:
-            comments.append(
-                {
-                    "path": finding.path,
-                    "side": finding.side,
-                    "line": finding.line,
-                    "severity": finding.severity,
-                    "body": finding.body,
-                }
-            )
-    if not findings:
-        sections.append("No candidate findings were extracted from the analyzed chunks.\n")
+        if CANDIDATE_FINDINGS_NOT_POSTED not in body:
+            body += f"\n{CANDIDATE_FINDINGS_NOT_POSTED}\n"
+    else:
+        body += "\nNo candidate findings were extracted from the analyzed chunks.\n"
     return {
         "event": "COMMENT",
-        "body": "\n".join(sections).rstrip() + "\n",
-        "comments": comments,
+        "body": body,
+        "comments": [],
+        "candidate_findings": [finding_record(item) for item in findings],
     }
 
 
