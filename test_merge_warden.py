@@ -313,6 +313,43 @@ class ReviewJsonTests(unittest.TestCase):
         self.assertEqual(data["event"], "COMMENT")
 
 
+class LazyContextLoaderTests(unittest.TestCase):
+    def test_git_show_bounded_skips_oversize_blob(self) -> None:
+        with mock.patch.object(mw, "git_blob_size", return_value=1_001), mock.patch.object(
+            mw, "git_show"
+        ) as show:
+            self.assertIsNone(mw.git_show_bounded("HEAD", "large.c", 1_000))
+        show.assert_not_called()
+
+    def test_git_show_bounded_reads_blob_within_limit(self) -> None:
+        with mock.patch.object(mw, "git_blob_size", return_value=999), mock.patch.object(
+            mw, "git_show", return_value="int ok;\n"
+        ) as show:
+            self.assertEqual(mw.git_show_bounded("HEAD", "ok.c", 1_000), "int ok;\n")
+        show.assert_called_once_with("HEAD", "ok.c")
+
+    def test_context_loader_normalizes_and_honors_size_limit(self) -> None:
+        with mock.patch.object(mw, "git_show_bounded", return_value="int ok;\n") as show:
+            loader = mw.make_context_loader("HEAD", max_bytes=123)
+            self.assertEqual(loader("`./src/ok.c`"), "int ok;\n")
+        show.assert_called_once_with("HEAD", "src/ok.c", 123)
+
+    def test_context_loader_preserves_dot_paths(self) -> None:
+        with mock.patch.object(mw, "git_show_bounded", return_value="ok") as show:
+            loader = mw.make_context_loader("HEAD", max_bytes=123)
+            self.assertEqual(loader(".gitignore"), "ok")
+            self.assertEqual(loader("./.github/workflows/ci.yml"), "ok")
+            self.assertEqual(loader("../shared/config.yml"), "ok")
+        self.assertEqual(
+            show.call_args_list,
+            [
+                mock.call("HEAD", ".gitignore", 123),
+                mock.call("HEAD", ".github/workflows/ci.yml", 123),
+                mock.call("HEAD", "../shared/config.yml", 123),
+            ],
+        )
+
+
 class PostReviewTests(unittest.TestCase):
     def test_approve_fallback_returns_comment_event(self) -> None:
         comments = [{"path": "parser.c", "line": 10, "body": "n"}]

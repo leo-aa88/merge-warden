@@ -162,17 +162,19 @@ with `git show`.
 - `event` — `posted-event` when posting, otherwise `generated-event`
 - `comment-count` — `posted-comment-count` when posting, otherwise `generated-comment-count`
 
-Injected after the system prompt: architectural docs, issue bodies, PR
-description, the complete diff, a commentable line map, and numbered
-changed-file contents. That material is treated as untrusted data, not as
-instructions to the reviewer.
+Injected after the system prompt for the primary pass: architectural docs,
+issue bodies, PR description, and the complete diff. Changed-file source is
+not eagerly mapped as full files; when the map stage emits `needs_context`,
+Merge Warden loads the requested file from the PR head and sends numbered
+source chunks through targeted validation. That material is treated as
+untrusted data, not as instructions to the reviewer.
 
 Merge Warden does **not** truncate the PR to fit a context window. It builds
-a complete context corpus, splits it at semantic boundaries (diff hunks,
-headings, source line ranges), packs those chunks into bounded map calls
-(~225k characters **and** at most 8 chunks each), extracts structured
-evidence, runs a targeted cross-chunk validation pass when analyses request
-more context, then hierarchically reduces finding IDs (without rewriting
+a complete primary context corpus, splits it at semantic boundaries (diff
+hunks and headings), packs those chunks into bounded map calls (~225k
+characters **and** at most 8 chunks each), extracts structured evidence, runs
+a targeted source validation pass when analyses request more context, then
+hierarchically reduces finding IDs (without rewriting
 their original bodies) and synthesizes the GitHub review. Independent map
 batches run concurrently (default 4 in-flight provider calls) so provider
 latency overlaps; evidence ingestion stays single-threaded and deterministic.
@@ -191,8 +193,10 @@ stay reliable. Map calls are also capped at 8 chunks so the required
 structured response stays bounded independently of input size. Independent
 map batches share a bounded worker pool (`map-concurrency`, default 4, max
 8). Workers only perform provider I/O; coverage, evidence, and retry/split
-decisions stay on one thread. The total source size is not artificially
-bounded by those per-call budgets.
+decisions stay on one thread. The pipeline footer reports primary map,
+validation, reduce, synthesis, and total request characters so corpus changes
+can be benchmarked. The total source size is not artificially bounded by
+those per-call budgets.
 
 Merge Warden also enforces an internal wall-clock review budget. The default is
 900 seconds, with the final 60 seconds reserved for writing artifacts and
@@ -212,6 +216,7 @@ Optional environment overrides:
 | `MERGE_WARDEN_MAX_SINGLE_CHUNK_CHARS` | 100000 | Max size of one context chunk |
 | `MERGE_WARDEN_MAX_TOTAL_REVIEW_CHARS` | 10000000 | Hard cap on reviewable source text |
 | `MERGE_WARDEN_MAX_CONTEXT_CHUNKS` | 64 | Hard cap on coalesced reviewable chunks |
+| `MERGE_WARDEN_MAX_LAZY_CONTEXT_BYTES` | 1000000 | Max blob size for one lazily loaded validation file |
 | `MERGE_WARDEN_REVIEW_TIMEOUT_SECONDS` | 900 | Total internal wall-clock review budget |
 | `MERGE_WARDEN_SHUTDOWN_RESERVE_SECONDS` | 60 | Time reserved for outputs and posting |
 | `MERGE_WARDEN_MAP_CONCURRENCY` | 4 | Max independent map provider requests in flight (1–8) |

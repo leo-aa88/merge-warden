@@ -82,6 +82,7 @@ MAX_SINGLE_CHUNK_CHARS = 100_000
 MAX_TOTAL_REVIEW_CHARS = 10_000_000
 MAX_CONTEXT_CHUNKS = 64
 MAX_MAP_OVERHEAD_CHARS = 24_000
+MAX_LAZY_CONTEXT_BYTES = 1_000_000
 MAX_USER_CHARS = MAX_MAP_REQUEST_CHARS
 MAX_COMMENTS = 25
 MAX_COMMENT_CHARS = 8000
@@ -388,6 +389,23 @@ def git_show(ref: str, path: str) -> str | None:
     return result.stdout
 
 
+def git_blob_size(ref: str, path: str) -> int | None:
+    result = run(["git", "cat-file", "-s", f"{ref}:{path}"], check=False)
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+def git_show_bounded(ref: str, path: str, max_bytes: int) -> str | None:
+    size = git_blob_size(ref, path)
+    if size is None or size > max_bytes:
+        return None
+    return git_show(ref, path)
+
+
 def number_lines(text: str) -> str:
     lines = text.splitlines()
     width = max(len(str(len(lines))), 1)
@@ -619,24 +637,30 @@ def collect_arch_doc_texts() -> list[tuple[str, str | None]]:
     return docs
 
 
-def collect_file_contents(
-    head_ref: str,
-    files: list[dict],
-) -> tuple[dict[str, str | None], set[str]]:
+def collect_skipped_paths(files: list[dict]) -> set[str]:
     skip_names = load_skip_names()
     skipped: set[str] = set()
-    contents: dict[str, str | None] = {}
     for file_info in files:
         path = file_info.get("filename") or ""
         if not path:
             continue
         if is_skipped_path(path, skip_names):
             skipped.add(path)
-            continue
-        if (file_info.get("status") or "") == "removed":
-            continue
-        contents[path] = git_show(head_ref, path)
-    return contents, skipped
+    return skipped
+
+
+def make_context_loader(head_ref: str, max_bytes: int = MAX_LAZY_CONTEXT_BYTES):
+    skip_names = load_skip_names()
+
+    def load(path: str) -> str | None:
+        clean = (path or "").strip().strip("`")
+        while clean.startswith("./"):
+            clean = clean[2:]
+        if not clean or is_skipped_path(clean, skip_names):
+            return None
+        return git_show_bounded(head_ref, clean, max_bytes)
+
+    return load
 
 
 def build_corpus(
@@ -651,7 +675,7 @@ def build_corpus(
     closing = pr.get("closingIssuesReferences") or []
     body = pr.get("body") or ""
     issues, omitted = collect_issue_records(repo, body, closing)
-    file_contents, skipped_paths = collect_file_contents(head_ref, files)
+    skipped_paths = collect_skipped_paths(files)
     return build_review_corpus(
         CorpusInputs(
             pr=pr,
@@ -660,7 +684,7 @@ def build_corpus(
             arch_docs=collect_arch_doc_texts(),
             issues=issues,
             omitted_issue_count=omitted,
-            file_contents=file_contents,
+            file_contents={},
             commentable=commentable,
             skipped_paths=skipped_paths,
         ),
@@ -1560,6 +1584,10 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             "MERGE_WARDEN_MAX_MAP_OVERHEAD_CHARS", MAX_MAP_OVERHEAD_CHARS
         ),
         map_concurrency=map_concurrency,
+        context_loader=make_context_loader(
+            args.head_ref,
+            env_int("MERGE_WARDEN_MAX_LAZY_CONTEXT_BYTES", MAX_LAZY_CONTEXT_BYTES),
+        ),
     )
     if not coverage.complete:
         print(

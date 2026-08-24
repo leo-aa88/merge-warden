@@ -101,10 +101,16 @@ class ReviewCorpus:
     total_chars: int
     exclusions: list[str] = field(default_factory=list)
     limit_error: str = ""
+    source_chunks: list[ContextChunk] = field(default_factory=list)
+    source_chunk_limit: int = DEFAULT_MAX_SINGLE_CHUNK_CHARS
 
     @property
     def reviewable_chunks(self) -> list[ContextChunk]:
         return [chunk for chunk in self.chunks if not chunk.excluded]
+
+    @property
+    def source_context_chunks(self) -> list[ContextChunk]:
+        return [chunk for chunk in self.source_chunks if not chunk.excluded]
 
 
 @dataclass
@@ -687,6 +693,7 @@ def build_review_corpus(
     max_context_chunks: int = DEFAULT_MAX_CONTEXT_CHUNKS,
 ) -> ReviewCorpus:
     chunks: list[ContextChunk] = []
+    source_chunks: list[ContextChunk] = []
     exclusions: list[str] = []
     pr = inputs.pr
     metadata = "\n".join(
@@ -839,22 +846,15 @@ def build_review_corpus(
                 )
             )
             continue
-        content = inputs.file_contents.get(path)
+        if path not in inputs.file_contents:
+            continue
+        content = inputs.file_contents[path]
         if content is None:
-            chunks.append(
-                ContextChunk(
-                    id=f"file:{path}:unavailable",
-                    kind="file",
-                    source=path,
-                    text=f"{header}\n{note}\n(contents unavailable at PR head)\n",
-                    member_ids=[f"file:{path}:unavailable"],
-                )
-            )
             continue
         file_chunks = chunk_source_file(path, content, max_single_chunk_chars)
         if file_chunks:
             file_chunks[0].text = f"{header}\n{note}\n" + file_chunks[0].text
-        chunks.extend(file_chunks)
+        source_chunks.extend(file_chunks)
 
     arch_limit = min(max_single_chunk_chars, DEFAULT_ARCH_COALESCE_CHARS)
     chunks = coalesce_same_source(
@@ -902,6 +902,8 @@ def build_review_corpus(
         total_chars=total_chars,
         exclusions=exclusions,
         limit_error=limit_error,
+        source_chunks=source_chunks,
+        source_chunk_limit=max_single_chunk_chars,
     )
 
 
