@@ -24,9 +24,12 @@ from review_pipeline import (
     DEFAULT_MAP_CONCURRENCY,
     DEFAULT_PROMPT_MAP,
     DEFAULT_PROMPT_REDUCE,
+    REDUCE_RESERVE_SECONDS,
+    SYNTHESIS_RESERVE_SECONDS,
     VALIDATION_STAGE_TOKEN,
     PipelineDeadlineExceeded,
     normalize_map_concurrency,
+    provider_stage_deadline,
     run_hierarchical_review,
 )
 
@@ -1476,6 +1479,8 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
         f"provider cutoff after "
         f"{review_timeout_seconds - shutdown_reserve_seconds}s; "
         f"{shutdown_reserve_seconds}s reserved for output/posting; "
+        f"{REDUCE_RESERVE_SECONDS}s reserved for reduce, "
+        f"{SYNTHESIS_RESERVE_SECONDS}s reserved for synthesis; "
         f"map concurrency {map_concurrency}",
         flush=True,
     )
@@ -1533,14 +1538,15 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
 
     def invoke(system_prompt: str, user_message: str) -> str:
         stage = provider_call_stage(system_prompt, user_message)
-        remaining = remaining_deadline_seconds(provider_deadline)
+        call_deadline = provider_stage_deadline(stage, provider_deadline)
+        remaining = remaining_deadline_seconds(call_deadline)
         if remaining is None or remaining <= 0:
             raise PipelineDeadlineExceeded(
                 f"provider cutoff reached before {stage}"
             )
         print(
             f"Calling {PROVIDER_LABELS[provider]} ({model}) [{stage}] "
-            f"({remaining:.0f}s provider budget remaining)",
+            f"({remaining:.0f}s {stage} budget remaining)",
             flush=True,
         )
         started = time.monotonic()
@@ -1552,7 +1558,7 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
                 user_message,
                 model,
                 api_key,
-                deadline=provider_deadline,
+                deadline=call_deadline,
             )
             outcome = "ok"
             return raw
@@ -1588,6 +1594,7 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             args.head_ref,
             env_int("MERGE_WARDEN_MAX_LAZY_CONTEXT_BYTES", MAX_LAZY_CONTEXT_BYTES),
         ),
+        deadline=provider_deadline,
     )
     if not coverage.complete:
         print(
@@ -1600,6 +1607,14 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
         print(
             "::warning::Merge Warden internal review deadline exhausted; "
             "returning a fail-closed COMMENT before the outer CI timeout",
+            file=sys.stderr,
+            flush=True,
+        )
+    if stats.validation_deadline_exhausted:
+        print(
+            "::warning::Merge Warden validation stage deadline exhausted; "
+            "continuing to reduction and synthesis with incomplete "
+            "cross-context checks",
             file=sys.stderr,
             flush=True,
         )

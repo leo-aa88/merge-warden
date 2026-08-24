@@ -33,6 +33,10 @@ DEFAULT_PROMPT_REDUCE = Path(__file__).resolve().parent / "prompt_reduce.md"
 REDUCE_GROUP_SIZE = 5
 MAX_REDUCE_ROUNDS = 8
 MAX_VALIDATION_CALLS = 8
+# Protected tail of the provider budget. Validation must stop before this
+# window so reduction and synthesis can still produce a review decision.
+REDUCE_RESERVE_SECONDS = 120
+SYNTHESIS_RESERVE_SECONDS = 150
 MAP_MISSING_CHUNK_RETRIES = 1
 VALIDATION_MISSING_CHUNK_RETRIES = 1
 MISSING_VALIDATION_ID_NOTE_LIMIT = 12
@@ -267,6 +271,7 @@ class PipelineStats:
     total_chars: int = 0
     coverage_complete: bool = False
     deadline_exhausted: bool = False
+    validation_deadline_exhausted: bool = False
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -291,7 +296,12 @@ class PipelineStats:
 
     def footer(self) -> str:
         coverage = "complete" if self.coverage_complete else "incomplete"
-        deadline = ", deadline exhausted" if self.deadline_exhausted else ""
+        extras: list[str] = []
+        if self.deadline_exhausted:
+            extras.append("deadline exhausted")
+        if self.validation_deadline_exhausted:
+            extras.append("validation budget exhausted")
+        extra = f", {', '.join(extras)}" if extras else ""
         total_request_chars = (
             self.map_request_chars
             + self.validation_request_chars
@@ -311,7 +321,7 @@ class PipelineStats:
             f"(primary map {self.map_request_chars}, validation {self.validation_request_chars}, "
             f"reduce {self.reduce_request_chars}, synthesis {self.synthesis_request_chars}), "
             f"{self.reduce_calls} reduce call(s), {self.synthesis_calls} synthesis call(s), "
-            f"coverage {coverage}{deadline}._"
+            f"coverage {coverage}{extra}._"
         )
 
 
@@ -385,6 +395,34 @@ class RequestTooLarge(RuntimeError):
 
 class PipelineDeadlineExceeded(RuntimeError):
     """The caller's wall-clock review budget was exhausted."""
+
+
+def validation_stage_deadline(provider_deadline: float | None) -> float | None:
+    """Latest monotonic time at which a new validation call may start.
+
+    Reduction and synthesis keep a reserved tail of the provider budget so
+    validation cannot starve the stages that produce a review decision.
+    """
+    if provider_deadline is None:
+        return None
+    return (
+        provider_deadline
+        - float(REDUCE_RESERVE_SECONDS)
+        - float(SYNTHESIS_RESERVE_SECONDS)
+    )
+
+
+def provider_stage_deadline(
+    stage: str, provider_deadline: float | None
+) -> float | None:
+    """Clamp a provider call to the stage-specific cutoff.
+
+    Validation uses an earlier cutoff so in-flight HTTP work cannot consume
+    the reduce/synthesis reserves. Other stages use the full provider deadline.
+    """
+    if stage == "validation":
+        return validation_stage_deadline(provider_deadline)
+    return provider_deadline
 
 
 @dataclass
@@ -1863,11 +1901,22 @@ def run_validation_pass(
     max_request_chars: int,
     stats: PipelineStats,
     context_loader: ContextLoader | None = None,
+    deadline: float | None = None,
 ) -> None:
+    """Run targeted validation until the call cap or stage deadline.
+
+    ``deadline`` is a monotonic timestamp. Once it is reached, no new
+    validation provider call is started. Remaining needs are marked
+    ``validation:incomplete:<path>`` so reduction and synthesis can still run.
+    A validation-stage ``PipelineDeadlineExceeded`` is treated the same way
+    rather than aborting the review.
+    """
     if not store.needs_context:
         return
     seen_paths: set[str] = set()
     limit_note_added = False
+    deadline_note_added = False
+    stop_validation = False
 
     def record_limit_reached() -> None:
         nonlocal limit_note_added
@@ -1878,6 +1927,29 @@ def run_validation_pass(
             "checks were not completed"
         )
         limit_note_added = True
+
+    def record_deadline_reached() -> None:
+        nonlocal deadline_note_added, stop_validation
+        stop_validation = True
+        stats.validation_deadline_exhausted = True
+        if deadline_note_added:
+            return
+        stats.notes.append(
+            "validation stage deadline exhausted; remaining cross-context "
+            "checks were marked incomplete so reduction and synthesis can run"
+        )
+        deadline_note_added = True
+
+    def cannot_start_provider_call() -> bool:
+        if stop_validation or (
+            deadline is not None and deadline - time.monotonic() <= 0
+        ):
+            record_deadline_reached()
+            return True
+        if stats.validation_attempts >= MAX_VALIDATION_CALLS:
+            record_limit_reached()
+            return True
+        return False
 
     for need in store.needs_context:
         path = need.path
@@ -1898,8 +1970,7 @@ def run_validation_pass(
                 f"validation for {path} could not load requested context"
             )
             continue
-        if stats.validation_attempts >= MAX_VALIDATION_CALLS:
-            record_limit_reached()
+        if cannot_start_provider_call():
             _mark_incomplete_validation(store, related, path)
             continue
 
@@ -1915,8 +1986,7 @@ def run_validation_pass(
         for attempt in range(VALIDATION_MISSING_CHUNK_RETRIES + 1):
             if not remaining:
                 break
-            if stats.validation_attempts >= MAX_VALIDATION_CALLS:
-                record_limit_reached()
+            if cannot_start_provider_call():
                 break
             plan = plan_requests(remaining, render_validation, max_request_chars)
             for chunk in plan.oversized:
@@ -1928,8 +1998,7 @@ def run_validation_pass(
                     f"configured request limit of {max_request_chars} characters; skipped"
                 )
             for batch_index, request in enumerate(plan.batches, 1):
-                if stats.validation_attempts >= MAX_VALIDATION_CALLS:
-                    record_limit_reached()
+                if cannot_start_provider_call():
                     break
                 try:
                     raw = _call(
@@ -1941,7 +2010,8 @@ def run_validation_pass(
                         max_chars=max_request_chars,
                     )
                 except PipelineDeadlineExceeded:
-                    raise
+                    record_deadline_reached()
+                    break
                 except Exception as exc:
                     stats.notes.append(f"validation for {path} failed: {exc}")
                     continue
@@ -1964,6 +2034,8 @@ def run_validation_pass(
                 if chunk.id not in acknowledged_ids and chunk.id not in unfittable_ids
             ]
             if remaining and attempt + 1 < VALIDATION_MISSING_CHUNK_RETRIES + 1:
+                if cannot_start_provider_call():
+                    break
                 stats.notes.append(
                     f"validation for {path} omitted {len(remaining)} chunk(s); "
                     "retrying once"
@@ -1991,6 +2063,7 @@ def run_hierarchical_review(
     map_overhead_chars: int,
     map_concurrency: int = DEFAULT_MAP_CONCURRENCY,
     context_loader: ContextLoader | None = None,
+    deadline: float | None = None,
 ) -> tuple[dict, CoverageReport, EvidenceStore, PipelineStats]:
     stats = PipelineStats(
         chunks=len(corpus.reviewable_chunks),
@@ -2055,6 +2128,7 @@ def run_hierarchical_review(
             max_map_request_chars,
             stats,
             context_loader=context_loader,
+            deadline=validation_stage_deadline(deadline),
         )
         hierarchical_reduce(
             store,

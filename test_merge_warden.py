@@ -900,6 +900,18 @@ class ReviewDeadlineTests(unittest.TestCase):
         self.assertEqual(hard, 1000.0)
         self.assertEqual(provider, 940.0)
 
+    def test_validation_stage_uses_reduce_and_synthesis_reserves(self) -> None:
+        provider = 940.0
+        validation = mw.provider_stage_deadline("validation", provider)
+        self.assertEqual(
+            validation,
+            provider - mw.REDUCE_RESERVE_SECONDS - mw.SYNTHESIS_RESERVE_SECONDS,
+        )
+        self.assertEqual(mw.provider_stage_deadline("map", provider), provider)
+        self.assertEqual(mw.provider_stage_deadline("reduce", provider), provider)
+        self.assertEqual(mw.provider_stage_deadline("synthesis", provider), provider)
+        self.assertEqual(validation, 670.0)
+
     def test_invalid_review_deadline_configuration_is_rejected(self) -> None:
         with self.assertRaises(RuntimeError):
             mw.compute_review_deadlines(60, 60, now=0.0)

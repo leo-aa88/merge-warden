@@ -202,12 +202,18 @@ those per-call budgets.
 
 Merge Warden also enforces an internal wall-clock review budget. The default is
 900 seconds, with the final 60 seconds reserved for writing artifacts and
-posting the GitHub review. Provider request timeouts and retry sleeps are
-clamped to the remaining provider budget. If the deadline is exhausted at any
-map, pre-reduce, validation, reduce, or synthesis stage, the pipeline preserves the
-evidence collected so far and returns a fail-closed `COMMENT` instead of
-waiting for the outer GitHub Actions timeout to kill the process. Keep the
-workflow job timeout comfortably above `review-timeout-seconds`.
+posting the GitHub review. Inside the remaining provider budget, the last 120
+seconds are reserved for reduction and the last 150 seconds for final
+synthesis. Validation cannot consume those reserves: once the validation-stage
+deadline is reached, remaining cross-context checks are marked
+`validation:incomplete:<path>` and the pipeline continues to reduction and
+synthesis. Incomplete validation is acceptable; a review with no synthesis is
+not. Provider request timeouts and retry sleeps are clamped to the remaining
+stage budget. If the global deadline is exhausted at any map, pre-reduce,
+reduce, or synthesis stage, the pipeline preserves the evidence collected so
+far and returns a fail-closed `COMMENT` instead of waiting for the outer
+GitHub Actions timeout to kill the process. Keep the workflow job timeout
+comfortably above `review-timeout-seconds`.
 
 Optional environment overrides:
 

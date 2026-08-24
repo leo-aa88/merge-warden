@@ -45,6 +45,8 @@ from review_pipeline import (
     MAX_REDUCE_ROUNDS,
     MAX_VALIDATION_CALLS,
     REDUCE_GROUP_SIZE,
+    REDUCE_RESERVE_SECONDS,
+    SYNTHESIS_RESERVE_SECONDS,
     SYNTHESIS_SUFFIX,
     VALIDATION_MISSING_CHUNK_RETRIES,
     VALIDATION_STAGE_TOKEN,
@@ -64,11 +66,13 @@ from review_pipeline import (
     normalize_map_concurrency,
     plan_requests,
     prune_context_needs,
+    provider_stage_deadline,
     run_hierarchical_review,
     run_pre_reduce,
     seed_final_reduce,
     sanitize_failure_note,
     validation_related_findings,
+    validation_stage_deadline,
 )
 
 FOO_MAP_CHUNK = "diff:src/foo.c:1"
@@ -2453,6 +2457,279 @@ class ValidationAttemptBudgetTests(unittest.TestCase):
         self.assertEqual(stats.validation_calls_succeeded, 1)
         self.assertEqual(stats.validation_chunks_acknowledged, len(matching))
         self.assertNotIn(INCOMPLETE_FOO, store.findings[_fid("F17")].evidence)
+
+
+class ValidationStageBudgetTests(unittest.TestCase):
+    """Validation must not consume the reserved reduce/synthesis tail."""
+
+    def _paths_corpus(self, count: int) -> tuple[ReviewCorpus, list[str]]:
+        paths = [f"include/h{index}.h" for index in range(1, count + 1)]
+        map_chunk = _chunk(
+            "diff:src/foo.c:1", "src/foo.c", "+int main(void);\n", kind="diff"
+        )
+        source_chunks: list[ContextChunk] = []
+        for path in paths:
+            source_chunks.append(
+                _chunk(f"file:{path}:1", path, f"/* {path} */\nint field;\n")
+            )
+        corpus = _synthetic_corpus(
+            [map_chunk],
+            index="Changed files:\n- src/foo.c +1 -0\n",
+        )
+        corpus.source_chunks = source_chunks
+        return corpus, paths
+
+    def _owned_findings(self, paths: list[str]) -> tuple[list[dict], list[dict]]:
+        findings = [
+            {
+                "id": f"F{index}",
+                "severity": "MAJOR",
+                "path": "src/foo.c",
+                "body": f"Candidate {index} may violate an ownership contract.",
+                "confidence": "LIKELY",
+                "evidence": [],
+            }
+            for index in range(1, len(paths) + 1)
+        ]
+        needs = [
+            {
+                "path": path,
+                "reason": "Need the ownership contract",
+                "finding_ids": [f"F{index}"],
+            }
+            for index, path in enumerate(paths, 1)
+        ]
+        return findings, needs
+
+    def _pipeline(
+        self,
+        *,
+        findings: list[dict],
+        needs_context: list,
+        on_validation=None,
+        synthesis_event: str = "COMMENT",
+        synthesis_body: str = "# COMMENT\n\nSynthesized review.\n",
+    ):
+        state = {"map": 0, "validation": 0, "reduce": 0, "synthesis": 0}
+        validation_messages: list[str] = []
+        synthesis_messages: list[str] = []
+        stages: list[str] = []
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                ids = _chunk_ids_in_prompt(user)
+                if "Context requests" in user or VALIDATION_STAGE_TOKEN in user:
+                    stages.append("validation")
+                    validation_messages.append(user)
+                    state["validation"] += 1
+                    if on_validation is not None:
+                        return on_validation(state["validation"], user, ids)
+                    return _map_chunks_json(ids)
+                extras: dict = {}
+                if state["map"] == 0:
+                    extras["findings"] = findings
+                    extras["needs_context"] = needs_context
+                state["map"] += 1
+                stages.append("map")
+                return _map_chunks_json(ids, **extras)
+            if "merge-warden-reduce" in system:
+                stages.append("reduce")
+                state["reduce"] += 1
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            stages.append("synthesis")
+            state["synthesis"] += 1
+            synthesis_messages.append(user)
+            return json.dumps(
+                {
+                    "event": synthesis_event,
+                    "body": synthesis_body,
+                    "comments": [],
+                }
+            )
+
+        fake.state = state  # type: ignore[attr-defined]
+        fake.validation_messages = validation_messages  # type: ignore[attr-defined]
+        fake.synthesis_messages = synthesis_messages  # type: ignore[attr-defined]
+        fake.stages = stages  # type: ignore[attr-defined]
+        return fake
+
+    def test_validation_deadline_subtracts_reduce_and_synthesis_reserves(
+        self,
+    ) -> None:
+        self.assertEqual(REDUCE_RESERVE_SECONDS, 120)
+        self.assertEqual(SYNTHESIS_RESERVE_SECONDS, 150)
+        self.assertEqual(validation_stage_deadline(1840.0), 1570.0)
+        self.assertIsNone(validation_stage_deadline(None))
+        self.assertEqual(provider_stage_deadline("validation", 1840.0), 1570.0)
+        self.assertEqual(provider_stage_deadline("map", 1840.0), 1840.0)
+        self.assertEqual(provider_stage_deadline("reduce", 1840.0), 1840.0)
+        self.assertEqual(provider_stage_deadline("synthesis", 1840.0), 1840.0)
+        self.assertIsNone(provider_stage_deadline("validation", None))
+
+    def test_slow_validation_cannot_starve_synthesis(self) -> None:
+        """Brainrot PR #238 shape: eight slow validations must not skip synthesis."""
+        corpus, paths = self._paths_corpus(8)
+        findings, needs = self._owned_findings(paths)
+        clock = {"now": 10_000.0}
+        # Observed Brainrot validation latency was 35–112s per call.
+        validation_latency = 100.0
+        provider_budget = 840.0
+
+        def on_validation(_n: int, _user: str, ids: list[str]) -> str:
+            clock["now"] += validation_latency
+            return _map_chunks_json(ids)
+
+        fake = self._pipeline(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            review, coverage, store, stats = _run_hierarchical(
+                corpus, fake, deadline=clock["now"] + provider_budget
+            )
+        self.assertTrue(coverage.complete)
+        self.assertFalse(stats.deadline_exhausted)
+        self.assertTrue(stats.validation_deadline_exhausted)
+        self.assertLess(fake.state["validation"], 8)
+        self.assertGreater(fake.state["validation"], 0)
+        self.assertGreater(fake.state["reduce"], 0)
+        self.assertEqual(fake.state["synthesis"], 1)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertIn("Synthesized review.", review["body"])
+        self.assertIn("validation budget exhausted", stats.footer())
+        self.assertTrue(
+            any("validation stage deadline exhausted" in note for note in stats.notes)
+        )
+        incomplete_markers = [
+            f"validation:incomplete:{path}"
+            for path in paths
+            if f"validation:incomplete:{path}"
+            in store.findings[_fid(f"F{paths.index(path) + 1}")].evidence
+        ]
+        self.assertGreater(len(incomplete_markers), 0)
+        self.assertIn("validation", fake.stages)
+        self.assertIn("synthesis", fake.stages)
+        self.assertLess(fake.stages.index("validation"), fake.stages.index("synthesis"))
+
+    def test_incomplete_validation_from_deadline_reaches_synthesis(self) -> None:
+        corpus, paths = self._paths_corpus(8)
+        findings, needs = self._owned_findings(paths)
+        clock = {"now": 10_000.0}
+
+        def on_validation(_n: int, _user: str, ids: list[str]) -> str:
+            clock["now"] += 100.0
+            return _map_chunks_json(ids)
+
+        fake = self._pipeline(
+            findings=findings,
+            needs_context=needs,
+            on_validation=on_validation,
+            synthesis_event="APPROVE",
+            synthesis_body="# APPROVE\n\nLooks good.\n",
+        )
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            review, coverage, store, stats = _run_hierarchical(
+                corpus, fake, deadline=clock["now"] + 840.0
+            )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertTrue(fake.synthesis_messages)
+        synthesis_user = fake.synthesis_messages[0]
+        incomplete_in_store = [
+            item
+            for finding in store.kept_findings()
+            for item in finding.evidence
+            if item.startswith("validation:incomplete:")
+        ]
+        self.assertTrue(incomplete_in_store)
+        for marker in incomplete_in_store:
+            self.assertIn(marker, synthesis_user)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertIn("could not validate all requested context", review["body"])
+
+    def test_no_validation_call_starts_once_stage_deadline_is_reached(self) -> None:
+        corpus, paths = self._paths_corpus(4)
+        findings, needs = self._owned_findings(paths)
+        clock = {"now": 10_000.0}
+        # Provider deadline leaves only the reduce+synthesis reserves.
+        provider_deadline = clock["now"] + REDUCE_RESERVE_SECONDS + SYNTHESIS_RESERVE_SECONDS
+
+        fake = self._pipeline(findings=findings, needs_context=needs)
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            review, coverage, store, stats = _run_hierarchical(
+                corpus, fake, deadline=provider_deadline
+            )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(fake.state["validation"], 0)
+        self.assertEqual(stats.validation_attempts, 0)
+        self.assertTrue(stats.validation_deadline_exhausted)
+        self.assertFalse(stats.deadline_exhausted)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertIn("Synthesized review.", review["body"])
+        for index, path in enumerate(paths, 1):
+            self.assertIn(
+                f"validation:incomplete:{path}",
+                store.findings[_fid(f"F{index}")].evidence,
+            )
+
+    def test_validation_deadline_exception_continues_to_synthesis(self) -> None:
+        corpus, paths = self._paths_corpus(4)
+        findings, needs = self._owned_findings(paths)
+
+        def on_validation(n: int, _user: str, ids: list[str]) -> str:
+            if n >= 2:
+                raise PipelineDeadlineExceeded(
+                    "provider cutoff reached before validation"
+                )
+            return _map_chunks_json(ids)
+
+        fake = self._pipeline(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+        review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertFalse(stats.deadline_exhausted)
+        self.assertTrue(stats.validation_deadline_exhausted)
+        self.assertEqual(fake.state["validation"], 2)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertIn("Synthesized review.", review["body"])
+        self.assertIn(
+            "validation:incomplete:include/h2.h",
+            store.findings[_fid("F2")].evidence,
+        )
+        self.assertIn(
+            "validation:incomplete:include/h3.h",
+            store.findings[_fid("F3")].evidence,
+        )
+        self.assertIn(
+            "validation:incomplete:include/h4.h",
+            store.findings[_fid("F4")].evidence,
+        )
+
+    def test_real_sleep_validation_cannot_consume_synthesis_reserve(self) -> None:
+        corpus, paths = self._paths_corpus(8)
+        findings, needs = self._owned_findings(paths)
+
+        def on_validation(_n: int, _user: str, ids: list[str]) -> str:
+            time.sleep(0.05)
+            return _map_chunks_json(ids)
+
+        fake = self._pipeline(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+        with mock.patch.object(rp, "REDUCE_RESERVE_SECONDS", 0.2), mock.patch.object(
+            rp, "SYNTHESIS_RESERVE_SECONDS", 0.2
+        ):
+            started = time.monotonic()
+            review, coverage, _store, stats = _run_hierarchical(
+                corpus, fake, deadline=started + 0.55
+            )
+        self.assertTrue(coverage.complete)
+        self.assertFalse(stats.deadline_exhausted)
+        self.assertTrue(stats.validation_deadline_exhausted)
+        self.assertLess(fake.state["validation"], 8)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertEqual(fake.state["synthesis"], 1)
+        self.assertIn("Synthesized review.", review["body"])
 
 
 class ReducerDecisionValidationTests(unittest.TestCase):
