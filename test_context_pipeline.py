@@ -38,12 +38,14 @@ from context_pipeline import (
 )
 from review_pipeline import (
     DEFAULT_MAP_CONCURRENCY,
+    DEFAULT_VALIDATION_CONCURRENCY,
     MAP_MISSING_CHUNK_RETRIES,
     MAX_MAP_ATTEMPTS,
     MAX_MAP_CHUNKS_PER_CALL,
     MAX_MAP_CONCURRENCY,
     MAX_REDUCE_ROUNDS,
     MAX_VALIDATION_CALLS,
+    MAX_VALIDATION_CONCURRENCY,
     REDUCE_GROUP_SIZE,
     REDUCE_RESERVE_SECONDS,
     SYNTHESIS_RESERVE_SECONDS,
@@ -64,7 +66,9 @@ from review_pipeline import (
     ingest_map_result,
     join_confidence,
     normalize_map_concurrency,
+    normalize_validation_concurrency,
     plan_requests,
+    plan_validation_tasks,
     prune_context_needs,
     provider_stage_deadline,
     reduce_stage_deadline,
@@ -72,6 +76,7 @@ from review_pipeline import (
     run_pre_reduce,
     seed_final_reduce,
     sanitize_failure_note,
+    validation_path_sort_key,
     validation_related_findings,
     validation_stage_deadline,
 )
@@ -176,6 +181,21 @@ def _reduce_payload_ids(user: str) -> list[str]:
 
 def _reduce_payload(user: str) -> dict:
     return json.loads(user[user.find("{") :])
+
+
+def _validation_requested_paths(user: str) -> list[str]:
+    marker = "# Context requests from chunk analyses"
+    rest = user.split(marker, 1)[1] if marker in user else user
+    end = rest.find("# Candidate findings")
+    blob = rest[:end] if end != -1 else rest
+    paths: list[str] = []
+    for line in blob.splitlines():
+        if not line.startswith("- `"):
+            continue
+        path = line[3:].split("`", 1)[0]
+        if path:
+            paths.append(path)
+    return paths
 
 
 def _validation_candidate_findings(user: str) -> list[dict]:
@@ -2324,31 +2344,34 @@ class ValidationAttemptBudgetTests(unittest.TestCase):
     ):
         state = {"map": 0, "validation": 0}
         validation_messages: list[str] = []
+        lock = threading.Lock()
 
         def fake(system: str, user: str) -> str:
-            if "merge-warden-map" in system:
-                ids = _chunk_ids_in_prompt(user)
-                if "Context requests" in user:
-                    validation_messages.append(user)
-                    state["validation"] += 1
-                    return on_validation(state["validation"], user, ids)
-                extras: dict = {}
-                if state["map"] == 0:
-                    extras["findings"] = findings
-                    extras["needs_context"] = needs_context
-                state["map"] += 1
-                return _map_chunks_json(ids, **extras)
-            if "merge-warden-reduce" in system:
+            with lock:
+                if "merge-warden-map" in system:
+                    ids = _chunk_ids_in_prompt(user)
+                    if "Context requests" in user:
+                        validation_messages.append(user)
+                        state["validation"] += 1
+                        n = state["validation"]
+                        return on_validation(n, user, ids)
+                    extras: dict = {}
+                    if state["map"] == 0:
+                        extras["findings"] = findings
+                        extras["needs_context"] = needs_context
+                    state["map"] += 1
+                    return _map_chunks_json(ids, **extras)
+                if "merge-warden-reduce" in system:
+                    return json.dumps(
+                        {
+                            "keep": [item["id"] for item in findings],
+                            "reject": [],
+                            "merge": [],
+                        }
+                    )
                 return json.dumps(
-                    {
-                        "keep": [item["id"] for item in findings],
-                        "reject": [],
-                        "merge": [],
-                    }
+                    {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
                 )
-            return json.dumps(
-                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
-            )
 
         fake.state = state  # type: ignore[attr-defined]
         fake.validation_messages = validation_messages  # type: ignore[attr-defined]
@@ -2522,36 +2545,38 @@ class ValidationStageBudgetTests(unittest.TestCase):
         validation_messages: list[str] = []
         synthesis_messages: list[str] = []
         stages: list[str] = []
+        lock = threading.Lock()
 
         def fake(system: str, user: str) -> str:
-            stage = mw.provider_call_stage(system, user)
-            stages.append(stage)
-            state[stage] = state.get(stage, 0) + 1
-            if stage == "map":
-                ids = _chunk_ids_in_prompt(user)
-                extras: dict = {}
-                if state["map"] == 1:
-                    extras["findings"] = findings
-                    extras["needs_context"] = needs_context
-                return _map_chunks_json(ids, **extras)
-            if stage == "validation":
-                ids = _chunk_ids_in_prompt(user)
-                validation_messages.append(user)
-                if on_validation is not None:
-                    return on_validation(state["validation"], user, ids)
-                return _map_chunks_json(ids)
-            if stage in {"pre-reduce", "reduce"}:
-                if on_reduce is not None:
-                    return on_reduce(stage, user)
-                return json.dumps({"keep": [], "reject": [], "merge": []})
-            synthesis_messages.append(user)
-            return json.dumps(
-                {
-                    "event": synthesis_event,
-                    "body": synthesis_body,
-                    "comments": [],
-                }
-            )
+            with lock:
+                stage = mw.provider_call_stage(system, user)
+                stages.append(stage)
+                state[stage] = state.get(stage, 0) + 1
+                if stage == "map":
+                    ids = _chunk_ids_in_prompt(user)
+                    extras: dict = {}
+                    if state["map"] == 1:
+                        extras["findings"] = findings
+                        extras["needs_context"] = needs_context
+                    return _map_chunks_json(ids, **extras)
+                if stage == "validation":
+                    ids = _chunk_ids_in_prompt(user)
+                    validation_messages.append(user)
+                    if on_validation is not None:
+                        return on_validation(state["validation"], user, ids)
+                    return _map_chunks_json(ids)
+                if stage in {"pre-reduce", "reduce"}:
+                    if on_reduce is not None:
+                        return on_reduce(stage, user)
+                    return json.dumps({"keep": [], "reject": [], "merge": []})
+                synthesis_messages.append(user)
+                return json.dumps(
+                    {
+                        "event": synthesis_event,
+                        "body": synthesis_body,
+                        "comments": [],
+                    }
+                )
 
         fake.state = state  # type: ignore[attr-defined]
         fake.validation_messages = validation_messages  # type: ignore[attr-defined]
@@ -2578,29 +2603,31 @@ class ValidationStageBudgetTests(unittest.TestCase):
             synthesis_body=synthesis_body,
         )
         synthesis_started: list[float] = []
+        lock = threading.Lock()
 
         def fake(system: str, user: str) -> str:
-            stage = mw.provider_call_stage(system, user)
-            stage_deadline = rp.provider_stage_deadline(stage, provider_deadline)
-            remaining = (
-                None
-                if stage_deadline is None
-                else stage_deadline - clock["now"]
-            )
-            if remaining is not None and remaining <= 0:
-                raise PipelineDeadlineExceeded(
-                    f"provider cutoff reached before {stage}"
+            with lock:
+                stage = mw.provider_call_stage(system, user)
+                stage_deadline = rp.provider_stage_deadline(stage, provider_deadline)
+                remaining = (
+                    None
+                    if stage_deadline is None
+                    else stage_deadline - clock["now"]
                 )
-            duration = float(work.get(stage, 0.0))
-            if remaining is not None and duration > remaining:
-                clock["now"] = stage_deadline
-                raise PipelineDeadlineExceeded(
-                    f"{stage} request crossed the stage deadline"
-                )
-            clock["now"] += duration
-            if stage == "synthesis":
-                synthesis_started.append(clock["now"])
-            return inner(system, user)
+                if remaining is not None and remaining <= 0:
+                    raise PipelineDeadlineExceeded(
+                        f"provider cutoff reached before {stage}"
+                    )
+                duration = float(work.get(stage, 0.0))
+                if remaining is not None and duration > remaining:
+                    clock["now"] = stage_deadline
+                    raise PipelineDeadlineExceeded(
+                        f"{stage} request crossed the stage deadline"
+                    )
+                clock["now"] += duration
+                if stage == "synthesis":
+                    synthesis_started.append(clock["now"])
+                return inner(system, user)
 
         fake.state = inner.state  # type: ignore[attr-defined]
         fake.validation_messages = inner.validation_messages  # type: ignore[attr-defined]
@@ -2773,7 +2800,9 @@ class ValidationStageBudgetTests(unittest.TestCase):
         fake = self._pipeline(
             findings=findings, needs_context=needs, on_validation=on_validation
         )
-        review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        review, coverage, store, stats = _run_hierarchical(
+            corpus, fake, validation_concurrency=1
+        )
         self.assertTrue(coverage.complete)
         self.assertFalse(stats.deadline_exhausted)
         self.assertTrue(stats.validation_deadline_exhausted)
@@ -4874,6 +4903,488 @@ class ParallelMapSchedulerTests(unittest.TestCase):
         self.assertEqual(review["event"], "COMMENT")
         self.assertIn("`C9`", review["body"])
         self.assertNotIn("`C1`", review["body"])
+
+
+class ParallelValidationSchedulerTests(unittest.TestCase):
+    def _paths_corpus(self, paths: list[str]) -> ReviewCorpus:
+        map_chunk = _chunk(
+            "diff:src/foo.c:1", "src/foo.c", "+int main(void);\n", kind="diff"
+        )
+        corpus = _synthetic_corpus(
+            [map_chunk],
+            index="Changed files:\n- src/foo.c +1 -0\n",
+        )
+        corpus.source_chunks = [
+            _chunk(f"file:{path}:1", path, f"/* {path} */\nint field;\n")
+            for path in paths
+        ]
+        return corpus
+
+    def _specs(
+        self, items: list[tuple[str, str, str, str]]
+    ) -> tuple[list[dict], list[dict]]:
+        findings = [
+            {
+                "id": finding_id,
+                "severity": severity,
+                "path": "src/foo.c",
+                "body": f"{severity} {confidence} candidate for {path}",
+                "confidence": confidence,
+                "evidence": [],
+            }
+            for finding_id, severity, confidence, path in items
+        ]
+        needs = [
+            {
+                "path": path,
+                "reason": f"Need context for {finding_id}",
+                "finding_ids": [finding_id],
+            }
+            for finding_id, _severity, _confidence, path in items
+        ]
+        return findings, needs
+
+    def _pipeline(
+        self,
+        *,
+        findings: list[dict],
+        needs_context: list,
+        on_validation=None,
+        keep_ids: list[str] | None = None,
+    ):
+        state = {"map": 0, "validation": 0}
+        validation_messages: list[str] = []
+        validation_threads: list[int] = []
+        lock = threading.Lock()
+        kept = keep_ids if keep_ids is not None else [item["id"] for item in findings]
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                ids = _chunk_ids_in_prompt(user)
+                if "Context requests" in user or VALIDATION_STAGE_TOKEN in user:
+                    with lock:
+                        validation_messages.append(user)
+                        state["validation"] += 1
+                        n = state["validation"]
+                    validation_threads.append(threading.get_ident())
+                    if on_validation is not None:
+                        return on_validation(n, user, ids)
+                    return _map_chunks_json(ids)
+                extras: dict = {}
+                with lock:
+                    first = state["map"] == 0
+                    state["map"] += 1
+                if first:
+                    extras["findings"] = findings
+                    extras["needs_context"] = needs_context
+                return _map_chunks_json(ids, **extras)
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": kept, "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        fake.state = state  # type: ignore[attr-defined]
+        fake.validation_messages = validation_messages  # type: ignore[attr-defined]
+        fake.validation_threads = validation_threads  # type: ignore[attr-defined]
+        return fake
+
+    def test_normalize_validation_concurrency_clamps_to_conservative_bounds(
+        self,
+    ) -> None:
+        self.assertEqual(DEFAULT_VALIDATION_CONCURRENCY, 2)
+        self.assertEqual(MAX_VALIDATION_CONCURRENCY, 4)
+        self.assertNotEqual(DEFAULT_VALIDATION_CONCURRENCY, DEFAULT_MAP_CONCURRENCY)
+        self.assertLess(MAX_VALIDATION_CONCURRENCY, MAX_MAP_CONCURRENCY)
+        self.assertEqual(normalize_validation_concurrency(None), 2)
+        self.assertEqual(normalize_validation_concurrency(1), 1)
+        self.assertEqual(normalize_validation_concurrency(2), 2)
+        self.assertEqual(normalize_validation_concurrency(4), 4)
+        self.assertEqual(normalize_validation_concurrency(100), 4)
+        self.assertEqual(normalize_validation_concurrency(0), 1)
+        self.assertEqual(normalize_validation_concurrency(-3), 1)
+        self.assertEqual(normalize_validation_concurrency("nope"), 2)  # type: ignore[arg-type]
+
+    def test_validation_path_sort_key_orders_severity_then_impact(self) -> None:
+        blocking_question = [
+            _finding("B", severity="BLOCKING", confidence="QUESTION")
+        ]
+        major_likely = [_finding("M", severity="MAJOR", confidence="LIKELY")]
+        minor_likely = [_finding("N", severity="MINOR", confidence="LIKELY")]
+        major_question = [_finding("Q", severity="MAJOR", confidence="QUESTION")]
+        # Severity beats original order and within-severity impact.
+        self.assertLess(
+            validation_path_sort_key(blocking_question, 9),
+            validation_path_sort_key(major_likely, 0),
+        )
+        self.assertLess(
+            validation_path_sort_key(major_likely, 9),
+            validation_path_sort_key(minor_likely, 0),
+        )
+        self.assertLess(
+            validation_path_sort_key(major_likely, 5),
+            validation_path_sort_key(major_question, 0),
+        )
+        self.assertEqual(validation_path_sort_key(major_likely, 3)[2], 3)
+
+    def test_plan_validation_tasks_reorders_minor_ahead_of_blocking(self) -> None:
+        store = EvidenceStore()
+        store.findings["minor"] = _finding("minor", severity="MINOR")
+        store.findings["blocking"] = _finding("blocking", severity="BLOCKING")
+        store.needs_context = [
+            rp.ContextNeed(
+                path="include/minor.h",
+                reason="low value",
+                finding_ids=["minor"],
+            ),
+            rp.ContextNeed(
+                path="include/blocking.h",
+                reason="root cause",
+                finding_ids=["blocking"],
+            ),
+        ]
+        tasks = plan_validation_tasks(store)
+        self.assertEqual(
+            [task.path for task in tasks],
+            ["include/blocking.h", "include/minor.h"],
+        )
+
+    def test_independent_validation_calls_overlap(self) -> None:
+        paths = ["include/h1.h", "include/h2.h"]
+        corpus = self._paths_corpus(paths)
+        findings, needs = self._specs(
+            [
+                ("F1", "MAJOR", "LIKELY", "include/h1.h"),
+                ("F2", "MAJOR", "LIKELY", "include/h2.h"),
+            ]
+        )
+        barrier = threading.Barrier(2, timeout=5)
+        overlapped = {"ok": False, "error": None}
+
+        def on_validation(_n: int, _user: str, ids: list[str]) -> str:
+            try:
+                barrier.wait()
+                overlapped["ok"] = True
+            except threading.BrokenBarrierError as exc:
+                overlapped["error"] = exc
+            return _map_chunks_json(ids)
+
+        fake = self._pipeline(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+        review, coverage, _store, stats = _run_hierarchical(
+            corpus, fake, validation_concurrency=2
+        )
+        self.assertTrue(coverage.complete)
+        self.assertTrue(overlapped["ok"])
+        self.assertIsNone(overlapped["error"])
+        self.assertEqual(fake.state["validation"], 2)
+        self.assertEqual(stats.validation_concurrency, 2)
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_validation_concurrency_never_exceeds_configured_limit(self) -> None:
+        paths = [f"include/h{index}.h" for index in range(1, 5)]
+        corpus = self._paths_corpus(paths)
+        findings, needs = self._specs(
+            [
+                (f"F{index}", "MAJOR", "LIKELY", path)
+                for index, path in enumerate(paths, 1)
+            ]
+        )
+        current = 0
+        max_inflight = 0
+        lock = threading.Lock()
+
+        def on_validation(_n: int, _user: str, ids: list[str]) -> str:
+            nonlocal current, max_inflight
+            with lock:
+                current += 1
+                max_inflight = max(max_inflight, current)
+            time.sleep(0.05)
+            with lock:
+                current -= 1
+            return _map_chunks_json(ids)
+
+        fake = self._pipeline(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+        _review, coverage, _store, stats = _run_hierarchical(
+            corpus, fake, validation_concurrency=2
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(max_inflight, 2)
+        self.assertEqual(stats.validation_attempts, 4)
+        self.assertLessEqual(current, 0)
+
+    def test_minor_cannot_consume_final_budget_ahead_of_major(self) -> None:
+        paths = ["include/minor.h", "include/major.h"]
+        corpus = self._paths_corpus(paths)
+        findings, needs = self._specs(
+            [
+                ("F1", "MINOR", "LIKELY", "include/minor.h"),
+                ("F2", "MAJOR", "LIKELY", "include/major.h"),
+            ]
+        )
+        fake = self._pipeline(findings=findings, needs_context=needs)
+        with mock.patch.object(rp, "MAX_VALIDATION_CALLS", 1):
+            _review, coverage, store, stats = _run_hierarchical(
+                corpus, fake, validation_concurrency=2
+            )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(fake.state["validation"], 1)
+        self.assertEqual(stats.validation_attempts, 1)
+        self.assertEqual(stats.validation_deferred, 1)
+        validated = _validation_requested_paths(fake.validation_messages[0])
+        self.assertEqual(validated, ["include/major.h"])
+        self.assertNotIn(
+            "validation:incomplete:include/major.h",
+            store.findings[_fid("F2")].evidence,
+        )
+        self.assertIn(
+            "validation:incomplete:include/minor.h",
+            store.findings[_fid("F1")].evidence,
+        )
+
+    def test_blocking_is_scheduled_before_major_and_minor(self) -> None:
+        paths = ["include/minor.h", "include/major.h", "include/blocking.h"]
+        corpus = self._paths_corpus(paths)
+        findings, needs = self._specs(
+            [
+                ("F1", "MINOR", "LIKELY", "include/minor.h"),
+                ("F2", "MAJOR", "LIKELY", "include/major.h"),
+                ("F3", "BLOCKING", "QUESTION", "include/blocking.h"),
+            ]
+        )
+        order: list[str] = []
+
+        def on_validation(_n: int, user: str, ids: list[str]) -> str:
+            order.extend(_validation_requested_paths(user))
+            return _map_chunks_json(ids)
+
+        fake = self._pipeline(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+        _run_hierarchical(corpus, fake, validation_concurrency=1)
+        self.assertEqual(
+            order, ["include/blocking.h", "include/major.h", "include/minor.h"]
+        )
+
+    def test_low_value_runs_only_if_budget_remains(self) -> None:
+        paths = ["include/minor.h", "include/major.h", "include/blocking.h"]
+        corpus = self._paths_corpus(paths)
+        findings, needs = self._specs(
+            [
+                ("F1", "MINOR", "LIKELY", "include/minor.h"),
+                ("F2", "MAJOR", "LIKELY", "include/major.h"),
+                ("F3", "BLOCKING", "LIKELY", "include/blocking.h"),
+            ]
+        )
+        fake = self._pipeline(findings=findings, needs_context=needs)
+        with mock.patch.object(rp, "MAX_VALIDATION_CALLS", 2):
+            _review, coverage, store, stats = _run_hierarchical(
+                corpus, fake, validation_concurrency=2
+            )
+        self.assertTrue(coverage.complete)
+        validated = [
+            path
+            for message in fake.validation_messages
+            for path in _validation_requested_paths(message)
+        ]
+        self.assertEqual(
+            set(validated), {"include/blocking.h", "include/major.h"}
+        )
+        self.assertNotIn("include/minor.h", validated)
+        self.assertEqual(stats.validation_deferred, 1)
+        self.assertIn(
+            "validation:incomplete:include/minor.h",
+            store.findings[_fid("F1")].evidence,
+        )
+
+    def test_workers_do_not_mutate_evidence_store(self) -> None:
+        paths = ["include/h1.h", "include/h2.h"]
+        corpus = self._paths_corpus([])
+        findings, needs = self._specs(
+            [
+                ("F1", "MAJOR", "LIKELY", "include/h1.h"),
+                ("F2", "MAJOR", "LIKELY", "include/h2.h"),
+            ]
+        )
+        main_ident = threading.get_ident()
+        ingest_threads: list[int] = []
+        load_threads: list[int] = []
+        barrier = threading.Barrier(2, timeout=5)
+        orig = rp.ingest_map_result
+
+        def wrapped_ingest(*args, **kwargs):
+            ingest_threads.append(threading.get_ident())
+            return orig(*args, **kwargs)
+
+        def loader(path: str) -> str | None:
+            load_threads.append(threading.get_ident())
+            return f"/* {path} */\nint field;\n"
+
+        def on_validation(_n: int, _user: str, ids: list[str]) -> str:
+            barrier.wait()
+            return _map_chunks_json(ids)
+
+        fake = self._pipeline(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+        with mock.patch.object(rp, "ingest_map_result", wrapped_ingest):
+            _run_hierarchical(
+                corpus,
+                fake,
+                validation_concurrency=2,
+                context_loader=loader,
+            )
+        self.assertTrue(ingest_threads)
+        self.assertTrue(load_threads)
+        self.assertTrue(all(ident == main_ident for ident in ingest_threads))
+        self.assertTrue(all(ident == main_ident for ident in load_threads))
+        self.assertTrue(
+            any(ident != main_ident for ident in fake.validation_threads)
+        )
+
+    def test_provider_failure_is_isolated_to_one_validation_task(self) -> None:
+        paths = ["include/h1.h", "include/h2.h"]
+        corpus = self._paths_corpus(paths)
+        findings, needs = self._specs(
+            [
+                ("F1", "MAJOR", "LIKELY", "include/h1.h"),
+                ("F2", "MAJOR", "LIKELY", "include/h2.h"),
+            ]
+        )
+
+        def on_validation(_n: int, user: str, ids: list[str]) -> str:
+            if "include/h2.h" in user:
+                raise RuntimeError("provider unavailable for sibling path")
+            return _map_chunks_json(ids)
+
+        fake = self._pipeline(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+        _review, coverage, store, stats = _run_hierarchical(
+            corpus, fake, validation_concurrency=2
+        )
+        self.assertTrue(coverage.complete)
+        self.assertGreaterEqual(stats.validation_attempts, 2)
+        self.assertEqual(stats.validation_calls_succeeded, 1)
+        self.assertNotIn(
+            "validation:incomplete:include/h1.h",
+            store.findings[_fid("F1")].evidence,
+        )
+        self.assertIn(
+            "validation:incomplete:include/h2.h",
+            store.findings[_fid("F2")].evidence,
+        )
+
+    def test_deadline_stops_scheduling_new_validation_work(self) -> None:
+        paths = [f"include/h{index}.h" for index in range(1, 7)]
+        corpus = self._paths_corpus(paths)
+        findings, needs = self._specs(
+            [
+                (f"F{index}", "MAJOR", "LIKELY", path)
+                for index, path in enumerate(paths, 1)
+            ]
+        )
+        calls: list[str] = []
+        lock = threading.Lock()
+
+        def on_validation(_n: int, user: str, _ids: list[str]) -> str:
+            with lock:
+                calls.extend(_validation_requested_paths(user))
+            raise PipelineDeadlineExceeded(
+                "provider cutoff reached before validation"
+            )
+
+        fake = self._pipeline(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+        review, coverage, store, stats = _run_hierarchical(
+            corpus, fake, validation_concurrency=2
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(stats.validation_attempts, 2)
+        self.assertTrue(stats.validation_deadline_exhausted)
+        self.assertFalse(stats.deadline_exhausted)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertGreaterEqual(stats.validation_deferred, 4)
+        self.assertEqual(review["event"], "COMMENT")
+        for index, path in enumerate(paths, 1):
+            self.assertIn(
+                f"validation:incomplete:{path}",
+                store.findings[_fid(f"F{index}")].evidence,
+            )
+
+    def test_footer_reports_validation_concurrency_and_deferred_work(self) -> None:
+        paths = ["include/minor.h", "include/major.h", "include/blocking.h"]
+        corpus = self._paths_corpus(paths)
+        findings, needs = self._specs(
+            [
+                ("F1", "MINOR", "LIKELY", "include/minor.h"),
+                ("F2", "MAJOR", "LIKELY", "include/major.h"),
+                ("F3", "BLOCKING", "LIKELY", "include/blocking.h"),
+            ]
+        )
+        fake = self._pipeline(findings=findings, needs_context=needs)
+        with mock.patch.object(rp, "MAX_VALIDATION_CALLS", 1):
+            _review, _coverage, _store, stats = _run_hierarchical(
+                corpus, fake, validation_concurrency=2
+            )
+        footer = stats.footer()
+        self.assertIn("1 validation call(s)", footer)
+        self.assertIn("2 validation worker(s)", footer)
+        self.assertIn("2 deferred validation path(s)", footer)
+
+    def test_validation_follow_up_needs_are_scheduled(self) -> None:
+        paths = ["include/h1.h", "include/h2.h"]
+        corpus = self._paths_corpus(paths)
+        findings, needs = self._specs(
+            [("F1", "MAJOR", "LIKELY", "include/h1.h")]
+        )
+
+        def on_validation(_n: int, user: str, ids: list[str]) -> str:
+            extras: dict = {}
+            if "include/h1.h" in user:
+                extras["needs_context"] = [
+                    {
+                        "path": "include/h2.h",
+                        "reason": "follow-up cross-context check",
+                    }
+                ]
+            return _map_chunks_json(ids, **extras)
+
+        fake = self._pipeline(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+        _review, coverage, store, stats = _run_hierarchical(
+            corpus, fake, validation_concurrency=1
+        )
+        self.assertTrue(coverage.complete)
+        validated = [
+            path
+            for message in fake.validation_messages
+            for path in _validation_requested_paths(message)
+        ]
+        self.assertEqual(validated, ["include/h1.h", "include/h2.h"])
+        self.assertEqual(stats.validation_attempts, 2)
+        self.assertNotIn(
+            "validation:incomplete:include/h2.h",
+            store.findings[_fid("F1")].evidence,
+        )
+
+    def test_action_yml_exposes_validation_concurrency_contract(self) -> None:
+        text = (Path(__file__).resolve().parent / "action.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("validation-concurrency:", text)
+        self.assertIn("VALIDATION_CONCURRENCY:", text)
+        self.assertIn('--validation-concurrency "${VALIDATION_CONCURRENCY}"', text)
+        self.assertRegex(
+            text,
+            r"validation-concurrency:\n(?:.*\n){0,12}    default: \"2\"",
+        )
 
 
 class GenerateReviewPipelineTests(unittest.TestCase):

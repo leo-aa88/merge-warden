@@ -51,6 +51,10 @@ MAX_MAP_CHUNKS_PER_CALL = 8
 MAX_MAP_ATTEMPTS = 32
 DEFAULT_MAP_CONCURRENCY = 4
 MAX_MAP_CONCURRENCY = 8
+# Validation requests are larger than map batches and contend for the same
+# provider rate limits, so concurrency is separate and more conservative.
+DEFAULT_VALIDATION_CONCURRENCY = 2
+MAX_VALIDATION_CONCURRENCY = 4
 _SECRET_NOTE_RE = re.compile(
     r"(?i)((?:authorization|api[_-]?key|token|secret|password)\s*[=:]\s*)(\S+)"
 )
@@ -86,6 +90,14 @@ CONFIDENCE_ORDER = {
     "QUESTION": 0,
     "LIKELY": 1,
     "CONFIRMED": 2,
+}
+# Within one severity, prefer work that can still change the merge decision.
+# LIKELY can become CONFIRMED; QUESTION can confirm or refute a defect;
+# CONFIRMED still needs the extra context to prove or disprove root cause.
+VALIDATION_IMPACT_ORDER = {
+    "CONFIRMED": 0,
+    "QUESTION": 1,
+    "LIKELY": 2,
 }
 
 CallModel = Callable[[str, str], str]
@@ -261,6 +273,8 @@ class PipelineStats:
     validation_requests: int = 0
     validation_chunks_sent: int = 0
     validation_chunks_acknowledged: int = 0
+    validation_concurrency: int = 0
+    validation_deferred: int = 0
     raw_finding_count: int = 0
     reduced_finding_count: int = 0
     reduce_calls: int = 0
@@ -326,6 +340,8 @@ class PipelineStats:
             f"{self.raw_finding_count} raw finding(s), "
             f"{self.reduced_finding_count} after pre-reduce, "
             f"{self.validation_calls} validation call(s), "
+            f"{self.validation_concurrency} validation worker(s), "
+            f"{self.validation_deferred} deferred validation path(s), "
             f"{total_request_chars} total request chars "
             f"(primary map {self.map_request_chars}, validation {self.validation_request_chars}, "
             f"reduce {self.reduce_request_chars}, synthesis {self.synthesis_request_chars}), "
@@ -396,6 +412,47 @@ class MapWorkerResult:
     elapsed_seconds: float = 0.0
     oversized: bool = False
     skipped: bool = False
+
+
+@dataclass
+class ValidationTask:
+    """Coordinator-owned state for one requested context path."""
+
+    path: str
+    related_needs: list[ContextNeed]
+    related: list[Finding]
+    related_for_prompt: list[Finding]
+    original_index: int
+    sort_key: tuple
+    extra: list[ContextChunk] = field(default_factory=list)
+    expected_ids: set[str] = field(default_factory=set)
+    acknowledged_ids: set[str] = field(default_factory=set)
+    unfittable_ids: set[str] = field(default_factory=set)
+    pending_batches: deque[ModelRequestBatch] = field(default_factory=deque)
+    attempt: int = 0
+    batch_serial: int = 0
+    prepared: bool = False
+
+
+@dataclass
+class ValidationWorkItem:
+    """One validation provider call. Workers must not mutate the task or store."""
+
+    path: str
+    chunks: list[ContextChunk]
+    message: str
+    batch_tag: str
+    sequence: int
+
+
+@dataclass
+class ValidationWorkerResult:
+    """Raw validation provider outcome. Workers must not mutate store or stats."""
+
+    item: ValidationWorkItem
+    raw: str | None = None
+    error: BaseException | None = None
+    elapsed_seconds: float = 0.0
 
 
 class RequestTooLarge(RuntimeError):
@@ -1295,18 +1352,12 @@ def _call(
         raise RequestTooLarge(
             f"{kind} request is {len(user_message)} characters; limit is {max_chars}"
         )
-    if kind == "validation":
-        stats.validation_request_chars += len(user_message)
-    elif kind == "reduce":
+    if kind == "reduce":
         stats.reduce_request_chars += len(user_message)
     elif kind == "synthesis":
         stats.synthesis_request_chars += len(user_message)
-    if kind == "validation":
-        stats.validation_attempts += 1
     raw = call_model(system_prompt, user_message)
-    if kind == "validation":
-        stats.validation_calls_succeeded += 1
-    elif kind == "reduce":
+    if kind == "reduce":
         stats.reduce_calls += 1
     elif kind == "synthesis":
         stats.synthesis_calls += 1
@@ -1522,6 +1573,39 @@ def normalize_map_concurrency(value: int | None) -> int:
     if parsed > MAX_MAP_CONCURRENCY:
         return MAX_MAP_CONCURRENCY
     return parsed
+
+
+def normalize_validation_concurrency(value: int | None) -> int:
+    """Clamp validation provider concurrency independently of map concurrency."""
+    try:
+        parsed = DEFAULT_VALIDATION_CONCURRENCY if value is None else int(value)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_VALIDATION_CONCURRENCY
+    if parsed < 1:
+        return 1
+    if parsed > MAX_VALIDATION_CONCURRENCY:
+        return MAX_VALIDATION_CONCURRENCY
+    return parsed
+
+
+def validation_path_sort_key(
+    related: list[Finding],
+    original_index: int,
+) -> tuple[int, int, int]:
+    """Lower sorts first: BLOCKING, then MAJOR, then MINOR, then unowned paths.
+
+    Within a severity, LIKELY work (can become CONFIRMED) outranks QUESTION
+    (can confirm or refute) which outranks already-CONFIRMED cross-context
+    checks. ``original_index`` keeps equal-priority paths in needs order so
+    scheduling stays deterministic.
+    """
+    if not related:
+        return (1, 1, original_index)
+    severity = max(SEVERITY_ORDER.get(finding.severity, -1) for finding in related)
+    impact = max(
+        VALIDATION_IMPACT_ORDER.get(finding.confidence, -1) for finding in related
+    )
+    return (-severity, -impact, original_index)
 
 
 def _map_worker(
@@ -1963,6 +2047,114 @@ def _load_source_chunks(
     return []
 
 
+def _validation_task_for_path(
+    store: EvidenceStore,
+    path: str,
+    original_index: int,
+) -> ValidationTask | None:
+    related_needs = [item for item in store.needs_context if item.path == path]
+    related = findings_for_context_need(store, related_needs)
+    if not related and all(item.finding_ids for item in related_needs):
+        # Rejected or superseded findings must not generate validation work.
+        return None
+    return ValidationTask(
+        path=path,
+        related_needs=related_needs,
+        related=related,
+        related_for_prompt=validation_related_findings(store, related)[:12],
+        original_index=original_index,
+        sort_key=validation_path_sort_key(related, original_index),
+    )
+
+
+def plan_validation_tasks(store: EvidenceStore) -> list[ValidationTask]:
+    """Group remaining context needs by path and order them for validation.
+
+    BLOCKING work is scheduled before MAJOR, which is scheduled before MINOR.
+    Within a severity, LIKELY findings outrank QUESTION, which outrank
+    CONFIRMED. Paths with equal rank keep their original ``needs_context``
+    order so tests and retries stay deterministic.
+    """
+    tasks: list[ValidationTask] = []
+    seen_paths: set[str] = set()
+    for original_index, need in enumerate(store.needs_context):
+        path = need.path
+        if not path or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        task = _validation_task_for_path(store, path, original_index)
+        if task is None:
+            continue
+        tasks.append(task)
+    tasks.sort(key=lambda task: task.sort_key)
+    return tasks
+
+
+def _insert_validation_task(
+    pending: deque[ValidationTask],
+    task: ValidationTask,
+) -> None:
+    for index, existing in enumerate(pending):
+        if task.sort_key < existing.sort_key:
+            pending.insert(index, task)
+            return
+    pending.append(task)
+
+
+def _validation_remaining(task: ValidationTask) -> list[ContextChunk]:
+    return [
+        chunk
+        for chunk in task.extra
+        if chunk.id not in task.acknowledged_ids and chunk.id not in task.unfittable_ids
+    ]
+
+
+def _validation_worker(
+    item: ValidationWorkItem,
+    map_prompt: str,
+    call_model: CallModel,
+) -> ValidationWorkerResult:
+    """Provider I/O only. Must not mutate store, coverage, stats, or tasks."""
+    started = time.monotonic()
+    try:
+        raw = call_model(map_prompt, item.message)
+    except Exception as exc:
+        return ValidationWorkerResult(
+            item=item,
+            error=exc,
+            elapsed_seconds=time.monotonic() - started,
+        )
+    return ValidationWorkerResult(
+        item=item,
+        raw=raw,
+        elapsed_seconds=time.monotonic() - started,
+    )
+
+
+def apply_validation_response(
+    store: EvidenceStore,
+    stats: PipelineStats,
+    result: ValidationWorkerResult,
+) -> set[str]:
+    """Ingest one validation provider result on the scheduler thread."""
+    path = result.item.path
+    chunks = result.item.chunks
+    if result.error is not None:
+        stats.notes.append(
+            sanitize_failure_note(f"validation for {path} failed: {result.error}")
+        )
+        return set()
+    stats.validation_calls_succeeded += 1
+    stats.validation_chunks_sent += len(chunks)
+    seen = ingest_map_result(store, result.raw or "", chunks, result.item.batch_tag)
+    if seen is None:
+        stats.notes.append(
+            sanitize_failure_note(f"validation for {path} returned non-JSON evidence")
+        )
+        return set()
+    return seen
+
+
 def run_validation_pass(
     corpus: ReviewCorpus,
     store: EvidenceStore,
@@ -1972,8 +2164,15 @@ def run_validation_pass(
     stats: PipelineStats,
     context_loader: ContextLoader | None = None,
     deadline: float | None = None,
+    validation_concurrency: int = DEFAULT_VALIDATION_CONCURRENCY,
 ) -> None:
     """Run targeted validation until the call cap or stage deadline.
+
+    Independent context paths share a worker pool that is bounded separately
+    from map concurrency. ``call_model()`` may overlap. Lazy context loading,
+    ``ingest_map_result()``, retries, and stats stay on this thread. Work is
+    dequeued in severity/impact order so a MINOR path cannot spend the last
+    provider slot while MAJOR or BLOCKING work is still queued.
 
     ``deadline`` is a monotonic timestamp. Once it is reached, no new
     validation provider call is started. Remaining needs are marked
@@ -1981,9 +2180,24 @@ def run_validation_pass(
     A validation-stage ``PipelineDeadlineExceeded`` is treated the same way
     rather than aborting the review.
     """
-    if not store.needs_context:
+    concurrency = normalize_validation_concurrency(validation_concurrency)
+    stats.validation_concurrency = concurrency
+    tasks = plan_validation_tasks(store)
+    if not tasks:
         return
-    seen_paths: set[str] = set()
+
+    print(
+        f"Validating {len(tasks)} context path(s) with concurrency {concurrency}",
+        flush=True,
+    )
+
+    pending: deque[ValidationTask] = deque(tasks)
+    scheduled_paths = {task.path for task in tasks}
+    in_flight: dict[int, Future[ValidationWorkerResult]] = {}
+    task_by_sequence: dict[int, ValidationTask] = {}
+    completed: dict[int, ValidationWorkerResult] = {}
+    next_ingest = 1
+    next_sequence = 0
     limit_note_added = False
     deadline_note_added = False
     stop_validation = False
@@ -2021,103 +2235,214 @@ def run_validation_pass(
             return True
         return False
 
-    for need in store.needs_context:
-        path = need.path
-        if not path or path in seen_paths:
-            continue
-        seen_paths.add(path)
-        related_needs = [item for item in store.needs_context if item.path == path]
-        related = findings_for_context_need(store, related_needs)
-        if not related and all(item.finding_ids for item in related_needs):
-            # Rejected or superseded findings must not generate validation work.
-            continue
-        related_for_prompt = validation_related_findings(store, related)[:12]
-        if cannot_start_provider_call():
-            _mark_incomplete_validation(store, related, path)
-            continue
+    def defer_task(task: ValidationTask) -> None:
+        stats.validation_deferred += 1
+        _mark_incomplete_validation(store, task.related, task.path)
+
+    def finalize_task(task: ValidationTask) -> None:
+        missing_ids = task.expected_ids - task.acknowledged_ids
+        if not missing_ids:
+            return
+        _mark_incomplete_validation(store, task.related, task.path)
+        stats.notes.append(
+            f"validation for {task.path} did not acknowledge "
+            f"{len(missing_ids)} chunk(s): {_format_id_list(missing_ids)}"
+        )
+
+    def abandon_pending() -> None:
+        while pending:
+            defer_task(pending.popleft())
+
+    def prepare_task(task: ValidationTask) -> bool:
+        if task.prepared:
+            return True
+        task.prepared = True
         stats.validation_requests += 1
-        extra = _load_source_chunks(corpus, path, context_loader)
+        extra = _load_source_chunks(corpus, task.path, context_loader)
         if not extra:
-            _mark_incomplete_validation(store, related, path)
+            _mark_incomplete_validation(store, task.related, task.path)
             stats.notes.append(
-                f"validation for {path} could not load requested context"
+                f"validation for {task.path} could not load requested context"
             )
-            continue
+            return False
+        task.extra = extra
+        task.expected_ids = {chunk.id for chunk in extra}
+        return True
+
+    def plan_next_pass(task: ValidationTask) -> bool:
+        remaining = _validation_remaining(task)
+        if not remaining:
+            return False
+        if task.attempt >= VALIDATION_MISSING_CHUNK_RETRIES + 1:
+            return False
+        if task.attempt:
+            stats.notes.append(
+                f"validation for {task.path} omitted {len(remaining)} chunk(s); "
+                "retrying once"
+            )
 
         def render_validation(batch: list[ContextChunk]) -> str:
             return format_validation_user_message(
-                corpus, related_needs, batch, related_for_prompt
+                corpus,
+                task.related_needs,
+                batch,
+                task.related_for_prompt,
             )
 
-        expected_ids = {chunk.id for chunk in extra}
-        acknowledged_ids: set[str] = set()
-        unfittable_ids: set[str] = set()
-        remaining = list(extra)
-        for attempt in range(VALIDATION_MISSING_CHUNK_RETRIES + 1):
-            if not remaining:
-                break
-            if cannot_start_provider_call():
-                break
-            plan = plan_requests(remaining, render_validation, max_request_chars)
-            for chunk in plan.oversized:
-                if chunk.id in unfittable_ids:
-                    continue
-                unfittable_ids.add(chunk.id)
-                stats.notes.append(
-                    f"validation chunk {chunk.id} for {path} cannot fit the "
-                    f"configured request limit of {max_request_chars} characters; skipped"
-                )
-            for batch_index, request in enumerate(plan.batches, 1):
-                if cannot_start_provider_call():
-                    break
-                try:
-                    raw = _call(
-                        call_model,
-                        map_prompt,
-                        request.message,
-                        stats,
-                        "validation",
-                        max_chars=max_request_chars,
-                    )
-                except PipelineDeadlineExceeded:
-                    record_deadline_reached()
-                    break
-                except Exception as exc:
-                    stats.notes.append(f"validation for {path} failed: {exc}")
-                    continue
-                stats.validation_chunks_sent += len(request.chunks)
-                tag = f"val:{path}:{batch_index}"
-                if attempt:
-                    tag += f".retry{attempt}"
-                seen = ingest_map_result(store, raw, request.chunks, tag)
-                if seen is None:
-                    stats.notes.append(
-                        f"validation for {path} returned non-JSON evidence"
-                    )
-                    continue
-                fresh = seen - acknowledged_ids
-                acknowledged_ids.update(seen)
-                stats.validation_chunks_acknowledged += len(fresh)
-            remaining = [
-                chunk
-                for chunk in remaining
-                if chunk.id not in acknowledged_ids and chunk.id not in unfittable_ids
-            ]
-            if remaining and attempt + 1 < VALIDATION_MISSING_CHUNK_RETRIES + 1:
-                if cannot_start_provider_call():
-                    break
-                stats.notes.append(
-                    f"validation for {path} omitted {len(remaining)} chunk(s); "
-                    "retrying once"
-                )
-
-        missing_ids = expected_ids - acknowledged_ids
-        if missing_ids:
-            _mark_incomplete_validation(store, related, path)
+        plan = plan_requests(remaining, render_validation, max_request_chars)
+        for chunk in plan.oversized:
+            if chunk.id in task.unfittable_ids:
+                continue
+            task.unfittable_ids.add(chunk.id)
             stats.notes.append(
-                f"validation for {path} did not acknowledge "
-                f"{len(missing_ids)} chunk(s): {_format_id_list(missing_ids)}"
+                f"validation chunk {chunk.id} for {task.path} cannot fit the "
+                f"configured request limit of {max_request_chars} characters; skipped"
             )
+        task.pending_batches = deque(plan.batches)
+        task.batch_serial = 0
+        task.attempt += 1
+        return bool(task.pending_batches)
+
+    def next_work_item(task: ValidationTask) -> ValidationWorkItem | None:
+        nonlocal next_sequence
+        if not task.pending_batches and not plan_next_pass(task):
+            return None
+        request = task.pending_batches.popleft()
+        if len(request.message) > max_request_chars:
+            for chunk in request.chunks:
+                task.unfittable_ids.add(chunk.id)
+            stats.notes.append(
+                f"validation for {task.path} exceeded the request limit; "
+                "skipped a batch"
+            )
+            return None
+        task.batch_serial += 1
+        tag = f"val:{task.path}:{task.batch_serial}"
+        if task.attempt > 1:
+            tag += f".retry{task.attempt - 1}"
+        next_sequence += 1
+        return ValidationWorkItem(
+            path=task.path,
+            chunks=list(request.chunks),
+            message=request.message,
+            batch_tag=tag,
+            sequence=next_sequence,
+        )
+
+    def adopt_new_needs() -> None:
+        """Schedule context paths that validation responses newly requested.
+
+        ``ingest_map_result`` may append to ``store.needs_context``. Dropping
+        those paths would skip cross-context work the old sequential loop
+        still visited. New tasks keep the same severity ordering.
+        """
+        for original_index, need in enumerate(store.needs_context):
+            path = need.path
+            if not path or path in scheduled_paths:
+                continue
+            scheduled_paths.add(path)
+            task = _validation_task_for_path(store, path, original_index)
+            if task is None:
+                continue
+            _insert_validation_task(pending, task)
+
+    def requeue_or_finish(task: ValidationTask) -> None:
+        if task.pending_batches or _validation_remaining(task):
+            if not task.pending_batches and not plan_next_pass(task):
+                finalize_task(task)
+                return
+            _insert_validation_task(pending, task)
+            return
+        finalize_task(task)
+
+    executor = ThreadPoolExecutor(
+        max_workers=concurrency,
+        thread_name_prefix="mw-val",
+    )
+    try:
+        while pending or in_flight or completed:
+            while pending and len(in_flight) < concurrency and not stop_validation:
+                if cannot_start_provider_call():
+                    abandon_pending()
+                    break
+                task = pending.popleft()
+                if not prepare_task(task):
+                    continue
+                item = next_work_item(task)
+                if item is None:
+                    requeue_or_finish(task)
+                    continue
+                print(
+                    f"Validation {task.path}: {len(item.chunks)} chunk(s), "
+                    f"{len(item.message)} request chars "
+                    f"({len(in_flight) + 1} in flight)",
+                    flush=True,
+                )
+                stats.validation_attempts += 1
+                stats.validation_request_chars += len(item.message)
+                task_by_sequence[item.sequence] = task
+                in_flight[item.sequence] = executor.submit(
+                    _validation_worker,
+                    item,
+                    map_prompt,
+                    call_model,
+                )
+
+            while next_ingest in completed:
+                result = completed.pop(next_ingest)
+                task = task_by_sequence.pop(next_ingest)
+                next_ingest += 1
+                if isinstance(result.error, PipelineDeadlineExceeded):
+                    record_deadline_reached()
+                    print(
+                        f"Validation {result.item.path}: deadline exhausted "
+                        f"after {result.elapsed_seconds:.1f}s",
+                        flush=True,
+                    )
+                    defer_task(task)
+                    abandon_pending()
+                    continue
+                seen = apply_validation_response(store, stats, result)
+                print(
+                    f"Validation {result.item.path}: ingested "
+                    f"{len(seen)}/{len(result.item.chunks)} chunk(s) in "
+                    f"{result.elapsed_seconds:.1f}s",
+                    flush=True,
+                )
+                fresh = seen - task.acknowledged_ids
+                task.acknowledged_ids.update(seen)
+                stats.validation_chunks_acknowledged += len(fresh)
+                adopt_new_needs()
+                requeue_or_finish(task)
+
+            if not in_flight:
+                if pending and cannot_start_provider_call():
+                    abandon_pending()
+                if not pending and not completed:
+                    break
+                if next_ingest not in completed and completed:
+                    next_ingest += 1
+                    continue
+                continue
+
+            done, _ = wait(
+                list(in_flight.values()),
+                return_when=FIRST_COMPLETED,
+            )
+            for future in done:
+                sequence = next(
+                    seq for seq, inflight in in_flight.items() if inflight is future
+                )
+                in_flight.pop(sequence)
+                completed[sequence] = future.result()
+                error = completed[sequence].error
+                if isinstance(error, PipelineDeadlineExceeded):
+                    stop_validation = True
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    if pending:
+        abandon_pending()
 
 
 def run_hierarchical_review(
@@ -2132,6 +2457,7 @@ def run_hierarchical_review(
     max_reduce_request_chars: int,
     map_overhead_chars: int,
     map_concurrency: int = DEFAULT_MAP_CONCURRENCY,
+    validation_concurrency: int = DEFAULT_VALIDATION_CONCURRENCY,
     context_loader: ContextLoader | None = None,
     deadline: float | None = None,
 ) -> tuple[dict, CoverageReport, EvidenceStore, PipelineStats]:
@@ -2200,6 +2526,7 @@ def run_hierarchical_review(
             stats,
             context_loader=context_loader,
             deadline=validation_stage_deadline(deadline),
+            validation_concurrency=validation_concurrency,
         )
         hierarchical_reduce(
             store,

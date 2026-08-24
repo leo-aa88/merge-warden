@@ -108,6 +108,13 @@ inputs:
       Bounded to avoid provider rate-limit explosions.
     required: false
     default: "4"
+  validation-concurrency:
+    description: >
+      Maximum number of independent validation provider requests in flight
+      (1-4). Separate from map-concurrency because validation requests are
+      larger and more likely to contend for provider rate limits.
+    required: false
+    default: "2"
 
 outputs:
   markdown-path:
@@ -171,6 +178,7 @@ runs:
         REVIEW_TIMEOUT_SECONDS: ${{ inputs.review-timeout-seconds }}
         SHUTDOWN_RESERVE_SECONDS: ${{ inputs.shutdown-reserve-seconds }}
         MAP_CONCURRENCY: ${{ inputs.map-concurrency }}
+        VALIDATION_CONCURRENCY: ${{ inputs.validation-concurrency }}
         PROMPT_FILE: ${{ inputs.prompt-file }}
         ACTION_PATH: ${{ github.action_path }}
       shell: bash
@@ -201,4 +209,5 @@ runs:
           --review-timeout-seconds "${REVIEW_TIMEOUT_SECONDS}" \
           --shutdown-reserve-seconds "${SHUTDOWN_RESERVE_SECONDS}" \
           --map-concurrency "${MAP_CONCURRENCY}" \
+          --validation-concurrency "${VALIDATION_CONCURRENCY}" \
           "${extra[@]}"
