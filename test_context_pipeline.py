@@ -4950,6 +4950,7 @@ class ParallelValidationSchedulerTests(unittest.TestCase):
         findings: list[dict],
         needs_context: list,
         on_validation=None,
+        on_reduce=None,
         keep_ids: list[str] | None = None,
     ):
         state = {"map": 0, "validation": 0}
@@ -4979,6 +4980,8 @@ class ParallelValidationSchedulerTests(unittest.TestCase):
                     extras["needs_context"] = needs_context
                 return _map_chunks_json(ids, **extras)
             if "merge-warden-reduce" in system:
+                if on_reduce is not None:
+                    return on_reduce(system, user)
                 return json.dumps({"keep": kept, "reject": [], "merge": []})
             return json.dumps(
                 {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
@@ -5047,6 +5050,98 @@ class ParallelValidationSchedulerTests(unittest.TestCase):
         self.assertEqual(
             [task.path for task in tasks],
             ["include/blocking.h", "include/minor.h"],
+        )
+
+    def test_plan_validation_tasks_orders_by_joined_merge_class_severity(self) -> None:
+        store = EvidenceStore()
+        store.findings["minor_canon"] = _finding(
+            "minor_canon", severity="MINOR", confidence="QUESTION"
+        )
+        store.findings["blocking_member"] = _finding(
+            "blocking_member", severity="BLOCKING", confidence="LIKELY"
+        )
+        store.findings["plain_minor"] = _finding(
+            "plain_minor", severity="MINOR", confidence="LIKELY"
+        )
+        store.merged_into["blocking_member"] = "minor_canon"
+        store.kept = {"minor_canon", "plain_minor"}
+        store.reduced = True
+        store.needs_context = [
+            rp.ContextNeed(
+                path="include/minor.h",
+                reason="low value",
+                finding_ids=["plain_minor"],
+            ),
+            rp.ContextNeed(
+                path="include/critical.h",
+                reason="root cause",
+                finding_ids=["minor_canon"],
+            ),
+        ]
+        tasks = plan_validation_tasks(store)
+        self.assertEqual(
+            [task.path for task in tasks],
+            ["include/critical.h", "include/minor.h"],
+        )
+        self.assertEqual(store.findings["minor_canon"].severity, "MINOR")
+
+    def test_plan_validation_tasks_does_not_use_prompt_confidence_demotion(
+        self,
+    ) -> None:
+        store = EvidenceStore()
+        store.findings["confirmed"] = _finding(
+            "confirmed", severity="MAJOR", confidence="CONFIRMED"
+        )
+        store.findings["likely"] = _finding(
+            "likely", severity="MAJOR", confidence="LIKELY"
+        )
+        store.needs_context = [
+            rp.ContextNeed(
+                path="include/confirmed.h",
+                reason="already confirmed, still needs context",
+                finding_ids=["confirmed"],
+            ),
+            rp.ContextNeed(
+                path="include/likely.h",
+                reason="can become CONFIRMED",
+                finding_ids=["likely"],
+            ),
+        ]
+        tasks = plan_validation_tasks(store)
+        self.assertEqual(
+            [task.path for task in tasks],
+            ["include/likely.h", "include/confirmed.h"],
+        )
+
+    def test_plan_validation_tasks_ranks_every_merge_class_not_prompt_slice(
+        self,
+    ) -> None:
+        store = EvidenceStore()
+        store.findings["plain"] = _finding("plain", severity="MINOR")
+        store.needs_context = [
+            rp.ContextNeed(
+                path="include/minor.h",
+                reason="low value",
+                finding_ids=["plain"],
+            )
+        ]
+        for index in range(1, 14):
+            finding_id = f"crowd{index}"
+            severity = "BLOCKING" if index == 13 else "MINOR"
+            store.findings[finding_id] = _finding(finding_id, severity=severity)
+            store.needs_context.append(
+                rp.ContextNeed(
+                    path="include/crowded.h",
+                    reason="one of many",
+                    finding_ids=[finding_id],
+                )
+            )
+        tasks = plan_validation_tasks(store)
+        self.assertEqual(tasks[0].path, "include/crowded.h")
+        self.assertEqual(len(tasks[0].related_for_prompt), 12)
+        self.assertEqual(
+            [task.path for task in tasks],
+            ["include/crowded.h", "include/minor.h"],
         )
 
     def test_independent_validation_calls_overlap(self) -> None:
@@ -5144,6 +5239,59 @@ class ParallelValidationSchedulerTests(unittest.TestCase):
             "validation:incomplete:include/minor.h",
             store.findings[_fid("F1")].evidence,
         )
+
+    def test_merged_blocking_member_beats_earlier_minor_path(self) -> None:
+        paths = ["include/minor.h", "include/critical.h"]
+        corpus = self._paths_corpus(paths)
+        findings, needs = self._specs(
+            [
+                ("F1", "MINOR", "LIKELY", "include/minor.h"),
+                ("F2", "MINOR", "QUESTION", "include/critical.h"),
+                ("F3", "BLOCKING", "LIKELY", "include/critical.h"),
+            ]
+        )
+
+        def on_reduce(_system: str, user: str) -> str:
+            ids = _reduce_payload_ids(user)
+            canon = next((item for item in ids if item.endswith("/F2")), None)
+            blocking = next((item for item in ids if item.endswith("/F3")), None)
+            minor = next((item for item in ids if item.endswith("/F1")), None)
+            keep = [item for item in (minor, canon) if item]
+            merge = []
+            if canon is not None and blocking is not None:
+                merge.append({"ids": [canon, blocking], "canonical": canon})
+            return json.dumps(
+                {"keep": keep or ids, "reject": [], "merge": merge}
+            )
+
+        fake = self._pipeline(
+            findings=findings, needs_context=needs, on_reduce=on_reduce
+        )
+        with mock.patch.object(rp, "MAX_VALIDATION_CALLS", 1):
+            _review, coverage, store, stats = _run_hierarchical(
+                corpus, fake, validation_concurrency=2
+            )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(store.findings[_fid("F2")].severity, "MINOR")
+        self.assertEqual(stats.validation_attempts, 1)
+        self.assertEqual(fake.state["validation"], 1)
+        validated = [
+            path
+            for message in fake.validation_messages
+            for path in _validation_requested_paths(message)
+        ]
+        self.assertIn("include/critical.h", validated)
+        self.assertNotIn("include/minor.h", validated)
+        self.assertNotIn(
+            "validation:incomplete:include/critical.h",
+            store.findings[_fid("F2")].evidence,
+        )
+        self.assertIn(
+            "validation:incomplete:include/minor.h",
+            store.findings[_fid("F1")].evidence,
+        )
+        candidates = _validation_candidate_findings(fake.validation_messages[0])
+        self.assertTrue(any(item.get("severity") == "BLOCKING" for item in candidates))
 
     def test_blocking_is_scheduled_before_major_and_minor(self) -> None:
         paths = ["include/minor.h", "include/major.h", "include/blocking.h"]

@@ -877,15 +877,16 @@ def _finding_has_pending_context(store: EvidenceStore, finding_id: str) -> bool:
     return False
 
 
-def validation_related_findings(
+def aggregated_related_findings(
     store: EvidenceStore,
     related: list[Finding],
 ) -> list[Finding]:
-    """Aggregated canonical views for a validation prompt.
+    """Join merge-class severity, confidence, and evidence for related findings.
 
-    Identity comes from the surviving representative. Severity, confidence,
-    and evidence are joined from the merge class. Pending cross-context
-    work is not presented as ``CONFIRMED``.
+    Identity comes from the surviving representative. Pending-context
+    demotion is not applied; the scheduler needs the true CONFIRMED label
+    so LIKELY work still outranks already-confirmed checks. Prompt views
+    go through ``validation_related_findings``.
     """
     views: list[Finding] = []
     seen: set[str] = set()
@@ -897,14 +898,28 @@ def validation_related_findings(
         members = store.merge_members(canonical_id)
         if not members:
             continue
-        view = aggregate_finding(store.findings[canonical_id], members)
+        views.append(aggregate_finding(store.findings[canonical_id], members))
+    return views
+
+
+def validation_related_findings(
+    store: EvidenceStore,
+    related: list[Finding],
+) -> list[Finding]:
+    """Aggregated canonical views for a validation prompt.
+
+    Identity comes from the surviving representative. Severity, confidence,
+    and evidence are joined from the merge class. Pending cross-context
+    work is not presented as ``CONFIRMED``.
+    """
+    views = aggregated_related_findings(store, related)
+    for view in views:
         if (
-            _finding_has_pending_context(store, canonical_id)
+            _finding_has_pending_context(store, view.id)
             and CONFIDENCE_ORDER.get(view.confidence, -1)
             >= CONFIDENCE_ORDER["CONFIRMED"]
         ):
             view.confidence = "LIKELY"
-        views.append(view)
     return views
 
 
@@ -1594,6 +1609,13 @@ def validation_path_sort_key(
 ) -> tuple[int, int, int]:
     """Lower sorts first: BLOCKING, then MAJOR, then MINOR, then unowned paths.
 
+    ``related`` must already be aggregated merge-class views
+    (``join_severity`` / ``join_confidence``), not raw canonical records
+    and not prompt views. Reducers pick IDs and do not rewrite mapper
+    severity, so the raw canonical can stay MINOR while the class is
+    BLOCKING. Prompt views demote pending CONFIRMED to LIKELY and would
+    invert impact order.
+
     Within a severity, LIKELY work (can become CONFIRMED) outranks QUESTION
     (can confirm or refute) which outranks already-CONFIRMED cross-context
     checks. ``original_index`` keeps equal-priority paths in needs order so
@@ -2057,13 +2079,17 @@ def _validation_task_for_path(
     if not related and all(item.finding_ids for item in related_needs):
         # Rejected or superseded findings must not generate validation work.
         return None
+    # Rank the full merge class before slicing the prompt view. A BLOCKING
+    # member merged into a MINOR canonical is invisible on the raw record,
+    # and [:12] must not hide a high-severity class from the queue.
+    rank_views = aggregated_related_findings(store, related)
     return ValidationTask(
         path=path,
         related_needs=related_needs,
         related=related,
         related_for_prompt=validation_related_findings(store, related)[:12],
         original_index=original_index,
-        sort_key=validation_path_sort_key(related, original_index),
+        sort_key=validation_path_sort_key(rank_views, original_index),
     )
 
 
@@ -2071,9 +2097,10 @@ def plan_validation_tasks(store: EvidenceStore) -> list[ValidationTask]:
     """Group remaining context needs by path and order them for validation.
 
     BLOCKING work is scheduled before MAJOR, which is scheduled before MINOR.
-    Within a severity, LIKELY findings outrank QUESTION, which outrank
-    CONFIRMED. Paths with equal rank keep their original ``needs_context``
-    order so tests and retries stay deterministic.
+    Severity and confidence come from the aggregated merge class, not the
+    raw canonical record. Within a severity, LIKELY findings outrank
+    QUESTION, which outrank CONFIRMED. Paths with equal rank keep their
+    original ``needs_context`` order so tests and retries stay deterministic.
     """
     tasks: list[ValidationTask] = []
     seen_paths: set[str] = set()
