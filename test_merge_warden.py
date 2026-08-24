@@ -374,6 +374,8 @@ class IncompletePipelinePostingTests(unittest.TestCase):
             validation_deadline_exhausted=False,
             pre_reduce_deadline_exhausted=False,
             reduce_deadline_exhausted=False,
+            map_deadline_exhausted=False,
+            synthesis_calls=0,
             notes=[],
         )
         stats.footer.return_value = "pipeline footer"
@@ -477,6 +479,7 @@ class IncompletePipelinePostingTests(unittest.TestCase):
             "comments": [self.RAW_COMMENT],
         }
         coverage, stats = self._stats(complete=True, deadline_exhausted=False)
+        stats.synthesis_calls = 1
         with tempfile.TemporaryDirectory() as tmp:
             args = self._args(tmp)
             rc = self._generate(args, review, coverage, stats, store=self._store())
@@ -489,6 +492,42 @@ class IncompletePipelinePostingTests(unittest.TestCase):
         self.assertEqual(payload["comments"][0]["path"], "a.c")
         self.assertIn("raw mapper candidate", payload["comments"][0]["body"])
         self.assertNotIn("Candidate findings (not posted)", markdown)
+
+    def test_synthesized_incomplete_coverage_keeps_inline_comments(self) -> None:
+        review = {
+            "event": "REQUEST_CHANGES",
+            "body": "# REQUEST CHANGES\n\nCovered defect.\n",
+            "comments": [self.RAW_COMMENT],
+        }
+        coverage, stats = self._stats(complete=False, deadline_exhausted=False)
+        stats.synthesis_calls = 1
+        stats.map_deadline_exhausted = True
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp)
+            rc = self._generate(args, review, coverage, stats, store=self._store())
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+            markdown = Path(args.output).read_text(encoding="utf-8")
+        self.assertEqual(rc, 0)
+        self.assertEqual(payload["event"], "REQUEST_CHANGES")
+        self.assertEqual(len(payload["comments"]), 1)
+        self.assertNotIn("Candidate findings (not posted)", markdown)
+
+    def test_synthesized_incomplete_coverage_cannot_approve(self) -> None:
+        review = {
+            "event": "APPROVE",
+            "body": "# APPROVE\n\nLooks good.\n",
+            "comments": [],
+        }
+        coverage, stats = self._stats(complete=False, deadline_exhausted=False)
+        stats.synthesis_calls = 1
+        stats.map_deadline_exhausted = True
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp)
+            rc = self._generate(args, review, coverage, stats)
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(payload["event"], "COMMENT")
+        self.assertEqual(payload["comments"], [])
 
 
 class ReviewJsonTests(unittest.TestCase):
@@ -1097,6 +1136,7 @@ class ReviewDeadlineTests(unittest.TestCase):
         provider = 940.0
         validation = mw.provider_stage_deadline("validation", provider)
         reduce_cutoff = mw.provider_stage_deadline("reduce", provider)
+        map_cutoff = mw.provider_stage_deadline("map", provider)
         self.assertEqual(
             validation,
             provider - mw.REDUCE_RESERVE_SECONDS - mw.SYNTHESIS_RESERVE_SECONDS,
@@ -1107,10 +1147,85 @@ class ReviewDeadlineTests(unittest.TestCase):
         self.assertEqual(
             mw.provider_stage_deadline("pre-reduce", provider), validation
         )
-        self.assertEqual(mw.provider_stage_deadline("map", provider), provider)
+        self.assertEqual(
+            map_cutoff,
+            provider
+            - mw.VALIDATION_RESERVE_SECONDS
+            - mw.REDUCE_RESERVE_SECONDS
+            - mw.SYNTHESIS_RESERVE_SECONDS,
+        )
         self.assertEqual(mw.provider_stage_deadline("synthesis", provider), provider)
+        self.assertLess(map_cutoff, validation)
+        self.assertLess(validation, reduce_cutoff)
+        self.assertLess(reduce_cutoff, provider)
         self.assertEqual(validation, 670.0)
         self.assertEqual(reduce_cutoff, 790.0)
+        self.assertEqual(map_cutoff, 520.0)
+
+    def test_map_call_limits_are_tighter_than_global_http_defaults(self) -> None:
+        timeout, attempts, budget = mw.provider_call_limits("map")
+        self.assertEqual(timeout, mw.MAP_HTTP_TIMEOUT_SECONDS)
+        self.assertEqual(attempts, mw.MAP_HTTP_ATTEMPTS)
+        self.assertEqual(budget, mw.MAP_CALL_BUDGET_SECONDS)
+        self.assertLess(timeout, mw.HTTP_TIMEOUT_SECONDS)
+        self.assertLess(attempts, mw.HTTP_ATTEMPTS)
+        self.assertLess(budget, mw.HTTP_TIMEOUT_SECONDS)
+        other_timeout, other_attempts, other_budget = mw.provider_call_limits("synthesis")
+        self.assertEqual(other_timeout, mw.HTTP_TIMEOUT_SECONDS)
+        self.assertEqual(other_attempts, mw.HTTP_ATTEMPTS)
+        self.assertIsNone(other_budget)
+
+    def test_map_call_deadline_is_min_of_stage_provider_and_call_budget(self) -> None:
+        now = 1000.0
+        call_deadline = mw.bound_call_deadline(
+            stage_deadline=now + 400.0,
+            provider_deadline=now + 840.0,
+            call_budget=120.0,
+            now=now,
+        )
+        self.assertEqual(call_deadline, now + 120.0)
+        stage_bound = mw.bound_call_deadline(
+            stage_deadline=now + 30.0,
+            provider_deadline=now + 840.0,
+            call_budget=120.0,
+            now=now,
+        )
+        self.assertEqual(stage_bound, now + 30.0)
+
+    def test_map_call_budget_timeout_is_not_a_pipeline_deadline(self) -> None:
+        with mock.patch.object(mw.time, "monotonic", return_value=1000.0):
+            classified = mw.classify_deadline_exception(
+                "map",
+                provider_deadline=2000.0,
+                stage_deadline=1800.0,
+                exc=mw.RequestDeadlineExceeded("socket timeout"),
+            )
+        self.assertIsInstance(classified, RuntimeError)
+        self.assertNotIsInstance(classified, mw.PipelineDeadlineExceeded)
+        self.assertNotIsInstance(classified, mw.StageDeadlineExceeded)
+        self.assertIn("latency budget", str(classified))
+
+    def test_map_stage_cutoff_is_not_a_global_deadline(self) -> None:
+        with mock.patch.object(mw.time, "monotonic", return_value=1700.0):
+            classified = mw.classify_deadline_exception(
+                "map",
+                provider_deadline=2000.0,
+                stage_deadline=1600.0,
+                exc=mw.RequestDeadlineExceeded("stage cutoff"),
+            )
+        self.assertIsInstance(classified, mw.StageDeadlineExceeded)
+        self.assertEqual(classified.stage, "map")
+
+    def test_provider_cutoff_still_fail_closes(self) -> None:
+        with mock.patch.object(mw.time, "monotonic", return_value=2000.0):
+            classified = mw.classify_deadline_exception(
+                "map",
+                provider_deadline=1900.0,
+                stage_deadline=1600.0,
+                exc=mw.RequestDeadlineExceeded("provider cutoff"),
+            )
+        self.assertIsInstance(classified, mw.PipelineDeadlineExceeded)
+        self.assertNotIsInstance(classified, mw.StageDeadlineExceeded)
 
     def test_invalid_review_deadline_configuration_is_rejected(self) -> None:
         with self.assertRaises(RuntimeError):

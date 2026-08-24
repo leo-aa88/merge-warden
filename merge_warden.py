@@ -25,16 +25,24 @@ from review_pipeline import (
     DEFAULT_PROMPT_MAP,
     DEFAULT_PROMPT_REDUCE,
     DEFAULT_VALIDATION_CONCURRENCY,
+    MAP_CALL_BUDGET_SECONDS,
+    MAP_HTTP_ATTEMPTS,
+    MAP_HTTP_TIMEOUT_SECONDS,
     PRE_REDUCE_STAGE_TOKEN,
     REDUCE_RESERVE_SECONDS,
     SYNTHESIS_RESERVE_SECONDS,
+    VALIDATION_RESERVE_SECONDS,
     VALIDATION_STAGE_TOKEN,
     PipelineDeadlineExceeded,
+    StageDeadlineExceeded,
     finding_record,
+    map_stage_deadline,
     normalize_map_concurrency,
     normalize_validation_concurrency,
     provider_stage_deadline,
+    reduce_stage_deadline,
     run_hierarchical_review,
+    validation_stage_deadline,
 )
 
 MARKER = "<!-- merge-warden -->"
@@ -304,6 +312,57 @@ def remaining_deadline_seconds(deadline: float | None) -> float | None:
     if deadline is None:
         return None
     return deadline - time.monotonic()
+
+
+def provider_call_limits(stage: str) -> tuple[float, int, float | None]:
+    """HTTP timeout, attempt count, and optional logical call budget.
+
+    Map uses a tighter per-call budget so a slow batch splits while
+    downstream stage reserves are still intact. Other stages keep the
+    global HTTP timeout and retry the same shape a few times.
+    """
+    if stage == "map":
+        return MAP_HTTP_TIMEOUT_SECONDS, MAP_HTTP_ATTEMPTS, MAP_CALL_BUDGET_SECONDS
+    return HTTP_TIMEOUT_SECONDS, HTTP_ATTEMPTS, None
+
+
+def bound_call_deadline(
+    stage_deadline: float | None,
+    provider_deadline: float | None,
+    call_budget: float | None,
+    *,
+    now: float | None = None,
+) -> float | None:
+    """Earliest of stage, provider, and per-call latency cutoffs."""
+    started = time.monotonic() if now is None else float(now)
+    candidates = [
+        value
+        for value in (stage_deadline, provider_deadline)
+        if value is not None
+    ]
+    if call_budget is not None:
+        candidates.append(started + float(call_budget))
+    if not candidates:
+        return None
+    return min(candidates)
+
+
+def classify_deadline_exception(
+    stage: str,
+    provider_deadline: float | None,
+    stage_deadline: float | None,
+    exc: BaseException,
+) -> BaseException:
+    """Turn an HTTP deadline into a stage, provider, or per-call failure."""
+    provider_remaining = remaining_deadline_seconds(provider_deadline)
+    if provider_remaining is not None and provider_remaining <= 0:
+        return PipelineDeadlineExceeded(str(exc))
+    stage_remaining = remaining_deadline_seconds(stage_deadline)
+    if stage_remaining is not None and stage_remaining <= 0:
+        if stage == "map":
+            return StageDeadlineExceeded(stage, str(exc))
+        return PipelineDeadlineExceeded(str(exc))
+    return RuntimeError(f"{stage} call exceeded latency budget: {exc}")
 
 
 def http_timeout_for_deadline(
@@ -905,6 +964,8 @@ def call_chat_completions(
     extra_headers: dict[str, str] | None = None,
     label: str,
     deadline: float | None = None,
+    timeout: float = HTTP_TIMEOUT_SECONDS,
+    attempts: int = HTTP_ATTEMPTS,
 ) -> str:
     headers = {
         "Content-Type": "application/json",
@@ -918,6 +979,8 @@ def call_chat_completions(
         headers,
         label=label,
         deadline=deadline,
+        timeout=timeout,
+        attempts=attempts,
     )
     return content_from_chat_completions(data, label)
 
@@ -939,6 +1002,8 @@ def call_anthropic(
     api_key: str,
     *,
     deadline: float | None = None,
+    timeout: float = HTTP_TIMEOUT_SECONDS,
+    attempts: int = HTTP_ATTEMPTS,
 ) -> str:
     label = PROVIDER_LABELS["anthropic"]
     data = http_post_json(
@@ -951,6 +1016,8 @@ def call_anthropic(
         },
         label=label,
         deadline=deadline,
+        timeout=timeout,
+        attempts=attempts,
     )
     return content_from_anthropic(data, label)
 
@@ -977,6 +1044,8 @@ def call_gemini(
     api_key: str,
     *,
     deadline: float | None = None,
+    timeout: float = HTTP_TIMEOUT_SECONDS,
+    attempts: int = HTTP_ATTEMPTS,
 ) -> str:
     label = PROVIDER_LABELS["google"]
     data = http_post_json(
@@ -988,6 +1057,8 @@ def call_gemini(
         },
         label=label,
         deadline=deadline,
+        timeout=timeout,
+        attempts=attempts,
     )
     return content_from_gemini(data, label)
 
@@ -1000,6 +1071,8 @@ def call_model(
     api_key: str,
     *,
     deadline: float | None = None,
+    timeout: float = HTTP_TIMEOUT_SECONDS,
+    attempts: int = HTTP_ATTEMPTS,
 ) -> str:
     label = PROVIDER_LABELS[provider]
     if provider == "xai":
@@ -1012,6 +1085,8 @@ def call_model(
             extra_headers={"x-grok-conv-id": XAI_CONV_ID},
             label=label,
             deadline=deadline,
+            timeout=timeout,
+            attempts=attempts,
         )
     if provider == "openai":
         return call_chat_completions(
@@ -1022,6 +1097,8 @@ def call_model(
             api_key,
             label=label,
             deadline=deadline,
+            timeout=timeout,
+            attempts=attempts,
         )
     if provider == "anthropic":
         return call_anthropic(
@@ -1030,6 +1107,8 @@ def call_model(
             model,
             api_key,
             deadline=deadline,
+            timeout=timeout,
+            attempts=attempts,
         )
     if provider == "google":
         return call_gemini(
@@ -1038,6 +1117,8 @@ def call_model(
             model,
             api_key,
             deadline=deadline,
+            timeout=timeout,
+            attempts=attempts,
         )
     raise RuntimeError(f"Unsupported provider {provider!r}")
 
@@ -1533,10 +1614,25 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
         f"provider cutoff after "
         f"{review_timeout_seconds - shutdown_reserve_seconds}s; "
         f"{shutdown_reserve_seconds}s reserved for output/posting; "
+        f"{VALIDATION_RESERVE_SECONDS}s reserved for validation, "
         f"{REDUCE_RESERVE_SECONDS}s reserved for reduce, "
         f"{SYNTHESIS_RESERVE_SECONDS}s reserved for synthesis; "
+        f"map call budget {MAP_CALL_BUDGET_SECONDS}s / "
+        f"{MAP_HTTP_TIMEOUT_SECONDS}s HTTP / {MAP_HTTP_ATTEMPTS} attempt(s); "
         f"map concurrency {map_concurrency}; "
         f"validation concurrency {validation_concurrency}",
+        flush=True,
+    )
+    now = time.monotonic()
+    print(
+        "Stage budgets: "
+        f"map cutoff +{max((map_stage_deadline(provider_deadline) or now) - now, 0):.0f}s, "
+        f"validation cutoff +"
+        f"{max((validation_stage_deadline(provider_deadline) or now) - now, 0):.0f}s, "
+        f"reduce cutoff +"
+        f"{max((reduce_stage_deadline(provider_deadline) or now) - now, 0):.0f}s, "
+        f"synthesis/provider cutoff +{max(provider_deadline - now, 0):.0f}s, "
+        f"hard review deadline +{max(hard_deadline - now, 0):.0f}s",
         flush=True,
     )
 
@@ -1593,15 +1689,37 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
 
     def invoke(system_prompt: str, user_message: str) -> str:
         stage = provider_call_stage(system_prompt, user_message)
-        call_deadline = provider_stage_deadline(stage, provider_deadline)
-        remaining = remaining_deadline_seconds(call_deadline)
-        if remaining is None or remaining <= 0:
+        stage_deadline = provider_stage_deadline(stage, provider_deadline)
+        provider_remaining = remaining_deadline_seconds(provider_deadline)
+        if provider_remaining is not None and provider_remaining <= 0:
             raise PipelineDeadlineExceeded(
                 f"provider cutoff reached before {stage}"
             )
+        stage_remaining = remaining_deadline_seconds(stage_deadline)
+        if stage_remaining is not None and stage_remaining <= 0:
+            if stage == "map":
+                raise StageDeadlineExceeded(
+                    stage, f"map stage cutoff reached before {stage}"
+                )
+            raise PipelineDeadlineExceeded(
+                f"provider cutoff reached before {stage}"
+            )
+        http_timeout, attempts, call_budget = provider_call_limits(stage)
+        call_deadline = bound_call_deadline(
+            stage_deadline, provider_deadline, call_budget
+        )
+        remaining = remaining_deadline_seconds(call_deadline)
+        if remaining is None or remaining <= 0:
+            raise classify_deadline_exception(
+                stage,
+                provider_deadline,
+                stage_deadline,
+                RuntimeError(f"{stage} call budget exhausted"),
+            )
         print(
             f"Calling {PROVIDER_LABELS[provider]} ({model}) [{stage}] "
-            f"({remaining:.0f}s {stage} budget remaining)",
+            f"({(stage_remaining if stage_remaining is not None else remaining):.0f}s "
+            f"{stage} budget remaining, call_budget={min(http_timeout, remaining):.0f}s)",
             flush=True,
         )
         started = time.monotonic()
@@ -1614,12 +1732,17 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
                 model,
                 api_key,
                 deadline=call_deadline,
+                timeout=http_timeout,
+                attempts=attempts,
             )
             outcome = "ok"
             return raw
         except RequestDeadlineExceeded as exc:
             outcome = "deadline"
-            raise PipelineDeadlineExceeded(str(exc)) from exc
+            classified = classify_deadline_exception(
+                stage, provider_deadline, stage_deadline, exc
+            )
+            raise classified from exc
         finally:
             extra = "" if outcome == "ok" else f" ({outcome})"
             print(
@@ -1659,6 +1782,13 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             file=sys.stderr,
             flush=True,
         )
+    if stats.map_deadline_exhausted:
+        print(
+            "::warning::Merge Warden map stage deadline exhausted; "
+            "continuing to downstream stages with uncovered primary chunks",
+            file=sys.stderr,
+            flush=True,
+        )
     if stats.deadline_exhausted:
         print(
             "::warning::Merge Warden internal review deadline exhausted; "
@@ -1691,18 +1821,28 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
     for note in stats.notes:
         print(f"::warning::{note}", file=sys.stderr, flush=True)
     print(stats.footer(), flush=True)
-    incomplete = not coverage.complete or stats.deadline_exhausted
-    if incomplete:
+    try:
+        synthesis_calls = int(getattr(stats, "synthesis_calls", 0) or 0)
+    except (TypeError, ValueError):
+        synthesis_calls = 0
+    synthesis_completed = not stats.deadline_exhausted and synthesis_calls > 0
+    unsynthesized = stats.deadline_exhausted or not synthesis_completed
+    fail_closed_inline = unsynthesized and (
+        not coverage.complete or stats.deadline_exhausted
+    )
+    if fail_closed_inline:
         # Synthesis did not complete. Mapper candidates are not review findings.
         review["event"] = "COMMENT"
         review["comments"] = []
 
     comments = build_inline_comments(review, commentable)
-    if incomplete:
+    if fail_closed_inline:
         comments = []
     head_sha = pr.get("headRefOid") or ""
     event = normalize_event(str(review.get("event") or ""), str(review.get("body") or ""))
-    if incomplete:
+    if fail_closed_inline:
+        event = "COMMENT"
+    elif not coverage.complete and event == "APPROVE":
         event = "COMMENT"
     payload = {
         "commit_id": head_sha,
@@ -1711,7 +1851,9 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
         "comments": comments,
     }
     unposted = (
-        [finding_record(item) for item in store.kept_findings()] if incomplete else []
+        [finding_record(item) for item in store.kept_findings()]
+        if fail_closed_inline
+        else []
     )
     Path(args.json_output).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     Path(args.output).write_text(

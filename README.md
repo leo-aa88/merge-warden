@@ -187,6 +187,9 @@ with a separate, more conservative worker pool (default 2 in-flight,
 max 4). Evidence ingestion stays single-threaded and deterministic.
 Failed map batches split into smaller requests instead of abandoning sibling
 chunks; a global cap of 32 logical map attempts still fail-closes the review.
+Initial map batches are balanced by chunk size (largest-first bin packing with
+a soft ~32k-character target) so one giant request is not scheduled beside
+several tiny ones. Hard per-request character limits still win.
 
 Binary and generated files can be excluded, but that exclusion is explicit in
 the PR index. If reviewable context exceeds `MERGE_WARDEN_MAX_TOTAL_REVIEW_CHARS`
@@ -211,27 +214,35 @@ those per-call budgets.
 
 Merge Warden also enforces an internal wall-clock review budget. The default is
 900 seconds, with the final 60 seconds reserved for writing artifacts and
-posting the GitHub review. Inside the remaining provider budget, the last 120
-seconds are reserved for reduction and the last 150 seconds for final
-synthesis. Provider request timeouts and retry sleeps are clamped to the
-stage cutoff:
+posting the GitHub review. Inside the remaining provider budget, earlier
+stages may surrender unused time to later stages, but they may never consume
+time reserved for later stages:
 
+- map stops `420s` before the provider cutoff (`150s` validation + `120s`
+  reduce + `150s` synthesis)
 - pre-reduce and validation stop `270s` before the provider cutoff
 - reduce stops `150s` before the provider cutoff
 - synthesis uses the remaining provider budget
 
+Map calls also have a tighter per-call latency budget (90s HTTP timeout, 120s
+logical call budget, 2 HTTP attempts) so a slow batch splits while downstream
+reserves are still intact. Exhausting the map-stage allocation leaves remaining
+primary chunks uncovered and **continues** into validation, reduction, and
+synthesis. Exhausting the global provider deadline still fail-closes immediately.
+
 Once a stage cutoff is reached, that stage stops scheduling new provider
 calls and the pipeline continues. Remaining cross-context checks are marked
 `validation:incomplete:<path>`. Remaining reduce groups are kept. Incomplete
-validation is acceptable; a review with no synthesis is not. Map still uses
-the full provider deadline; exhausting it fail-closes to `COMMENT` because
-primary coverage is incomplete. If synthesis itself hits the provider cutoff,
-or if coverage is incomplete so synthesis never runs, the pipeline fail-closes
-to `COMMENT` with **no inline comments**. Mapper candidates stay in
-`merge-warden.md` for debugging; `merge-warden.json` remains the GitHub review
-payload (`commit_id`, `event`, `body`, `comments`) and is not a debug dump.
-An unsynthesized mapper candidate is not a review finding. Keep the workflow
-job timeout comfortably above `review-timeout-seconds`.
+validation is acceptable; a review with no synthesis is not. If synthesis
+itself hits the provider cutoff, the pipeline fail-closes to `COMMENT` with
+**no inline comments**. If map-stage exhaustion leaves primary coverage
+incomplete, synthesis still runs when time remains and must not `APPROVE`;
+synthesized comments from covered chunks may be posted. Mapper candidates stay
+in `merge-warden.md` for debugging when synthesis does not complete;
+`merge-warden.json` remains the GitHub review payload (`commit_id`, `event`,
+`body`, `comments`) and is not a debug dump. An unsynthesized mapper candidate
+is not a review finding. Keep the workflow job timeout comfortably above
+`review-timeout-seconds`.
 
 Optional environment overrides:
 

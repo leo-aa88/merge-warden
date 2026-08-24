@@ -47,16 +47,20 @@ from review_pipeline import (
     MAX_REDUCE_ROUNDS,
     MAX_VALIDATION_CALLS,
     MAX_VALIDATION_CONCURRENCY,
+    MAP_CALL_BUDGET_SECONDS,
+    MAP_SOFT_REQUEST_TARGET_CHARS,
     REDUCE_GROUP_SIZE,
     REDUCE_RESERVE_SECONDS,
     SYNTHESIS_RESERVE_SECONDS,
     SYNTHESIS_SUFFIX,
     VALIDATION_MISSING_CHUNK_RETRIES,
+    VALIDATION_RESERVE_SECONDS,
     VALIDATION_STAGE_TOKEN,
     EvidenceStore,
     Finding,
     PipelineDeadlineExceeded,
     PipelineStats,
+    StageDeadlineExceeded,
     apply_reduce_decision,
     canonical_finding_id,
     findings_as_review,
@@ -66,8 +70,10 @@ from review_pipeline import (
     hierarchical_reduce,
     ingest_map_result,
     join_confidence,
+    map_stage_deadline,
     normalize_map_concurrency,
     normalize_validation_concurrency,
+    pack_map_batches,
     plan_requests,
     plan_validation_tasks,
     prune_context_needs,
@@ -539,6 +545,83 @@ class PackTests(unittest.TestCase):
         self.assertEqual([chunk.id for chunk in packed], [chunk.id for chunk in chunks])
         for batch in batches:
             self.assertLessEqual(sum(chunk.size for chunk in batch), 70)
+
+    def test_pack_map_batches_balances_by_size_not_source_order(self) -> None:
+        chunks = [
+            _chunk("huge", "huge.c", "H" * 60_000),
+            _chunk("mid", "mid.c", "M" * 30_000),
+            _chunk("a", "a.c", "a" * 5_000),
+            _chunk("b", "b.c", "b" * 5_000),
+            _chunk("c", "c.c", "c" * 5_000),
+            _chunk("d", "d.c", "d" * 5_000),
+        ]
+        greedy = pack_chunks(chunks, 201_000)
+        greedy_sizes = [sum(item.size for item in batch) for batch in greedy]
+        self.assertEqual(len(greedy), 1)
+        self.assertEqual(greedy_sizes[0], 110_000)
+        balanced = pack_map_batches(
+            chunks,
+            max_chars=201_000,
+            max_chunks=MAX_MAP_CHUNKS_PER_CALL,
+            soft_target=32_000,
+        )
+        sizes = [sum(item.size for item in batch) for batch in balanced]
+        self.assertGreater(len(balanced), 1)
+        self.assertNotIn(110_000, sizes)
+        self.assertLessEqual(max(sizes) - min(sizes), 60_000)
+        packed_ids = [item.id for batch in balanced for item in batch]
+        self.assertEqual(sorted(packed_ids), sorted(chunk.id for chunk in chunks))
+        for batch in balanced:
+            origins = [chunks.index(item) for item in batch]
+            self.assertEqual(origins, sorted(origins))
+
+    def test_pack_map_batches_reduces_pathological_spread(self) -> None:
+        chunks = [
+            _chunk("p64", "p64.c", "A" * 64_000),
+            _chunk("p33", "p33.c", "B" * 33_000),
+            _chunk("p5a", "p5a.c", "C" * 5_000),
+            _chunk("p5b", "p5b.c", "D" * 5_000),
+            _chunk("p4a", "p4a.c", "E" * 4_000),
+            _chunk("p4b", "p4b.c", "F" * 4_000),
+        ]
+        balanced = pack_map_batches(
+            chunks,
+            max_chars=201_000,
+            max_chunks=MAX_MAP_CHUNKS_PER_CALL,
+            soft_target=MAP_SOFT_REQUEST_TARGET_CHARS,
+        )
+        sizes = [sum(item.size for item in batch) for batch in balanced]
+        self.assertGreaterEqual(len(balanced), 3)
+        self.assertLess(max(sizes), 64_000 + 33_000)
+        self.assertTrue(any(size == 64_000 for size in sizes))
+
+    def test_pack_map_batches_is_deterministic(self) -> None:
+        chunks = [
+            _chunk(f"c{i}", f"f{i}.c", ("x" * ((i * 1_733) % 8_000 + 100)))
+            for i in range(12)
+        ]
+        first = pack_map_batches(
+            chunks, max_chars=50_000, max_chunks=8, soft_target=32_000
+        )
+        second = pack_map_batches(
+            chunks, max_chars=50_000, max_chunks=8, soft_target=32_000
+        )
+        self.assertEqual(
+            [[item.id for item in batch] for batch in first],
+            [[item.id for item in batch] for batch in second],
+        )
+
+    def test_pack_map_batches_hard_limit_still_wins(self) -> None:
+        chunks = [
+            _chunk("a", "a.c", "a" * 40),
+            _chunk("b", "b.c", "b" * 40),
+        ]
+        batches = pack_map_batches(
+            chunks, max_chars=50, max_chunks=8, soft_target=10_000
+        )
+        for batch in batches:
+            self.assertLessEqual(sum(item.size for item in batch), 50)
+        self.assertEqual(len(batches), 2)
 
 
 class CorpusTests(unittest.TestCase):
@@ -2684,12 +2767,24 @@ class ValidationStageBudgetTests(unittest.TestCase):
                     else stage_deadline - clock["now"]
                 )
                 if remaining is not None and remaining <= 0:
+                    provider_remaining = provider_deadline - clock["now"]
+                    if stage == "map" and provider_remaining > 0:
+                        raise StageDeadlineExceeded(
+                            "map",
+                            f"map stage cutoff reached before {stage}",
+                        )
                     raise PipelineDeadlineExceeded(
                         f"provider cutoff reached before {stage}"
                     )
                 duration = float(work.get(stage, 0.0))
                 if remaining is not None and duration > remaining:
                     clock["now"] = stage_deadline
+                    provider_remaining = provider_deadline - clock["now"]
+                    if stage == "map" and provider_remaining > 0:
+                        raise StageDeadlineExceeded(
+                            "map",
+                            f"{stage} request crossed the stage deadline",
+                        )
                     raise PipelineDeadlineExceeded(
                         f"{stage} request crossed the stage deadline"
                     )
@@ -2710,15 +2805,22 @@ class ValidationStageBudgetTests(unittest.TestCase):
     ) -> None:
         self.assertEqual(REDUCE_RESERVE_SECONDS, 120)
         self.assertEqual(SYNTHESIS_RESERVE_SECONDS, 150)
+        self.assertEqual(VALIDATION_RESERVE_SECONDS, 150)
         self.assertEqual(validation_stage_deadline(1840.0), 1570.0)
         self.assertEqual(reduce_stage_deadline(1840.0), 1690.0)
+        self.assertEqual(map_stage_deadline(1840.0), 1420.0)
         self.assertIsNone(validation_stage_deadline(None))
         self.assertIsNone(reduce_stage_deadline(None))
+        self.assertIsNone(map_stage_deadline(None))
         self.assertEqual(provider_stage_deadline("validation", 1840.0), 1570.0)
         self.assertEqual(provider_stage_deadline("pre-reduce", 1840.0), 1570.0)
         self.assertEqual(provider_stage_deadline("reduce", 1840.0), 1690.0)
-        self.assertEqual(provider_stage_deadline("map", 1840.0), 1840.0)
+        self.assertEqual(provider_stage_deadline("map", 1840.0), 1420.0)
         self.assertEqual(provider_stage_deadline("synthesis", 1840.0), 1840.0)
+        self.assertLess(
+            provider_stage_deadline("map", 1840.0),
+            provider_stage_deadline("validation", 1840.0),
+        )
         self.assertIsNone(provider_stage_deadline("validation", None))
 
     def test_slow_validation_cannot_starve_synthesis(self) -> None:
@@ -2816,44 +2918,53 @@ class ValidationStageBudgetTests(unittest.TestCase):
             return f"/* {path} */\nint field;\n"
 
         clock = {"now": 10_000.0}
-        provider_deadline = (
-            clock["now"] + REDUCE_RESERVE_SECONDS + SYNTHESIS_RESERVE_SECONDS
+        provider_deadline = clock["now"] + 840.0
+        fake = self._invoke_like(
+            findings=findings,
+            needs_context=needs,
+            clock=clock,
+            provider_deadline=provider_deadline,
+            work={"map": 0.0, "validation": 10_000.0, "synthesis": 0.0},
         )
-        fake = self._pipeline(findings=findings, needs_context=needs)
         with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
             _run_hierarchical(
                 corpus,
                 fake,
                 deadline=provider_deadline,
                 context_loader=loader,
+                validation_concurrency=1,
             )
-        self.assertEqual(loaded, [])
+        self.assertEqual(loaded, [paths[0]])
         self.assertEqual(fake.state["validation"], 0)
 
     def test_no_validation_call_starts_once_stage_deadline_is_reached(self) -> None:
+        """A deadline that leaves only reduce+synthesis also expires map.
+
+        Map's cutoff is 150s before validation's. Starting already inside the
+        reduce+synthesis window must not start map or validation; synthesis
+        still runs on whatever evidence exists.
+        """
         corpus, paths = self._paths_corpus(4)
         findings, needs = self._owned_findings(paths)
         clock = {"now": 10_000.0}
-        # Provider deadline leaves only the reduce+synthesis reserves.
-        provider_deadline = clock["now"] + REDUCE_RESERVE_SECONDS + SYNTHESIS_RESERVE_SECONDS
+        provider_deadline = (
+            clock["now"] + REDUCE_RESERVE_SECONDS + SYNTHESIS_RESERVE_SECONDS
+        )
 
         fake = self._pipeline(findings=findings, needs_context=needs)
         with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
-            review, coverage, store, stats = _run_hierarchical(
+            review, coverage, _store, stats = _run_hierarchical(
                 corpus, fake, deadline=provider_deadline
             )
-        self.assertTrue(coverage.complete)
+        self.assertEqual(fake.state["map"], 0)
         self.assertEqual(fake.state["validation"], 0)
         self.assertEqual(stats.validation_attempts, 0)
-        self.assertTrue(stats.validation_deadline_exhausted)
+        self.assertTrue(stats.map_deadline_exhausted)
         self.assertFalse(stats.deadline_exhausted)
         self.assertEqual(stats.synthesis_calls, 1)
         self.assertIn("Synthesized review.", review["body"])
-        for index, path in enumerate(paths, 1):
-            self.assertIn(
-                f"validation:incomplete:{path}",
-                store.findings[_fid(f"F{index}")].evidence,
-            )
+        self.assertFalse(coverage.complete)
+        self.assertNotEqual(review["event"].upper().replace(" ", "_"), "APPROVE")
 
     def test_validation_deadline_exception_continues_to_synthesis(self) -> None:
         corpus, paths = self._paths_corpus(4)
@@ -2978,12 +3089,15 @@ class ValidationStageBudgetTests(unittest.TestCase):
         fake = self._pipeline(
             findings=findings, needs_context=needs, on_validation=on_validation
         )
-        with mock.patch.object(rp, "REDUCE_RESERVE_SECONDS", 0.2), mock.patch.object(
-            rp, "SYNTHESIS_RESERVE_SECONDS", 0.2
-        ):
+        with mock.patch.object(rp, "VALIDATION_RESERVE_SECONDS", 0.2), mock.patch.object(
+            rp, "REDUCE_RESERVE_SECONDS", 0.2
+        ), mock.patch.object(rp, "SYNTHESIS_RESERVE_SECONDS", 0.2):
             started = time.monotonic()
             review, coverage, _store, stats = _run_hierarchical(
-                corpus, fake, deadline=started + 0.55
+                corpus,
+                fake,
+                deadline=started + 0.75,
+                validation_concurrency=1,
             )
         self.assertTrue(coverage.complete)
         self.assertFalse(stats.deadline_exhausted)
@@ -3088,10 +3202,14 @@ class ValidationStageBudgetTests(unittest.TestCase):
                 "body": "synthesized finding after incomplete validation",
             }
         ]
-        inner = self._pipeline(findings=findings, needs_context=needs)
         clock = {"now": 10_000.0}
-        provider_deadline = (
-            clock["now"] + REDUCE_RESERVE_SECONDS + SYNTHESIS_RESERVE_SECONDS
+        provider_deadline = clock["now"] + 840.0
+        inner = self._invoke_like(
+            findings=findings,
+            needs_context=needs,
+            clock=clock,
+            provider_deadline=provider_deadline,
+            work={"map": 0.0, "validation": 10_000.0, "synthesis": 0.0},
         )
 
         def fake(system: str, user: str) -> str:
@@ -3108,7 +3226,7 @@ class ValidationStageBudgetTests(unittest.TestCase):
 
         with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
             review, coverage, _store, stats = _run_hierarchical(
-                corpus, fake, deadline=provider_deadline
+                corpus, fake, deadline=provider_deadline, validation_concurrency=1
             )
         self.assertTrue(coverage.complete)
         self.assertFalse(stats.deadline_exhausted)
@@ -3116,6 +3234,308 @@ class ValidationStageBudgetTests(unittest.TestCase):
         self.assertEqual(stats.synthesis_calls, 1)
         self.assertEqual(review["event"], "REQUEST_CHANGES")
         self.assertEqual(review["comments"], synthesized)
+
+
+class MapSchedulerInvariantTests(unittest.TestCase):
+    """Earlier stages may surrender unused time, but must never steal later reserves."""
+
+    def _sized_chunks(self, sizes: list[int]) -> list[ContextChunk]:
+        return [
+            _chunk(f"C{index}", f"c{index}.c", "x" * size)
+            for index, size in enumerate(sizes, 1)
+        ]
+
+    def test_map_cannot_consume_synthesis_reserve(self) -> None:
+        chunks = self._sized_chunks([200] * 8)
+        corpus = _synthetic_corpus(chunks)
+        clock = {"now": 10_000.0}
+        provider_deadline = clock["now"] + 840.0
+        map_cutoff = map_stage_deadline(provider_deadline)
+        fake = ValidationStageBudgetTests()._invoke_like(
+            findings=[],
+            needs_context=[],
+            clock=clock,
+            provider_deadline=provider_deadline,
+            work={"map": 10_000.0, "pre-reduce": 0.0, "reduce": 0.0, "synthesis": 10.0},
+        )
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            review, coverage, _store, stats = _run_hierarchical(
+                corpus, fake, deadline=provider_deadline, map_concurrency=4
+            )
+        synthesis_started = fake.synthesis_started[0] - 10.0
+        self.assertLessEqual(synthesis_started, provider_deadline)
+        self.assertGreaterEqual(
+            provider_deadline - synthesis_started, SYNTHESIS_RESERVE_SECONDS - 10.0
+        )
+        self.assertGreater(synthesis_started, map_cutoff - 0.001)
+        self.assertTrue(stats.map_deadline_exhausted)
+        self.assertFalse(stats.deadline_exhausted)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertNotEqual(review["event"].upper().replace(" ", "_"), "APPROVE")
+        self.assertFalse(coverage.complete)
+
+    def test_map_stage_timeout_continues_pipeline(self) -> None:
+        chunks = _tiny_chunks(10)
+        corpus = _synthetic_corpus(chunks)
+        mapped: set[str] = set()
+        synthesis_messages: list[str] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                if "C9" in ids:
+                    raise StageDeadlineExceeded("map", "map allocation expired")
+                mapped.update(ids)
+                return _map_chunks_json(
+                    ids,
+                    findings=[
+                        {
+                            "id": "F1",
+                            "severity": "MAJOR",
+                            "path": "c1.c",
+                            "side": "RIGHT",
+                            "line": 1,
+                            "body": "surviving mapper candidate",
+                            "confidence": "LIKELY",
+                        }
+                    ],
+                )
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            if stage == "synthesis":
+                synthesis_messages.append(user)
+                return json.dumps(
+                    {
+                        "event": "APPROVE",
+                        "body": "# APPROVE\n\nShould be demoted.\n",
+                        "comments": [],
+                    }
+                )
+            return json.dumps({"keep": [], "reject": [], "merge": []})
+
+        review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(stats.map_deadline_exhausted)
+        self.assertFalse(stats.deadline_exhausted)
+        self.assertTrue(mapped)
+        self.assertTrue(coverage.uncovered_chunk_ids)
+        self.assertTrue(set(mapped).isdisjoint(set(coverage.uncovered_chunk_ids)))
+        self.assertEqual(stats.raw_finding_count, len(store.findings))
+        self.assertGreater(stats.raw_finding_count, 0)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertEqual(len(synthesis_messages), 1)
+        self.assertIn('"complete": false', synthesis_messages[0])
+        self.assertNotEqual(review["event"].upper().replace(" ", "_"), "APPROVE")
+        self.assertEqual(review.get("comments") or [], [])
+
+    def test_global_provider_deadline_still_fail_closes(self) -> None:
+        chunks = _tiny_chunks(8)
+        corpus = _synthetic_corpus(chunks)
+        later_stages = {"n": 0}
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                raise PipelineDeadlineExceeded("provider cutoff reached during map")
+            later_stages["n"] += 1
+            raise AssertionError("no later pipeline stage should run")
+
+        review, coverage, store, stats = _run_hierarchical(
+            corpus, fake, map_concurrency=2
+        )
+        self.assertEqual(later_stages["n"], 0)
+        self.assertTrue(stats.deadline_exhausted)
+        self.assertFalse(stats.map_deadline_exhausted)
+        self.assertEqual(stats.raw_finding_count, len(store.findings))
+        self.assertEqual(stats.raw_finding_count, 0)
+        self.assertEqual(stats.synthesis_calls, 0)
+        _assert_unsynthesized_fallback(self, review)
+        self.assertFalse(coverage.complete)
+
+    def test_slow_large_batch_splits_without_retrying_same_shape(self) -> None:
+        chunks = _tiny_chunks(8)
+        corpus = _synthetic_corpus(chunks)
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                shapes.append(len(ids))
+                if len(ids) >= 8:
+                    raise RuntimeError("map call exceeded latency budget")
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        _review, coverage, _store, stats = _run_hierarchical(corpus, fake)
+        self.assertEqual(shapes.count(8), 1)
+        self.assertIn(4, shapes)
+        self.assertGreaterEqual(stats.map_batches_split, 1)
+        self.assertTrue(coverage.complete)
+        self.assertLess(shapes.count(8), 3)
+
+    def test_child_batches_are_not_started_after_map_cutoff(self) -> None:
+        chunks = _tiny_chunks(8)
+        corpus = _synthetic_corpus(chunks)
+        clock = {"now": 10_000.0}
+        provider_deadline = clock["now"] + 840.0
+        map_cutoff = map_stage_deadline(provider_deadline)
+        started: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                started.append(len(ids))
+                if len(ids) >= 8:
+                    clock["now"] = map_cutoff
+                    raise RuntimeError("map call exceeded latency budget")
+                raise AssertionError("child map calls must not start at cutoff")
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n\nPartial.\n", "comments": []}
+            )
+
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            _review, _coverage, _store, stats = _run_hierarchical(
+                corpus, fake, deadline=provider_deadline
+            )
+        self.assertEqual(started, [8])
+        self.assertTrue(stats.map_deadline_exhausted)
+        self.assertEqual(stats.synthesis_calls, 1)
+
+    def test_raw_finding_count_on_map_stage_exit(self) -> None:
+        chunks = _tiny_chunks(10)
+        corpus = _synthetic_corpus(chunks)
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                if "C9" in ids:
+                    raise StageDeadlineExceeded("map", "map allocation expired")
+                return _map_chunks_json(
+                    ids,
+                    findings=[
+                        {
+                            "id": "F1",
+                            "severity": "MAJOR",
+                            "path": "c1.c",
+                            "side": "RIGHT",
+                            "line": 1,
+                            "body": "first finding",
+                            "confidence": "LIKELY",
+                        },
+                        {
+                            "id": "F2",
+                            "severity": "MINOR",
+                            "path": "c1.c",
+                            "side": "RIGHT",
+                            "line": 1,
+                            "body": "second finding",
+                            "confidence": "QUESTION",
+                        },
+                    ],
+                )
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n\nPartial.\n", "comments": []}
+            )
+
+        _review, _coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertEqual(stats.raw_finding_count, len(store.findings))
+        self.assertEqual(stats.raw_finding_count, 2)
+        self.assertIn(f"{stats.raw_finding_count} raw finding(s)", stats.footer())
+        self.assertIn("map budget exhausted", stats.footer())
+
+    def test_zero_findings_stays_zero_on_map_stage_exit(self) -> None:
+        chunks = _tiny_chunks(10)
+        corpus = _synthetic_corpus(chunks)
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                if "C9" in ids:
+                    raise StageDeadlineExceeded("map", "map allocation expired")
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertEqual(len(store.findings), 0)
+        self.assertEqual(stats.raw_finding_count, 0)
+        self.assertTrue(stats.map_deadline_exhausted)
+        self.assertNotEqual(review["event"].upper().replace(" ", "_"), "APPROVE")
+        self.assertFalse(coverage.complete)
+
+    def test_unsynthesized_mapper_candidates_are_not_posted(self) -> None:
+        chunks = _tiny_chunks(2)
+        corpus = _synthetic_corpus(chunks)
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                ids = _chunk_ids_in_prompt(user)
+                return _map_chunks_json(
+                    ids,
+                    findings=[
+                        {
+                            "id": "F1",
+                            "severity": "MAJOR",
+                            "path": "c1.c",
+                            "side": "RIGHT",
+                            "line": 1,
+                            "body": "must not become an inline comment",
+                            "confidence": "LIKELY",
+                        }
+                    ],
+                )
+            raise PipelineDeadlineExceeded("provider cutoff reached before synthesis")
+
+        review, _coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(stats.deadline_exhausted)
+        self.assertEqual(stats.synthesis_calls, 0)
+        _assert_unsynthesized_fallback(self, review)
+        self.assertTrue(store.findings)
+        self.assertNotIn("must not become an inline comment", review["body"])
+        self.assertEqual(review["comments"], [])
+
+    def test_hard_request_limit_still_wins_with_balanced_packing(self) -> None:
+        chunks = [
+            _chunk(
+                f"file:src/p{i}.c:1",
+                f"src/p{i}.c",
+                f"int f{i}(void) {{ return {i}; }}\n" + ("A" * 80),
+            )
+            for i in range(6)
+        ]
+        index = "Changed files:\n" + "\n".join(
+            f"{i}. src/p{i}.c +10 -2" for i in range(40)
+        ) + "\n"
+        corpus = _synthetic_corpus(chunks, index=index)
+        reviewable = corpus.reviewable_chunks
+        single_max = max(
+            len(format_map_user_message(corpus, [chunk])) for chunk in reviewable
+        )
+        recorder = _ReviewRecorder()
+        _review, _coverage, _store, stats = _run_hierarchical(
+            corpus,
+            recorder,
+            max_map_request_chars=single_max,
+            map_overhead_chars=24_000,
+        )
+        for message in recorder.map_messages:
+            self.assertLessEqual(len(message), single_max)
+        self.assertGreaterEqual(stats.map_attempts, 1)
 
 
 class ReducerDecisionValidationTests(unittest.TestCase):
@@ -4275,8 +4695,13 @@ class SerializedRequestBudgetTests(unittest.TestCase):
 
 
 def _tiny_chunks(count: int, prefix: str = "C") -> list[ContextChunk]:
+    width = len(str(count))
     return [
-        _chunk(f"{prefix}{index}", f"{prefix.lower()}{index}.c", f"tiny-{index}")
+        _chunk(
+            f"{prefix}{index}",
+            f"{prefix.lower()}{index}.c",
+            f"tiny-{index:0{width}d}",
+        )
         for index in range(1, count + 1)
     ]
 
