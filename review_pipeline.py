@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -25,6 +27,7 @@ from context_pipeline import (
 
 MAP_STAGE_TOKEN = "merge-warden-map"
 REDUCE_STAGE_TOKEN = "merge-warden-reduce"
+VALIDATION_STAGE_TOKEN = "merge-warden-validation"
 DEFAULT_PROMPT_MAP = Path(__file__).resolve().parent / "prompt_map.md"
 DEFAULT_PROMPT_REDUCE = Path(__file__).resolve().parent / "prompt_reduce.md"
 REDUCE_GROUP_SIZE = 5
@@ -39,6 +42,8 @@ MAX_MAP_CHUNKS_PER_CALL = 8
 # malformed responses. HTTP retries inside one call_model() remain one
 # logical attempt, matching validation-attempt semantics.
 MAX_MAP_ATTEMPTS = 32
+DEFAULT_MAP_CONCURRENCY = 4
+MAX_MAP_CONCURRENCY = 8
 _SECRET_NOTE_RE = re.compile(
     r"(?i)((?:authorization|api[_-]?key|token|secret|password)\s*[=:]\s*)(\S+)"
 )
@@ -334,12 +339,38 @@ class RequestPlan:
     oversized: list[ContextChunk] = field(default_factory=list)
 
 
+@dataclass
+class MapWorkItem:
+    chunks: list[ContextChunk]
+    batch_tag: str
+    sequence: int
+    message: str = ""
+
+
+@dataclass
+class MapWorkerResult:
+    """Raw provider outcome. Workers must not mutate store, coverage, or stats."""
+
+    item: MapWorkItem
+    raw: str | None = None
+    error: BaseException | None = None
+    elapsed_seconds: float = 0.0
+    oversized: bool = False
+    skipped: bool = False
+
+
 class RequestTooLarge(RuntimeError):
     """A serialized model request exceeded the configured character budget."""
 
 
 class PipelineDeadlineExceeded(RuntimeError):
     """The caller's wall-clock review budget was exhausted."""
+
+
+@dataclass
+class MapStageResult:
+    analyzed: list[ContextChunk] = field(default_factory=list)
+    deadline_error: PipelineDeadlineExceeded | None = None
 
 
 def sanitize_failure_note(note: str, *, max_chars: int = 240) -> str:
@@ -437,9 +468,8 @@ def _deadline_result(
     analyzed: list[ContextChunk],
     error: PipelineDeadlineExceeded,
 ) -> tuple[dict, CoverageReport, EvidenceStore, PipelineStats]:
-    # A deadline can interrupt a map sub-batch before it returns its local
-    # acknowledgement list. Under-reporting that sub-batch is intentional:
-    # deadline degradation must be conservative, never optimistic.
+    # The map scheduler reports every sibling batch it already ingested before
+    # a deadline. Only the interrupted provider call remains uncovered.
     mark_chunks_covered(coverage, analyzed)
     stats.map_chunks_acknowledged = len(analyzed)
     stats.map_chunks_uncovered = max(stats.chunks - len(analyzed), 0)
@@ -878,6 +908,8 @@ def format_validation_user_message(
             "# PR-wide index",
             corpus.index.rstrip(),
             "",
+            f"<!-- {VALIDATION_STAGE_TOKEN} -->",
+            "",
             "# Context requests from chunk analyses",
             "\n".join(request_lines) or "- (none)",
             "",
@@ -1073,11 +1105,6 @@ def _call(
         )
     if kind == "validation":
         stats.validation_attempts += 1
-    elif kind == "map":
-        # Count the logical provider invocation before the call so exceptions
-        # consume the map-attempt budget. Internal HTTP retries inside
-        # call_model() are not additional logical attempts.
-        stats.map_attempts += 1
     raw = call_model(system_prompt, user_message)
     if kind == "validation":
         stats.validation_calls_succeeded += 1
@@ -1189,73 +1216,75 @@ def _record_map_budget_exhausted(stats: PipelineStats) -> None:
         stats.notes.append(note)
 
 
-def execute_map_request(
-    *,
-    corpus: ReviewCorpus,
-    batch: list[ContextChunk],
-    store: EvidenceStore,
+def normalize_map_concurrency(value: int | None) -> int:
+    """Clamp map provider concurrency to a conservative bound."""
+    try:
+        parsed = DEFAULT_MAP_CONCURRENCY if value is None else int(value)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_MAP_CONCURRENCY
+    if parsed < 1:
+        return 1
+    if parsed > MAX_MAP_CONCURRENCY:
+        return MAX_MAP_CONCURRENCY
+    return parsed
+
+
+def _map_worker(
+    item: MapWorkItem,
     map_prompt: str,
     call_model: CallModel,
+) -> MapWorkerResult:
+    """Provider I/O only. Must not mutate store, coverage, or stats."""
+    started = time.monotonic()
+    try:
+        raw = call_model(map_prompt, item.message)
+    except Exception as exc:
+        return MapWorkerResult(
+            item=item,
+            error=exc,
+            elapsed_seconds=time.monotonic() - started,
+        )
+    return MapWorkerResult(
+        item=item,
+        raw=raw,
+        elapsed_seconds=time.monotonic() - started,
+    )
+
+
+def apply_map_response(
+    store: EvidenceStore,
     stats: PipelineStats,
-    batch_tag: str,
-    max_request_chars: int,
+    result: MapWorkerResult,
 ) -> MapAttemptResult:
-    """Perform exactly one logical map provider attempt.
+    """Ingest one map provider result on the scheduler thread.
 
     Coverage is based on explicit acknowledgements of the IDs present in the
     map prompt (``chunk.id``), including coalesced IDs. Unacknowledged chunks
     stay uncovered rather than being treated as analyzed. A parseable JSON
     object with zero supplied IDs is a failed attempt, not progress.
     """
+    batch = result.item.chunks
+    batch_tag = result.item.batch_tag
     missing = list(batch)
     if not batch:
         return MapAttemptResult(acknowledged=[], missing=[])
-    if stats.map_attempts >= MAX_MAP_ATTEMPTS:
-        _record_map_budget_exhausted(stats)
-        return MapAttemptResult(
-            acknowledged=[],
-            missing=missing,
-            budget_exhausted=True,
-        )
-    user_message = format_map_user_message(corpus, batch)
-    print(
-        f"Map batch {batch_tag}: {len(batch)} chunk(s), "
-        f"{sum(chunk.size for chunk in batch)} chunk chars, "
-        f"{len(user_message)} request chars"
-    )
-    if len(user_message) > max_request_chars:
+    if result.oversized:
         stats.notes.append(
-            f"map batch {batch_tag} exceeded {max_request_chars} characters; "
+            f"map batch {batch_tag} exceeded the request limit; "
             "chunks left uncovered"
         )
         return MapAttemptResult(acknowledged=[], missing=missing)
-    try:
-        raw = _call(
-            call_model,
-            map_prompt,
-            user_message,
-            stats,
-            "map",
-            max_chars=max_request_chars,
-        )
-    except RequestTooLarge as exc:
-        stats.notes.append(
-            sanitize_failure_note(f"map batch {batch_tag} failed: {exc}")
-        )
-        return MapAttemptResult(acknowledged=[], missing=missing)
-    except PipelineDeadlineExceeded:
-        raise
-    except Exception as exc:
+    if result.error is not None:
         stats.map_provider_failures += 1
         stats.notes.append(
-            sanitize_failure_note(f"map batch {batch_tag} failed: {exc}")
+            sanitize_failure_note(f"map batch {batch_tag} failed: {result.error}")
         )
         return MapAttemptResult(
             acknowledged=[],
             missing=missing,
             provider_failed=True,
         )
-    seen = ingest_map_result(store, raw, batch, batch_tag)
+    seen = ingest_map_result(store, result.raw or "", batch, batch_tag)
     if seen is None:
         stats.map_non_json_responses += 1
         stats.notes.append(
@@ -1283,149 +1312,287 @@ def execute_map_request(
     return MapAttemptResult(acknowledged=acknowledged, missing=remaining)
 
 
-def map_batch_resilient(
-    *,
-    corpus: ReviewCorpus,
-    batch: list[ContextChunk],
-    store: EvidenceStore,
-    map_prompt: str,
-    call_model: CallModel,
+def _follow_up_batches(
+    result: MapAttemptResult,
+    current: list[ContextChunk],
+    mapped_ids: set[str],
+    single_failures: dict[str, int],
     stats: PipelineStats,
     batch_tag: str,
-    max_request_chars: int,
-) -> list[ContextChunk]:
-    """Map ``batch`` with retries, partial-ack isolation, and degradation.
-
-    Already-acknowledged chunks are never primary-mapped again. Failed
-    multi-chunk requests split in half. A single-chunk failure is retried
-    ``MAP_MISSING_CHUNK_RETRIES`` times, then left uncovered. The global
-    ``MAX_MAP_ATTEMPTS`` budget is checked before every provider call.
-    """
-    queue: deque[list[ContextChunk]] = deque()
-    if batch:
-        queue.append(list(batch))
-    analyzed: list[ContextChunk] = []
-    mapped_ids: set[str] = set()
-    single_failures: dict[str, int] = {}
-    serial = 0
-
-    def enqueue(parts: list[list[ContextChunk]]) -> None:
-        for part in parts:
-            leftover = [chunk for chunk in part if chunk.id not in mapped_ids]
-            if leftover:
-                queue.append(leftover)
-
-    def split_and_enqueue(items: list[ContextChunk], reason: str) -> None:
-        left, right = split_map_batch(items)
+) -> list[list[ContextChunk]]:
+    """Retry/split work for one ingested map result. Scheduler thread only."""
+    remaining = [chunk for chunk in result.missing if chunk.id not in mapped_ids]
+    if result.complete or not remaining or result.budget_exhausted:
+        return []
+    if result.partial:
+        if len(remaining) == 1:
+            return [remaining]
+        left, right = split_map_batch(remaining)
         stats.map_batches_split += 1
         stats.notes.append(
             sanitize_failure_note(
-                f"{reason}: {len(items)}-chunk request was split into "
-                f"{len(left)} + {len(right)}"
+                f"map batch {batch_tag}: {len(remaining)}-chunk request was "
+                f"split into {len(left)} + {len(right)}"
             )
         )
-        enqueue([left, right])
-
-    while queue:
-        current = queue.popleft()
-        current = [chunk for chunk in current if chunk.id not in mapped_ids]
-        if not current:
-            continue
-        if stats.map_attempts >= MAX_MAP_ATTEMPTS:
-            _record_map_budget_exhausted(stats)
-            continue
-        serial += 1
-        tag = batch_tag if serial == 1 and not queue else f"{batch_tag}.{serial}"
-        result = execute_map_request(
-            corpus=corpus,
-            batch=current,
-            store=store,
-            map_prompt=map_prompt,
-            call_model=call_model,
-            stats=stats,
-            batch_tag=tag,
-            max_request_chars=max_request_chars,
+        return [part for part in (left, right) if part]
+    if len(current) == 1:
+        chunk_id = current[0].id
+        retries = single_failures.get(chunk_id, 0)
+        if retries < MAP_MISSING_CHUNK_RETRIES:
+            single_failures[chunk_id] = retries + 1
+            return [current]
+        stats.notes.append(
+            sanitize_failure_note(
+                f"map chunk {chunk_id} left uncovered after retry"
+            )
         )
-        for chunk in result.acknowledged:
-            if chunk.id in mapped_ids:
-                continue
-            mapped_ids.add(chunk.id)
-            analyzed.append(chunk)
-        if result.complete:
-            continue
-        remaining = [chunk for chunk in result.missing if chunk.id not in mapped_ids]
-        if not remaining:
-            continue
-        if result.budget_exhausted:
-            continue
-        if result.partial:
-            if len(remaining) == 1:
-                enqueue([remaining])
-            else:
-                split_and_enqueue(remaining, f"map batch {tag}")
-            continue
-        if len(current) == 1:
-            chunk_id = current[0].id
-            retries = single_failures.get(chunk_id, 0)
-            if retries < MAP_MISSING_CHUNK_RETRIES:
-                single_failures[chunk_id] = retries + 1
-                enqueue([current])
-            else:
-                stats.notes.append(
-                    sanitize_failure_note(
-                        f"map chunk {chunk_id} left uncovered after retry"
-                    )
-                )
-            continue
-        split_and_enqueue(current, f"map batch {tag}")
-    return analyzed
+        return []
+    left, right = split_map_batch(current)
+    stats.map_batches_split += 1
+    stats.notes.append(
+        sanitize_failure_note(
+            f"map batch {batch_tag}: {len(current)}-chunk request was split "
+            f"into {len(left)} + {len(right)}"
+        )
+    )
+    return [part for part in (left, right) if part]
 
 
-def _run_map_batch(
+def _plan_primary_map_work(
     *,
     corpus: ReviewCorpus,
-    batch: list[ContextChunk],
+    packed: list[list[ContextChunk]],
+    max_request_chars: int,
+    stats: PipelineStats,
+) -> list[MapWorkItem]:
+    items: list[MapWorkItem] = []
+    sequence = 0
+    for index, batch in enumerate(packed, 1):
+        plan = plan_requests(
+            batch,
+            lambda chunks: format_map_user_message(corpus, chunks),
+            max_request_chars,
+            max_chunks=MAX_MAP_CHUNKS_PER_CALL,
+        )
+        stats.batches += len(plan.batches)
+        for chunk in plan.oversized:
+            stats.notes.append(
+                f"Merge Warden could not analyze chunk {chunk.id} within the "
+                f"configured request limit of {max_request_chars} characters; "
+                "left uncovered"
+            )
+        split = len(plan.batches) > 1 or bool(plan.oversized)
+        for sub_index, request in enumerate(plan.batches, 1):
+            sequence += 1
+            tag = (
+                f"{index}/{len(packed)}.{sub_index}"
+                if split
+                else f"{index}/{len(packed)}"
+            )
+            items.append(
+                MapWorkItem(
+                    chunks=list(request.chunks),
+                    batch_tag=tag,
+                    sequence=sequence,
+                    message=request.message,
+                )
+            )
+    return items
+
+
+def run_map_stage(
+    *,
+    corpus: ReviewCorpus,
+    packed: list[list[ContextChunk]],
     store: EvidenceStore,
     map_prompt: str,
     call_model: CallModel,
     stats: PipelineStats,
-    batch_tag: str,
     max_request_chars: int,
-) -> list[ContextChunk]:
-    """Plan ``batch`` by serialized size and chunk count, then map it."""
-    plan = plan_requests(
-        batch,
-        lambda chunks: format_map_user_message(corpus, chunks),
-        max_request_chars,
-        max_chunks=MAX_MAP_CHUNKS_PER_CALL,
+    map_concurrency: int,
+) -> MapStageResult:
+    """Map packed chunks with bounded parallel provider calls.
+
+    Independent batches share a worker pool. ``call_model()`` may overlap.
+    ``ingest_map_result()`` and stats updates stay on this thread in
+    sequence order so completion order cannot change evidence identity.
+    """
+    concurrency = normalize_map_concurrency(map_concurrency)
+    pending: deque[MapWorkItem] = deque(
+        _plan_primary_map_work(
+            corpus=corpus,
+            packed=packed,
+            max_request_chars=max_request_chars,
+            stats=stats,
+        )
     )
-    stats.batches += len(plan.batches)
-    for chunk in plan.oversized:
-        stats.notes.append(
-            f"Merge Warden could not analyze chunk {chunk.id} within the "
-            f"configured request limit of {max_request_chars} characters; "
-            "left uncovered"
+    if pending:
+        print(
+            f"Mapping {len(pending)} planned batch(es) with concurrency {concurrency}",
+            flush=True,
         )
+
+    mapped_ids: set[str] = set()
     analyzed: list[ContextChunk] = []
-    split = len(plan.batches) > 1 or bool(plan.oversized)
-    for sub_index, request in enumerate(plan.batches, 1):
-        if stats.map_attempts >= MAX_MAP_ATTEMPTS:
-            _record_map_budget_exhausted(stats)
-            break
-        tag = f"{batch_tag}.{sub_index}" if split else batch_tag
-        analyzed.extend(
-            map_batch_resilient(
-                corpus=corpus,
-                batch=request.chunks,
-                store=store,
-                map_prompt=map_prompt,
-                call_model=call_model,
-                stats=stats,
-                batch_tag=tag,
-                max_request_chars=max_request_chars,
+    single_failures: dict[str, int] = {}
+    follow_up_serial: dict[str, int] = {}
+    next_sequence = pending[-1].sequence if pending else 0
+    next_ingest = 1
+    completed: dict[int, MapWorkerResult] = {}
+    in_flight: dict[int, Future[MapWorkerResult]] = {}
+    deadline_error: PipelineDeadlineExceeded | None = None
+
+    def enqueue(parts: list[list[ContextChunk]], parent_tag: str) -> None:
+        nonlocal next_sequence
+        for part in parts:
+            leftover = [chunk for chunk in part if chunk.id not in mapped_ids]
+            if not leftover:
+                continue
+            follow_up_serial[parent_tag] = follow_up_serial.get(parent_tag, 1) + 1
+            next_sequence += 1
+            pending.append(
+                MapWorkItem(
+                    chunks=leftover,
+                    batch_tag=f"{parent_tag}.{follow_up_serial[parent_tag]}",
+                    sequence=next_sequence,
+                    message=format_map_user_message(corpus, leftover),
+                )
             )
-        )
-    return analyzed
+
+    def abandon_pending() -> None:
+        while pending:
+            leftover = pending.popleft()
+            completed.setdefault(
+                leftover.sequence,
+                MapWorkerResult(item=leftover, skipped=True),
+            )
+
+    def stop_scheduling(error: PipelineDeadlineExceeded | None = None) -> None:
+        nonlocal deadline_error
+        if error is not None:
+            deadline_error = deadline_error or error
+        abandon_pending()
+
+    executor = ThreadPoolExecutor(
+        max_workers=concurrency,
+        thread_name_prefix="mw-map",
+    )
+    try:
+        while pending or in_flight or completed:
+            while (
+                pending
+                and len(in_flight) < concurrency
+                and deadline_error is None
+            ):
+                item = pending.popleft()
+                item.chunks = [
+                    chunk for chunk in item.chunks if chunk.id not in mapped_ids
+                ]
+                if not item.chunks:
+                    completed[item.sequence] = MapWorkerResult(
+                        item=item, skipped=True
+                    )
+                    continue
+                if not item.message:
+                    item.message = format_map_user_message(corpus, item.chunks)
+                print(
+                    f"Map batch {item.batch_tag}: {len(item.chunks)} chunk(s), "
+                    f"{sum(chunk.size for chunk in item.chunks)} chunk chars, "
+                    f"{len(item.message)} request chars "
+                    f"({len(in_flight) + 1} in flight)",
+                    flush=True,
+                )
+                if len(item.message) > max_request_chars:
+                    completed[item.sequence] = MapWorkerResult(
+                        item=item,
+                        oversized=True,
+                    )
+                    continue
+                if stats.map_attempts >= MAX_MAP_ATTEMPTS:
+                    _record_map_budget_exhausted(stats)
+                    completed[item.sequence] = MapWorkerResult(
+                        item=item, skipped=True
+                    )
+                    abandon_pending()
+                    break
+                stats.map_attempts += 1
+                in_flight[item.sequence] = executor.submit(
+                    _map_worker,
+                    item,
+                    map_prompt,
+                    call_model,
+                )
+
+            while next_ingest in completed:
+                result = completed.pop(next_ingest)
+                next_ingest += 1
+                if result.skipped:
+                    continue
+                if isinstance(result.error, PipelineDeadlineExceeded):
+                    stop_scheduling(result.error)
+                    print(
+                        f"Map batch {result.item.batch_tag}: deadline exhausted "
+                        f"after {result.elapsed_seconds:.1f}s",
+                        flush=True,
+                    )
+                    continue
+                attempt = apply_map_response(store, stats, result)
+                print(
+                    f"Map batch {result.item.batch_tag}: ingested "
+                    f"{len(attempt.acknowledged)}/{len(result.item.chunks)} "
+                    f"chunk(s) in {result.elapsed_seconds:.1f}s",
+                    flush=True,
+                )
+                for chunk in attempt.acknowledged:
+                    if chunk.id in mapped_ids:
+                        continue
+                    mapped_ids.add(chunk.id)
+                    analyzed.append(chunk)
+                if deadline_error is not None:
+                    continue
+                if stats.map_attempts >= MAX_MAP_ATTEMPTS:
+                    _record_map_budget_exhausted(stats)
+                    continue
+                enqueue(
+                    _follow_up_batches(
+                        attempt,
+                        result.item.chunks,
+                        mapped_ids,
+                        single_failures,
+                        stats,
+                        result.item.batch_tag,
+                    ),
+                    result.item.batch_tag,
+                )
+
+            if not in_flight:
+                if deadline_error is not None or stats.map_attempts >= MAX_MAP_ATTEMPTS:
+                    abandon_pending()
+                if not pending and not completed:
+                    break
+                if next_ingest not in completed and completed:
+                    next_ingest += 1
+                    continue
+                continue
+
+            done, _ = wait(
+                list(in_flight.values()),
+                return_when=FIRST_COMPLETED,
+            )
+            for future in done:
+                sequence = next(
+                    seq for seq, inflight in in_flight.items() if inflight is future
+                )
+                in_flight.pop(sequence)
+                worker_result = future.result()
+                completed[sequence] = worker_result
+                if isinstance(worker_result.error, PipelineDeadlineExceeded):
+                    stop_scheduling(worker_result.error)
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    return MapStageResult(analyzed=analyzed, deadline_error=deadline_error)
 
 
 def _mark_incomplete_validation(
@@ -1580,6 +1747,7 @@ def run_hierarchical_review(
     max_map_request_chars: int,
     max_reduce_request_chars: int,
     map_overhead_chars: int,
+    map_concurrency: int = DEFAULT_MAP_CONCURRENCY,
 ) -> tuple[dict, CoverageReport, EvidenceStore, PipelineStats]:
     stats = PipelineStats(
         chunks=len(corpus.reviewable_chunks),
@@ -1598,34 +1766,31 @@ def run_hierarchical_review(
         return review, coverage, store, stats
 
     # Overhead is a packing hint only. Actual serialized requests are split
-    # and bounded in `_run_map_batch` before every provider call.
+    # and bounded in `run_map_stage` before every provider call.
     payload_limit = max(max_map_request_chars - map_overhead_chars, 1)
     packed = pack_chunks(corpus.reviewable_chunks, payload_limit)
     analyzed: list[ContextChunk] = []
 
-    for index, batch in enumerate(packed, 1):
-        try:
-            analyzed.extend(
-                _run_map_batch(
-                    corpus=corpus,
-                    batch=batch,
-                    store=store,
-                    map_prompt=map_prompt,
-                    call_model=call_model,
-                    stats=stats,
-                    batch_tag=f"{index}/{len(packed)}",
-                    max_request_chars=max_map_request_chars,
-                )
-            )
-        except PipelineDeadlineExceeded as exc:
-            return _deadline_result(
-                corpus=corpus,
-                coverage=coverage,
-                store=store,
-                stats=stats,
-                analyzed=analyzed,
-                error=exc,
-            )
+    map_result = run_map_stage(
+        corpus=corpus,
+        packed=packed,
+        store=store,
+        map_prompt=map_prompt,
+        call_model=call_model,
+        stats=stats,
+        max_request_chars=max_map_request_chars,
+        map_concurrency=map_concurrency,
+    )
+    analyzed.extend(map_result.analyzed)
+    if map_result.deadline_error is not None:
+        return _deadline_result(
+            corpus=corpus,
+            coverage=coverage,
+            store=store,
+            stats=stats,
+            analyzed=analyzed,
+            error=map_result.deadline_error,
+        )
 
     mark_chunks_covered(coverage, analyzed)
     stats.map_chunks_acknowledged = len(analyzed)
