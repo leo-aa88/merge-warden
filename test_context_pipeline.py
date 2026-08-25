@@ -73,6 +73,7 @@ from review_pipeline import (
     hierarchical_reduce,
     ingest_map_result,
     join_confidence,
+    join_severity,
     map_stage_deadline,
     normalize_map_concurrency,
     normalize_validation_concurrency,
@@ -4256,6 +4257,42 @@ class ReducerDecisionValidationTests(unittest.TestCase):
         self._assert_known_identities(store)
 
 
+class SeverityCanonicalizationTests(unittest.TestCase):
+    """Mapper aliases must share posting's BLOCKING | MAJOR | MINOR vocabulary."""
+
+    def _parse(self, **raw: object) -> Finding:
+        payload = {"body": "defect", **raw}
+        parsed = rp._parse_finding(payload, "diff:a.c:1", set(), {})
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        return parsed
+
+    def test_canonical_severity_maps_blocker_alias_and_unknowns(self) -> None:
+        self.assertEqual(rp.canonical_severity("blocker"), "BLOCKING")
+        self.assertEqual(rp.canonical_severity("BLOCKER"), "BLOCKING")
+        self.assertEqual(rp.canonical_severity("blocking"), "BLOCKING")
+        self.assertEqual(rp.canonical_severity("MAJOR"), "MAJOR")
+        self.assertEqual(rp.canonical_severity("CRITICAL"), "MINOR")
+        self.assertEqual(rp.canonical_severity("HIGH"), "MINOR")
+        self.assertEqual(rp.canonical_severity(""), "MINOR")
+        self.assertEqual(rp.canonical_severity(None), "MINOR")
+        self.assertEqual(rp.canonical_severity("suggestion"), "MINOR")
+
+    def test_parse_finding_stores_canonical_severity(self) -> None:
+        self.assertEqual(self._parse(severity="blocker").severity, "BLOCKING")
+        self.assertEqual(self._parse(severity="BLOCKER").severity, "BLOCKING")
+        self.assertEqual(self._parse(severity="CRITICAL").severity, "MINOR")
+        self.assertEqual(self._parse().severity, "MINOR")
+        self.assertEqual(self._parse(severity="").severity, "MINOR")
+
+    def test_join_severity_blocker_beats_minor_and_returns_blocking(self) -> None:
+        blocker = _finding("b", severity="BLOCKER")
+        minor = _finding("m", severity="MINOR")
+        self.assertEqual(join_severity([blocker, minor]), "BLOCKING")
+        self.assertEqual(join_severity([minor, blocker]), "BLOCKING")
+        self.assertEqual(join_severity([blocker]), "BLOCKING")
+
+
 class ReducerEvidentiaryStrengthTests(unittest.TestCase):
     """Valid merges must not weaken the surviving representative."""
 
@@ -6070,6 +6107,24 @@ class ParallelValidationSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(validation_path_sort_key(major_likely, 3)[2], 3)
 
+    def test_validation_path_sort_key_ranks_blocker_alias_with_blocking(self) -> None:
+        blocker = [_finding("B", severity="BLOCKER", confidence="LIKELY")]
+        blocking = [_finding("K", severity="BLOCKING", confidence="LIKELY")]
+        minor = [_finding("N", severity="MINOR", confidence="LIKELY")]
+        self.assertLess(
+            validation_path_sort_key(blocker, 9),
+            validation_path_sort_key(minor, 0),
+        )
+        self.assertEqual(
+            validation_path_sort_key(blocker, 3)[:2],
+            validation_path_sort_key(blocking, 3)[:2],
+        )
+        self.assertFalse(
+            validation_path_sort_key(minor, 0)
+            < validation_path_sort_key(blocker, 9),
+            "MINOR must not be scheduled ahead of a BLOCKER alias",
+        )
+
     def test_plan_validation_tasks_reorders_minor_ahead_of_blocking(self) -> None:
         store = EvidenceStore()
         store.findings["minor"] = _finding("minor", severity="MINOR")
@@ -6090,6 +6145,28 @@ class ParallelValidationSchedulerTests(unittest.TestCase):
         self.assertEqual(
             [task.path for task in tasks],
             ["include/blocking.h", "include/minor.h"],
+        )
+
+    def test_plan_validation_tasks_orders_blocker_alias_ahead_of_minor(self) -> None:
+        store = EvidenceStore()
+        store.findings["blocker"] = _finding("blocker", severity="BLOCKER")
+        store.findings["minor"] = _finding("minor", severity="MINOR")
+        store.needs_context = [
+            rp.ContextNeed(
+                path="include/minor.h",
+                reason="low value",
+                finding_ids=["minor"],
+            ),
+            rp.ContextNeed(
+                path="include/blocker.h",
+                reason="root cause",
+                finding_ids=["blocker"],
+            ),
+        ]
+        tasks = plan_validation_tasks(store)
+        self.assertEqual(
+            [task.path for task in tasks],
+            ["include/blocker.h", "include/minor.h"],
         )
 
     def test_plan_validation_tasks_orders_by_joined_merge_class_severity(self) -> None:
