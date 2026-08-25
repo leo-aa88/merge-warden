@@ -546,10 +546,11 @@ def map_call_seconds_needed(http_timeout: float | None = None) -> float:
     """Wall clock one map dispatch may consume, given its HTTP timeout.
 
     This is the map stage's single funding contract. Retry planning, the
-    enqueue gate and the dispatch gate all size work with this one function,
-    so a retry cannot be admitted under one budget and refused under another.
-    Two nearby formulas with different margins would silently recreate the bug
-    this scheduler exists to avoid: work abandoned while time remained.
+    enqueue gate, the dispatch gate, and the backoff-sleep gate all size work
+    with this one function, so a retry cannot be admitted under one budget and
+    refused under another. Two nearby formulas with different margins would
+    silently recreate the bug this scheduler exists to avoid: work abandoned
+    while time remained.
 
     ``None`` means the standard map call, which is bounded by its own logical
     budget rather than by a per-item timeout.
@@ -2461,15 +2462,19 @@ def run_map_stage(
 
         Returns False when waiting would leave too little time to dispatch the
         batch afterwards, in which case the stage is exhausted and the deferred
-        work stays uncovered rather than eating a downstream reserve.
+        work stays uncovered rather than eating a downstream reserve. The leftover
+        is sized with ``map_call_seconds_needed`` for the earliest item, the same
+        envelope dispatch will demand once it wakes.
         """
         if not pending:
             return False
-        delay = min(candidate.ready_at for candidate in pending) - time.monotonic()
+        earliest = min(pending, key=lambda candidate: candidate.ready_at)
+        delay = earliest.ready_at - time.monotonic()
         if delay <= 0:
             return True
         remaining = remaining_map_seconds()
-        if remaining is not None and remaining - delay < MAP_CALL_BUDGET_SECONDS:
+        needed = map_call_seconds_needed(earliest.http_timeout)
+        if remaining is not None and remaining - delay < needed:
             # Sleeping would only burn time validation could still use.
             exhaust_map_stage()
             return False

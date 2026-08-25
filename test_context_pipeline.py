@@ -5815,6 +5815,71 @@ class MapRetryBudgetTests(unittest.TestCase):
             stats.notes,
         )
 
+    def test_capacity_retry_is_refused_when_backoff_would_leave_less_than_a_call(
+        self,
+    ) -> None:
+        """A Retry-After that would leave 149s must not be slept out.
+
+        Planning and the sleep gate both size the leftover against
+        ``map_call_seconds_needed``. Sleeping 4s and then skipping the retry
+        would burn time validation could still use.
+        """
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        delay = MAP_CAPACITY_BACKOFF_SECONDS[0]
+        leftover = rp.map_call_seconds_needed() - 1.0
+        attempts: list[float | None] = []
+        fake = self._single_chunk_model(
+            clock,
+            attempts,
+            lambda: ProviderRequestError(
+                ProviderFailureKind.CAPACITY,
+                "Gemini HTTP 503: high demand",
+                retry_after_seconds=delay,
+            ),
+            cost=420.0 - leftover - delay,
+            fail_times=99,
+        )
+
+        (_review, coverage, _store, stats), slept = self._clocked_run(
+            corpus, fake, clock, deadline
+        )
+        self.assertFalse(coverage.complete)
+        self.assertEqual(attempts, [None])
+        self.assertEqual(slept, [])
+        self.assertEqual(stats.map_capacity_retries, 0)
+
+    def test_capacity_retry_waits_when_the_dispatch_envelope_still_fits(
+        self,
+    ) -> None:
+        """The inverse: leftover exactly equal to a call budget must still sleep."""
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        delay = MAP_CAPACITY_BACKOFF_SECONDS[0]
+        leftover = rp.map_call_seconds_needed()
+        attempts: list[float | None] = []
+        fake = self._single_chunk_model(
+            clock,
+            attempts,
+            lambda: ProviderRequestError(
+                ProviderFailureKind.CAPACITY,
+                "Gemini HTTP 503: high demand",
+                retry_after_seconds=delay,
+            ),
+            cost=420.0 - leftover - delay,
+            fail_times=1,
+        )
+
+        (_review, coverage, _store, stats), slept = self._clocked_run(
+            corpus, fake, clock, deadline
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(slept, [delay])
+        self.assertEqual(stats.map_capacity_retries, 1)
+
     def test_multi_chunk_capacity_failure_never_splits(self) -> None:
         """Splitting doubles the request rate against a load-shedding provider.
 

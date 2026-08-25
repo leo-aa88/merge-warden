@@ -293,15 +293,18 @@ waiting out capacity backoff, so one flapping batch cannot sleep away the
 allocation that other batches still need.
 
 Every retry is bounded by the **remaining map budget**, not by a fixed counter.
-Merge Warden schedules another attempt only when the stage can still fund one of
-roughly the observed cost, so a chunk is abandoned because time ran out rather
-than because a counter did. Fixed ceilings remain as safety rails against a
-provider that rejects instantly; they are counted per chunk, so splitting a
-batch does not hand its halves a fresh retry allowance. A map call is not
-started unless its
-own call budget remains, which for a widened retry is larger than the standard
-one; a widened retry that no longer fits leaves its chunk uncovered rather than
-re-running under the clock that already failed.
+Merge Warden schedules another attempt only when the stage can still fund the
+same dispatch envelope the call will consume: the standard 150s call budget, or
+the widened HTTP timeout plus its 10s margin, plus any capacity backoff still
+owed. The elapsed time of the attempt that just failed is sunk cost and is not
+part of that question — a 24s 503 does not retry because 24s remains; it retries
+because a full call envelope plus backoff still fits. Fixed ceilings remain as
+a second, independent bound against a provider that rejects instantly; either
+bound is enough to give up. They are counted per chunk, so splitting a batch
+does not hand its halves a fresh retry allowance. A map call is not started
+unless that same envelope still fits, which for a widened retry is larger than
+the standard one; a widened retry that no longer fits leaves its chunk uncovered
+rather than re-running under the clock that already failed.
 
 When a capacity retry or a widened latency retry happens, the pipeline footer
 in `merge-warden.md` reports it, so these paths are visible in the job log.
