@@ -46,15 +46,12 @@ VALIDATION_RESERVE_SECONDS = 150
 REDUCE_RESERVE_SECONDS = 120
 SYNTHESIS_RESERVE_SECONDS = 150
 # Map calls get a tighter latency budget than the whole provider window so a
-# slow batch splits while downstream reserves are still intact. HTTP timeout
-# stays at or below the logical call budget; attempts=1 so a timed-out
-# inference is not retried as the same expensive prompt before the split.
-MAP_CALL_BUDGET_SECONDS = 150
-MAP_HTTP_TIMEOUT_SECONDS = 140
-MAP_HTTP_ATTEMPTS = 1
+# slow batch splits while downstream reserves are still intact.
+MAP_CALL_BUDGET_SECONDS = 120
+MAP_HTTP_TIMEOUT_SECONDS = 90
+MAP_HTTP_ATTEMPTS = 2
 # Soft packing target in chunk characters. Hard request limits still win.
-# 16k keeps typical Grok 4.6 map latency inside MAP_CALL_BUDGET_SECONDS.
-MAP_SOFT_REQUEST_TARGET_CHARS = 16_000
+MAP_SOFT_REQUEST_TARGET_CHARS = 32_000
 CANDIDATE_FINDINGS_NOT_POSTED = (
     "Candidate findings were intentionally not posted as inline comments "
     "because final synthesis did not complete."
