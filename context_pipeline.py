@@ -173,6 +173,11 @@ def split_text_by_lines(text: str, limit: int) -> list[str]:
 
 
 def _line_span(text: str, start_line: int | None) -> tuple[int | None, int | None]:
+    """Inclusive source-line span from newline count.
+
+    Diff chunks must not use this: headers, ``@@``, and ``-`` lines are not
+    new-file lines. See ``_diff_line_span``.
+    """
     if start_line is None:
         return None, None
     count = text.count("\n")
@@ -202,6 +207,99 @@ def _make_chunk(
         end_line=end,
         member_ids=[chunk_id],
     )
+
+
+def _diff_line_span(
+    text: str,
+    left: int | None = None,
+    right: int | None = None,
+    resume: bool = False,
+) -> tuple[int | None, int | None, int | None, int | None]:
+    """File-line span of unified-diff text, plus cursors after the last body line.
+
+    Prefers the new-file (RIGHT) range covered by ``+`` and context lines.
+    LEFT-only deletion fragments fall back to old-file lines so the chunk is
+    not labeled with a raw newline count. ``left``/``right`` continue a
+    mid-hunk split that has no ``@@`` header of its own. ``resume`` skips the
+    remainder of a line already counted when ``split_text_by_lines`` hard-split
+    it; that tail must not be parsed as a new context line.
+    """
+    if resume:
+        newline = text.find("\n")
+        if newline == -1:
+            return None, None, left, right
+        text = text[newline + 1 :]
+    first_right: int | None = None
+    last_right: int | None = None
+    first_left: int | None = None
+    last_left: int | None = None
+    in_hunk = left is not None or right is not None
+    for raw in text.splitlines():
+        if raw.startswith("@@"):
+            match = HUNK_RE.match(raw)
+            if match:
+                left = int(match.group(1))
+                right = int(match.group(3))
+                in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if raw.startswith("\\"):
+            continue
+        if raw.startswith("+"):
+            if right is not None:
+                if first_right is None:
+                    first_right = right
+                last_right = right
+                right += 1
+            continue
+        if raw.startswith("-"):
+            if left is not None:
+                if first_left is None:
+                    first_left = left
+                last_left = left
+                left += 1
+            continue
+        if right is not None:
+            if first_right is None:
+                first_right = right
+            last_right = right
+            right += 1
+        if left is not None:
+            if first_left is None:
+                first_left = left
+            last_left = left
+            left += 1
+    if first_right is not None and last_right is not None:
+        return first_right, last_right, left, right
+    if first_left is not None and last_left is not None:
+        return first_left, last_left, left, right
+    return None, None, left, right
+
+
+def _make_diff_chunk(
+    prefix: str,
+    index: int,
+    source: str,
+    text: str,
+    left: int | None = None,
+    right: int | None = None,
+    resume: bool = False,
+) -> tuple[ContextChunk, int | None, int | None]:
+    start, end, left, right = _diff_line_span(
+        text, left=left, right=right, resume=resume
+    )
+    chunk_id = f"{prefix}:{index}"
+    chunk = ContextChunk(
+        id=chunk_id,
+        kind="diff",
+        source=source,
+        text=text,
+        start_line=start,
+        end_line=end,
+        member_ids=[chunk_id],
+    )
+    return chunk, left, right
 
 
 def chunk_text(
@@ -356,47 +454,42 @@ def chunk_diff(diff: str, limit: int) -> list[ContextChunk]:
         prefix = f"diff:{path}"
         index = 1
         pending_parts: list[str] = []
-        pending_start: int | None = None
         pending_size = 0
 
         def flush() -> None:
-            nonlocal pending_parts, pending_start, pending_size, index
+            nonlocal pending_parts, pending_size, index
             if not pending_parts:
                 return
-            chunk = _make_chunk(
-                prefix, index, "diff", path, "".join(pending_parts), pending_start
-            )
+            chunk, _, _ = _make_diff_chunk(prefix, index, path, "".join(pending_parts))
             chunks.append(chunk)
             index += 1
             pending_parts = []
-            pending_start = None
             pending_size = 0
 
-        def emit_oversized(text: str, start: int | None) -> None:
+        def emit_oversized(text: str) -> None:
             nonlocal index
-            offset = start
+            left: int | None = None
+            right: int | None = None
+            resume = False
             for part in split_text_by_lines(text, limit):
-                chunks.append(_make_chunk(prefix, index, "diff", path, part, offset))
+                chunk, left, right = _make_diff_chunk(
+                    prefix, index, path, part, left=left, right=right, resume=resume
+                )
+                chunks.append(chunk)
                 index += 1
-                if offset is not None:
-                    lines = part.count("\n")
-                    if part and not part.endswith("\n"):
-                        lines += 1
-                    offset += lines
+                resume = bool(part) and not part.endswith("\n")
 
-        for hunk_text, hunk_start in hunks:
+        for hunk_text, _ in hunks:
             candidate = header + hunk_text if not pending_parts else hunk_text
             if not pending_parts and len(header + hunk_text) > limit:
-                emit_oversized(header + hunk_text, hunk_start)
+                emit_oversized(header + hunk_text)
                 continue
             if pending_parts and pending_size + len(hunk_text) > limit:
                 flush()
                 candidate = header + hunk_text
                 if len(candidate) > limit:
-                    emit_oversized(candidate, hunk_start)
+                    emit_oversized(candidate)
                     continue
-            if not pending_parts:
-                pending_start = hunk_start
             pending_parts.append(candidate)
             pending_size += len(candidate)
         flush()
