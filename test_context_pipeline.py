@@ -56,6 +56,8 @@ from review_pipeline import (
     MAX_VALIDATION_CALLS,
     MAX_VALIDATION_CONCURRENCY,
     MAP_CALL_BUDGET_SECONDS,
+    MAP_CALL_BUDGET_MARGIN_SECONDS,
+    MAP_MIN_REPAIR_SECONDS,
     MAP_SOFT_REQUEST_TARGET_CHARS,
     PROVIDER_CIRCUIT_FAILURE_THRESHOLD,
     PROVIDER_CIRCUIT_MIN_INDEPENDENT_REQUESTS,
@@ -4358,7 +4360,60 @@ class MapSchedulerInvariantTests(unittest.TestCase):
         self.assertTrue(stats.map_deadline_exhausted)
         self.assertEqual(stats.synthesis_calls, 1)
 
-    def test_child_batches_are_not_started_without_a_full_call_budget(self) -> None:
+    def test_child_batches_start_as_coverage_repair_in_the_stranded_tail(
+        self,
+    ) -> None:
+        """A leftover just under a full call budget used to refuse splits.
+
+        Those halves were never tried as their own requests. Remaining 149s
+        is above the repair floor, so they start under a shortened clock.
+        """
+        chunks = _tiny_chunks(8)
+        corpus = _synthetic_corpus(chunks)
+        clock = {"now": 10_000.0}
+        provider_deadline = clock["now"] + 840.0
+        map_cutoff = map_stage_deadline(provider_deadline)
+        started: list[int] = []
+        timeouts: list[float | None] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                started.append(len(ids))
+                timeouts.append(rp.map_call_timeout_override.get())
+                if len(ids) >= 8:
+                    clock["now"] = map_cutoff - (MAP_CALL_BUDGET_SECONDS - 1.0)
+                    raise RuntimeError("map call exceeded latency budget")
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n\nPartial.\n", "comments": []}
+            )
+
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            _review, coverage, _store, stats = _run_hierarchical(
+                corpus, fake, deadline=provider_deadline
+            )
+        self.assertGreater(len(started), 1)
+        self.assertEqual(started[0], 8)
+        self.assertTrue(any(size < 8 for size in started[1:]), started)
+        repair_timeouts = [item for item in timeouts[1:] if item is not None]
+        self.assertTrue(repair_timeouts)
+        leftover = MAP_CALL_BUDGET_SECONDS - 1.0
+        for timeout in repair_timeouts:
+            self.assertAlmostEqual(
+                timeout,
+                leftover - MAP_CALL_BUDGET_MARGIN_SECONDS,
+                delta=0.01,
+            )
+            self.assertLess(timeout, MAP_HTTP_TIMEOUT_SECONDS)
+        self.assertGreater(stats.map_repair_attempts, 0)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.synthesis_calls, 1)
+
+    def test_child_batches_are_not_started_below_the_repair_floor(self) -> None:
         chunks = _tiny_chunks(8)
         corpus = _synthetic_corpus(chunks)
         clock = {"now": 10_000.0}
@@ -4372,10 +4427,10 @@ class MapSchedulerInvariantTests(unittest.TestCase):
                 ids = _chunk_ids_in_prompt(user)
                 started.append(len(ids))
                 if len(ids) >= 8:
-                    clock["now"] = map_cutoff - (MAP_CALL_BUDGET_SECONDS - 1.0)
+                    clock["now"] = map_cutoff - (MAP_MIN_REPAIR_SECONDS - 1.0)
                     raise RuntimeError("map call exceeded latency budget")
                 raise AssertionError(
-                    "child map calls must not start without a full call budget"
+                    "child map calls must not start below the repair floor"
                 )
             if stage in {"pre-reduce", "reduce"}:
                 return json.dumps({"keep": [], "reject": [], "merge": []})
@@ -4384,10 +4439,12 @@ class MapSchedulerInvariantTests(unittest.TestCase):
             )
 
         with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
-            _review, _coverage, _store, stats = _run_hierarchical(
+            _review, coverage, _store, stats = _run_hierarchical(
                 corpus, fake, deadline=provider_deadline
             )
         self.assertEqual(started, [8])
+        self.assertEqual(stats.map_repair_attempts, 0)
+        self.assertFalse(coverage.complete)
         self.assertTrue(stats.map_deadline_exhausted)
         self.assertEqual(stats.synthesis_calls, 1)
 
@@ -6498,6 +6555,440 @@ class MapRetryBudgetTests(unittest.TestCase):
             rp.escalated_map_timeout(rp.MAP_MAX_HTTP_TIMEOUT_SECONDS, budget)
         )
         self.assertIsNone(rp.escalated_map_timeout(10_000.0, budget))
+
+
+class MapCoverageRepairTests(unittest.TestCase):
+    """Issue #74: spend the stranded map tail on uncovered chunks.
+
+    The dispatch gate used to demand a full 150s envelope, so leftover
+    sub-150s map time was surrendered to validation even though uncovered
+    chunks made APPROVE unreachable. Every recovery case here has an inverse
+    so "always attempt" cannot pass the suite.
+    """
+
+    def _clocked_run(self, corpus, fake, clock, deadline, **kwargs):
+        slept: list[float] = []
+
+        def fake_sleep(seconds: float) -> None:
+            slept.append(seconds)
+            clock["now"] += seconds
+
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            with mock.patch.object(rp.time, "sleep", fake_sleep):
+                outcome = _run_hierarchical(corpus, fake, deadline=deadline, **kwargs)
+        return outcome, slept
+
+    @staticmethod
+    def _separate_batch_chunks(count: int) -> list[ContextChunk]:
+        return MapRetryBudgetTests._separate_batch_chunks(count)
+
+    def _succeeding_map(self, clock, attempts, cost):
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                attempts.append(rp.map_call_timeout_override.get())
+                clock["now"] += cost
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        return fake
+
+    def test_estimate_is_conservative_until_samples_exist(self) -> None:
+        tracker = rp.MapCallLatency()
+        self.assertEqual(tracker.estimated_seconds(), float(MAP_CALL_BUDGET_SECONDS))
+        tracker.observe_success(20.0)
+        self.assertEqual(tracker.estimated_seconds(), float(MAP_CALL_BUDGET_SECONDS))
+        tracker.observe_success(20.0)
+        self.assertEqual(
+            tracker.estimated_seconds(),
+            rp.map_call_seconds_needed(estimated_seconds=20.0 * rp.MAP_LATENCY_SAFETY_FACTOR),
+        )
+
+    def test_estimate_uses_max_not_mean_so_a_fast_outlier_cannot_poison(
+        self,
+    ) -> None:
+        tracker = rp.MapCallLatency()
+        tracker.observe_success(10.0)
+        tracker.observe_success(100.0)
+        self.assertEqual(
+            tracker.estimated_seconds(),
+            rp.map_call_seconds_needed(
+                estimated_seconds=100.0 * rp.MAP_LATENCY_SAFETY_FACTOR
+            ),
+        )
+
+    def test_estimate_cannot_exceed_the_standard_call_budget(self) -> None:
+        self.assertEqual(
+            rp.map_call_seconds_needed(estimated_seconds=10_000.0),
+            float(MAP_CALL_BUDGET_SECONDS),
+        )
+
+    def test_estimate_cannot_shrink_below_the_repair_floor(self) -> None:
+        self.assertEqual(
+            rp.map_call_seconds_needed(estimated_seconds=1.0),
+            float(MAP_MIN_REPAIR_SECONDS),
+        )
+
+    def test_shortened_timeout_is_none_below_the_floor(self) -> None:
+        self.assertIsNone(
+            rp.shortened_map_http_timeout(MAP_MIN_REPAIR_SECONDS - 0.01)
+        )
+        timeout = rp.shortened_map_http_timeout(MAP_MIN_REPAIR_SECONDS)
+        self.assertIsNotNone(timeout)
+        self.assertAlmostEqual(
+            timeout,
+            MAP_MIN_REPAIR_SECONDS - MAP_CALL_BUDGET_MARGIN_SECONDS,
+        )
+
+    def test_retry_budget_uses_the_estimate_for_a_standard_follow_up(self) -> None:
+        funded = rp.RetryBudget(
+            remaining_seconds=120.0,
+            attempts_left=2,
+            estimated_call_seconds=120.0,
+        )
+        self.assertTrue(funded.can_fund())
+        starved = rp.RetryBudget(
+            remaining_seconds=119.0,
+            attempts_left=2,
+            estimated_call_seconds=120.0,
+        )
+        self.assertFalse(starved.can_fund())
+        widened = rp.RetryBudget(
+            remaining_seconds=120.0,
+            attempts_left=2,
+            estimated_call_seconds=30.0,
+        )
+        self.assertFalse(widened.can_fund(MAP_HTTP_TIMEOUT_SECONDS))
+
+    def test_min_repair_seconds_env_override(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"MERGE_WARDEN_MAP_MIN_REPAIR_SECONDS": "30"}
+        ):
+            self.assertEqual(rp.map_min_repair_seconds(), 30.0)
+        with mock.patch.dict(
+            os.environ, {"MERGE_WARDEN_MAP_MIN_REPAIR_SECONDS": "0"}
+        ):
+            self.assertEqual(rp.map_min_repair_seconds(), MAP_MIN_REPAIR_SECONDS)
+        with mock.patch.dict(
+            os.environ, {"MERGE_WARDEN_MAP_MIN_REPAIR_SECONDS": "nope"}
+        ):
+            self.assertEqual(rp.map_min_repair_seconds(), MAP_MIN_REPAIR_SECONDS)
+
+    def test_untried_sibling_is_repaired_after_a_failed_predecessor(self) -> None:
+        """A predecessor that consumes the tail must not strand a later chunk."""
+        corpus = _synthetic_corpus(self._separate_batch_chunks(2))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        attempts: list[tuple[str, float | None]] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                override = rp.map_call_timeout_override.get()
+                attempts.append((",".join(ids), override))
+                if ids == ["C1"]:
+                    clock["now"] += 272.0
+                    raise ProviderRequestError(
+                        ProviderFailureKind.LATENCY_TIMEOUT, "timed out"
+                    )
+                clock["now"] += 100.0
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        (_review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline, map_concurrency=1
+        )
+        self.assertEqual([name for name, _timeout in attempts], ["C1", "C2"])
+        self.assertIsNone(attempts[0][1])
+        self.assertIsNotNone(attempts[1][1])
+        self.assertEqual(stats.map_repair_attempts, 1)
+        self.assertIn("C2", {chunk.id for chunk in corpus.reviewable_chunks})
+        self.assertNotIn("C2", coverage.uncovered_chunk_ids)
+
+    def test_stranded_tail_covers_the_untried_chunk(self) -> None:
+        """Issue #74 row 1: 148s left, gate used to demand 150s, chunk untried."""
+        corpus = _synthetic_corpus(self._separate_batch_chunks(3))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        attempts: list[float | None] = []
+        fake = self._succeeding_map(clock, attempts, cost=136.0)
+
+        (review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline, map_concurrency=1
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(stats.map_attempts, 3)
+        self.assertEqual(stats.map_repair_attempts, 1)
+        self.assertIsNone(attempts[0])
+        self.assertIsNone(attempts[1])
+        self.assertIsNotNone(attempts[2])
+        self.assertLess(attempts[2], MAP_HTTP_TIMEOUT_SECONDS)
+        self.assertIn("coverage-repair attempt", stats.footer())
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_genuinely_exhausted_budget_still_abandons(self) -> None:
+        corpus = _synthetic_corpus(self._separate_batch_chunks(3))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        attempts: list[float | None] = []
+        fake = self._succeeding_map(clock, attempts, cost=190.0)
+
+        (review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline, map_concurrency=1
+        )
+        self.assertFalse(coverage.complete)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(stats.map_repair_attempts, 0)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertTrue(stats.map_deadline_exhausted)
+        self.assertEqual(stats.synthesis_calls, 1)
+
+    def test_floor_binds_with_zero_additional_calls(self) -> None:
+        corpus = _synthetic_corpus(self._separate_batch_chunks(3))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        map_cutoff = map_stage_deadline(deadline)
+        attempts: list[float | None] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                attempts.append(rp.map_call_timeout_override.get())
+                if len(attempts) == 2:
+                    clock["now"] = map_cutoff - (MAP_MIN_REPAIR_SECONDS - 1.0)
+                else:
+                    clock["now"] += 100.0
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        (review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline, map_concurrency=1
+        )
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(stats.map_repair_attempts, 0)
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_shortened_attempt_uses_a_shortened_clock(self) -> None:
+        corpus = _synthetic_corpus(self._separate_batch_chunks(3))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        map_cutoff = map_stage_deadline(deadline)
+        dispatched: list[tuple[float | None, float]] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                remaining = map_cutoff - clock["now"]
+                dispatched.append((rp.map_call_timeout_override.get(), remaining))
+                clock["now"] += 136.0
+                return _map_chunks_json(_chunk_ids_in_prompt(user))
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        (_review, coverage, _store, _stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline, map_concurrency=1
+        )
+        self.assertTrue(coverage.complete)
+        repair = [item for item in dispatched if item[0] is not None]
+        self.assertEqual(len(repair), 1)
+        timeout, remaining = repair[0]
+        self.assertAlmostEqual(
+            timeout, remaining - MAP_CALL_BUDGET_MARGIN_SECONDS, delta=0.01
+        )
+        self.assertNotEqual(timeout, MAP_HTTP_TIMEOUT_SECONDS)
+
+    def test_repair_cannot_delay_synthesis(self) -> None:
+        corpus = _synthetic_corpus(self._separate_batch_chunks(5))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        map_cutoff = map_stage_deadline(deadline)
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                override = rp.map_call_timeout_override.get()
+                limit = (
+                    override if override is not None else MAP_HTTP_TIMEOUT_SECONDS
+                )
+                clock["now"] += min(100.0, limit)
+                return _map_chunks_json(_chunk_ids_in_prompt(user))
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        (_review, _coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline, map_concurrency=1
+        )
+        self.assertLessEqual(clock["now"], map_cutoff)
+        self.assertGreaterEqual(deadline - clock["now"], SYNTHESIS_RESERVE_SECONDS)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertGreater(stats.map_repair_attempts, 0)
+
+    def test_failed_repair_does_not_resurrect_approve(self) -> None:
+        corpus = _synthetic_corpus(self._separate_batch_chunks(4))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        attempts: list[float | None] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                override = rp.map_call_timeout_override.get()
+                attempts.append(override)
+                if override is not None:
+                    clock["now"] += override
+                    raise ProviderRequestError(
+                        ProviderFailureKind.LATENCY_TIMEOUT, "repair timed out"
+                    )
+                clock["now"] += 136.0
+                return _map_chunks_json(_chunk_ids_in_prompt(user))
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "APPROVE", "body": "# APPROVE\n", "comments": []}
+            )
+
+        (review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline, map_concurrency=1
+        )
+        self.assertFalse(coverage.complete)
+        self.assertGreater(stats.map_repair_attempts, 0)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertTrue(stats.synthesis_calls == 1 or stats.map_deadline_exhausted)
+
+    def test_estimation_cannot_poison_the_map_cutoff(self) -> None:
+        """Two fast successes must not dispatch a full 140s socket into the tail."""
+        corpus = _synthetic_corpus(self._separate_batch_chunks(4))
+        clock = {"now": 10_000.0}
+        # 80s map window so two 5s calls leave a repair-sized remainder.
+        deadline = clock["now"] + 80.0 + 420.0
+        map_cutoff = map_stage_deadline(deadline)
+        attempts: list[float | None] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                override = rp.map_call_timeout_override.get()
+                attempts.append(override)
+                true_cost = 5.0 if len(attempts) <= 2 else 140.0
+                limit = (
+                    override if override is not None else MAP_HTTP_TIMEOUT_SECONDS
+                )
+                clock["now"] += min(true_cost, limit)
+                if true_cost > limit:
+                    raise ProviderRequestError(
+                        ProviderFailureKind.LATENCY_TIMEOUT, "slow call"
+                    )
+                return _map_chunks_json(_chunk_ids_in_prompt(user))
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        (_review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline, map_concurrency=1
+        )
+        self.assertLessEqual(clock["now"], map_cutoff)
+        self.assertGreaterEqual(deadline - clock["now"], SYNTHESIS_RESERVE_SECONDS)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertTrue(any(item is not None for item in attempts))
+        self.assertFalse(coverage.complete)
+
+    def test_open_circuit_suppresses_shortened_repair(self) -> None:
+        corpus = _synthetic_corpus(self._separate_batch_chunks(3))
+        packed = pack_map_batches(
+            corpus.reviewable_chunks,
+            max_chars=80_000,
+            max_chunks=MAX_MAP_CHUNKS_PER_CALL,
+        )
+        health = ProviderHealth()
+        health.observe_capacity_failure("a", http_status=503)
+        health.observe_capacity_failure("b", http_status=503)
+        self.assertTrue(health.observe_capacity_failure("c", http_status=503))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 80.0
+        stats = PipelineStats()
+        store = EvidenceStore()
+        calls: list[str] = []
+
+        def fake(system: str, user: str) -> str:
+            calls.append(mw.provider_call_stage(system, user))
+            raise AssertionError("repair must not run against an open circuit")
+
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            result = rp.run_map_stage(
+                corpus=corpus,
+                packed=packed,
+                store=store,
+                map_prompt="<!-- merge-warden-map -->",
+                call_model=fake,
+                stats=stats,
+                max_request_chars=80_000,
+                map_concurrency=1,
+                deadline=deadline,
+                provider_health=health,
+            )
+        self.assertEqual(calls, [])
+        self.assertEqual(stats.map_repair_attempts, 0)
+        self.assertEqual(stats.map_attempts, 0)
+        self.assertTrue(result.circuit_open)
+        self.assertTrue(health.circuit_open)
+
+    def test_permanent_error_suppresses_further_repair(self) -> None:
+        corpus = _synthetic_corpus(self._separate_batch_chunks(4))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        attempts: list[float | None] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                override = rp.map_call_timeout_override.get()
+                attempts.append(override)
+                if len(attempts) < 3:
+                    clock["now"] += 136.0
+                    return _map_chunks_json(_chunk_ids_in_prompt(user))
+                raise ProviderRequestError(
+                    ProviderFailureKind.PERMANENT_PROVIDER_ERROR,
+                    "Gemini permanent provider error: authentication or "
+                    "permission denied (HTTP 401)",
+                )
+            raise AssertionError(
+                f"later stage {stage} must not run after a permanent error"
+            )
+
+        (review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline, map_concurrency=1
+        )
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(stats.map_attempts, 3)
+        self.assertEqual(stats.map_repair_attempts, 1)
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(stats.synthesis_calls, 0)
 
 
 def _tiny_chunks(count: int, prefix: str = "C") -> list[ContextChunk]:

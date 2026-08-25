@@ -275,6 +275,21 @@ threatened. Map performs no in-call retry: a single attempt returns its failure
 to the map scheduler, which can defer a batch without holding a worker thread
 and keeps the failure classification intact.
 
+The 150s figure is a ceiling, not a requirement that every dispatch reserve the
+worst case. After two successful map calls, retry planning may size a standard
+follow-up from the slowest success times a 1.2 safety factor, still capped at
+150s and floored at 45s. Independently, while primary chunks remain uncovered
+and the remaining map window is below a full call budget but at least 45s, map
+spends that tail on a **coverage-repair** attempt whose HTTP timeout is sized
+to the remaining window (remaining minus the 10s call-budget margin). A
+shortened attempt is still an attempt: if it times out or errors, the chunk
+stays uncovered and `APPROVE` stays unreachable. Remaining time below 45s is
+abandoned honestly rather than burned on a doomed few-second call. Repair never
+consumes the reduce or synthesis reserves, and it is suppressed while the
+provider circuit is open or after a permanent provider error. Unused map time
+that repair does not use is still surrendered to later stages; the reverse
+remains forbidden.
+
 How a failed map batch recovers depends on why it failed:
 
 | Failure | Recovery |
@@ -303,6 +318,7 @@ stage budget opens it rather than sleeping the review to death.
 Every retry is bounded by the **remaining map budget**, not by a fixed counter.
 Merge Warden schedules another attempt only when the stage can still fund the
 same dispatch envelope the call will consume: the standard 150s call budget, or
+a bounded estimate of observed successful latency once enough samples exist, or
 the widened HTTP timeout plus its 10s margin, plus any capacity backoff still
 owed. The elapsed time of the attempt that just failed is sunk cost and is not
 part of that question — a 24s 503 does not retry because 24s remains; it retries
@@ -312,10 +328,14 @@ bound is enough to give up. They are counted per chunk, so splitting a batch
 does not hand its halves a fresh retry allowance. A map call is not started
 unless that same envelope still fits, which for a widened retry is larger than
 the standard one; a widened retry that no longer fits leaves its chunk uncovered
-rather than re-running under the clock that already failed.
+rather than re-running under the clock that already failed. Untried chunks in
+the tail of the map window are the exception: they may start as a coverage-repair
+attempt under a shortened clock, as described above, instead of being abandoned
+while tens of seconds remain.
 
-When a capacity retry or a widened latency retry happens, the pipeline footer
-in `merge-warden.md` reports it, so these paths are visible in the job log.
+When a capacity retry, a widened latency retry, or a coverage-repair attempt
+happens, the pipeline footer in `merge-warden.md` reports it, so these paths
+are visible in the job log.
 
 Exhausting the map-stage allocation leaves remaining primary chunks uncovered
 and **continues** into validation, reduction, and synthesis. Exhausting the
@@ -360,6 +380,9 @@ Optional environment overrides:
 | `MERGE_WARDEN_SHUTDOWN_RESERVE_SECONDS` | 60 | Time reserved for outputs and posting |
 | `MERGE_WARDEN_MAP_CONCURRENCY` | 4 | Max independent map provider requests in flight (1–8) |
 | `MERGE_WARDEN_VALIDATION_CONCURRENCY` | 2 | Max independent validation provider requests in flight (1–4) |
+| `MERGE_WARDEN_MAP_MIN_REPAIR_SECONDS` | 45 | Floor below which an uncovered chunk is abandoned rather than given a shortened map call |
+| `MERGE_WARDEN_MAP_LATENCY_SAFETY_FACTOR` | 1.2 | Multiplier on the slowest successful map call when estimating the next dispatch envelope |
+| `MERGE_WARDEN_MAP_LATENCY_ESTIMATE_SAMPLES` | 2 | Successful map calls required before the dispatch gate may use the latency estimate |
 
 GitHub review bodies and inline comments still have posting size limits
 (60k / 8k). Those are GitHub API limits, not source truncation. A review is
