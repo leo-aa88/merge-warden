@@ -285,12 +285,18 @@ How a failed map batch recovers depends on why it failed:
 | Transport fault | Re-send the same request |
 | Malformed or partial response | Split, or re-send a single chunk |
 
+Isolated capacity failures still retry. Several independent 429/503 responses from the same provider and model in one review run mean the endpoint is broadly unavailable, not that one batch was unlucky. After three capacity failures from at least two distinct logical requests, or a `Retry-After` that exceeds the remaining stage budget, Merge Warden **opens a provider circuit**: it stops scheduling new provider calls (retries, splits, remaining map batches, and later stages including synthesis), preserves evidence and coverage already collected, and fail-closes to `COMMENT`. In-flight requests may finish and their successes are still ingested. A successful response resets the failure streak, so `503 → 503 → success` does not open the circuit. Latency timeouts do not count as availability failures; the split/widen policy above is unchanged.
+
+Circuit-open is not stage-budget exhaustion. The map-stage cutoff still leaves downstream reserves intact and continues to synthesis when the provider is healthy. A provider circuit means remaining time exists but the configured provider/model is unhealthy, so Merge Warden does not call it again merely to synthesize a failure message. The pipeline footer reports `provider circuit open` separately from `map budget exhausted` and `deadline exhausted`.
+
 Capacity backoff honors a provider `Retry-After` header when present, capped at
 60s, and otherwise backs off 4s, 8s, 16s, 30s. A deferred batch does not hold a
 worker while it waits, and the scheduler only waits once no completed or
 in-flight work remains to process. The map stage spends at most 120s in total
 waiting out capacity backoff, so one flapping batch cannot sleep away the
-allocation that other batches still need.
+allocation that other batches still need. Repeated 429s across independent
+requests still feed the circuit; a `Retry-After` larger than the remaining
+stage budget opens it rather than sleeping the review to death.
 
 Every retry is bounded by the **remaining map budget**, not by a fixed counter.
 Merge Warden schedules another attempt only when the stage can still fund the
@@ -312,7 +318,9 @@ in `merge-warden.md` reports it, so these paths are visible in the job log.
 Exhausting the map-stage allocation leaves remaining primary chunks uncovered
 and **continues** into validation, reduction, and synthesis. Exhausting the
 global provider deadline still fail-closes immediately. Uncovered chunks always
-make `APPROVE` unreachable, however they came to be uncovered.
+make `APPROVE` unreachable, however they came to be uncovered. A provider
+circuit that leaves coverage or validation incomplete likewise makes `APPROVE`
+unreachable.
 
 Once a stage cutoff is reached, that stage stops scheduling new provider
 calls and the pipeline continues. Remaining cross-context checks are marked

@@ -1060,6 +1060,8 @@ class IncompletePipelinePostingTests(unittest.TestCase):
             pre_reduce_deadline_exhausted=False,
             reduce_deadline_exhausted=False,
             map_deadline_exhausted=False,
+            provider_circuit_open=False,
+            provider_circuit_reason="",
             synthesis_calls=0,
             notes=[],
         )
@@ -1299,6 +1301,35 @@ class IncompletePipelinePostingTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(payload["event"], "COMMENT")
         self.assertEqual(payload["comments"], [])
+
+    def test_provider_circuit_open_strips_inline_comments_even_when_coverage_complete(
+        self,
+    ) -> None:
+        coverage, stats = self._stats(complete=True, deadline_exhausted=False)
+        stats.provider_circuit_open = True
+        stats.synthesis_calls = 0
+        posted: list[dict] = []
+
+        def capture_post(_repo: str, _pr: str, payload: dict):
+            posted.append(payload)
+            return "COMMENT", []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp, post=True)
+            with mock.patch.object(mw, "post_review", side_effect=capture_post):
+                with mock.patch.object(mw.time, "monotonic", return_value=0.0):
+                    rc = self._generate(
+                        args,
+                        self._leaky_review(),
+                        coverage,
+                        stats,
+                        store=self._store(),
+                    )
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        self._assert_github_payload(payload)
+        self.assertEqual(posted[0]["comments"], [])
+        self.assertEqual(posted[0]["event"], "COMMENT")
 
 
 class ReviewJsonTests(unittest.TestCase):
@@ -2708,9 +2739,11 @@ class ReviewDeadlineTests(unittest.TestCase):
         capacity = mw.provider_http_error("xAI", 503, "overloaded", "7")
         self.assertEqual(capacity.kind, mw.ProviderFailureKind.CAPACITY)
         self.assertEqual(capacity.retry_after_seconds, 7.0)
+        self.assertEqual(capacity.http_status, 503)
         throttled = mw.provider_http_error("xAI", 429, "slow down", None)
         self.assertEqual(throttled.kind, mw.ProviderFailureKind.CAPACITY)
         self.assertIsNone(throttled.retry_after_seconds)
+        self.assertEqual(throttled.http_status, 429)
         for code in (500, 502, 504):
             with self.subTest(code=code):
                 error = mw.provider_http_error("xAI", code, "boom", None)

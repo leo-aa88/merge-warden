@@ -57,7 +57,10 @@ from review_pipeline import (
     MAX_VALIDATION_CONCURRENCY,
     MAP_CALL_BUDGET_SECONDS,
     MAP_SOFT_REQUEST_TARGET_CHARS,
+    PROVIDER_CIRCUIT_FAILURE_THRESHOLD,
+    PROVIDER_CIRCUIT_MIN_INDEPENDENT_REQUESTS,
     ProviderFailureKind,
+    ProviderHealth,
     ProviderRequestError,
     REDUCE_GROUP_SIZE,
     REDUCE_RESERVE_SECONDS,
@@ -5915,15 +5918,51 @@ class MapRetryBudgetTests(unittest.TestCase):
         self.assertFalse(coverage.complete)
         self.assertEqual(review["event"], "COMMENT")
 
-    def test_stage_wide_backoff_cap_bounds_several_deferred_batches(self) -> None:
-        """Per-request ceilings do not bound several batches deferred at once.
+    def test_independent_capacity_rejections_open_the_provider_circuit(self) -> None:
+        """Four concurrent 503s are a provider outage, not four unlucky batches.
 
-        Four independent batches are rejected for capacity with the maximum
-        Retry-After. Each honored deferral commits 60s, so only two fit under
-        the 120s stage cap and the rest must be abandoned rather than allowed
-        to sleep away time the later stages have reserved.
+        The previous bound was the 120s stage-wide sleep cap, which still
+        spent minutes retrying an unhealthy model. The circuit opens on the
+        third independent capacity failure and does not dispatch retries.
         """
         corpus = _synthetic_corpus(self._separate_batch_chunks(4))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        calls: list[tuple[str, ...]] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = tuple(_chunk_ids_in_prompt(user))
+                calls.append(ids)
+                raise ProviderRequestError(
+                    ProviderFailureKind.CAPACITY,
+                    "Gemini HTTP 503: high demand",
+                    retry_after_seconds=rp.MAX_MAP_CAPACITY_BACKOFF_SECONDS,
+                )
+            raise AssertionError("circuit-open must not call later stages")
+
+        (review, coverage, _store, stats), slept = self._clocked_run(
+            corpus, fake, clock, deadline, map_concurrency=4
+        )
+        self.assertTrue(stats.provider_circuit_open)
+        self.assertFalse(stats.map_deadline_exhausted)
+        self.assertFalse(stats.deadline_exhausted)
+        self.assertEqual(stats.map_capacity_retries, 0)
+        self.assertEqual(stats.synthesis_calls, 0)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(slept, [])
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(review.get("comments") or [], [])
+        self.assertIn("provider circuit open", stats.footer())
+        self.assertNotIn("map budget exhausted", stats.footer())
+        self.assertIn("provider circuit opened", " ".join(stats.notes).lower())
+        _assert_unsynthesized_fallback(self, review)
+
+    def test_two_independent_capacity_failures_still_retry(self) -> None:
+        """The circuit needs three failures; two unlucky batches still back off."""
+        corpus = _synthetic_corpus(self._separate_batch_chunks(2))
         clock = {"now": 10_000.0}
         deadline = clock["now"] + 840.0
         rejected: set[tuple[str, ...]] = set()
@@ -5931,16 +5970,15 @@ class MapRetryBudgetTests(unittest.TestCase):
         def fake(system: str, user: str) -> str:
             stage = mw.provider_call_stage(system, user)
             if stage == "map":
-                ids = _chunk_ids_in_prompt(user)
-                key = tuple(ids)
-                if key not in rejected:
-                    rejected.add(key)
+                ids = tuple(_chunk_ids_in_prompt(user))
+                if ids not in rejected:
+                    rejected.add(ids)
                     raise ProviderRequestError(
                         ProviderFailureKind.CAPACITY,
                         "Gemini HTTP 503: high demand",
                         retry_after_seconds=rp.MAX_MAP_CAPACITY_BACKOFF_SECONDS,
                     )
-                return _map_chunks_json(ids)
+                return _map_chunks_json(list(ids))
             if stage in {"pre-reduce", "reduce"}:
                 return json.dumps({"keep": [], "reject": [], "merge": []})
             return json.dumps(
@@ -5948,21 +5986,14 @@ class MapRetryBudgetTests(unittest.TestCase):
             )
 
         (review, coverage, _store, stats), slept = self._clocked_run(
-            corpus, fake, clock, deadline, map_concurrency=4
+            corpus, fake, clock, deadline, map_concurrency=2
         )
-        affordable = int(
-            rp.MAX_MAP_CAPACITY_SLEEP_SECONDS // rp.MAX_MAP_CAPACITY_BACKOFF_SECONDS
-        )
-        # Exactly the deferrals the cap can pay for, and no more. Without the
-        # cap all four would be retried.
-        self.assertEqual(stats.map_capacity_retries, affordable)
+        self.assertFalse(stats.provider_circuit_open)
+        self.assertEqual(stats.map_capacity_retries, 2)
         self.assertTrue(slept)
         self.assertLessEqual(sum(slept), rp.MAX_MAP_CAPACITY_SLEEP_SECONDS)
-        self.assertFalse(coverage.complete)
+        self.assertTrue(coverage.complete)
         self.assertEqual(review["event"], "COMMENT")
-        self.assertEqual(
-            len(coverage.uncovered_chunk_ids), len(corpus.chunks) - affordable
-        )
 
     def test_widened_retry_queued_behind_work_rechecks_its_own_budget(
         self,
@@ -6486,6 +6517,404 @@ def _heading_doc(title: str, sections: int, filler: str = "body") -> str:
         f"# {title} {index}\n{filler} {index}\n" for index in range(1, sections + 1)
     ]
     return "\n".join(parts)
+
+
+class ProviderHealthTests(unittest.TestCase):
+    """Circuit policy, independent of the map scheduler."""
+
+    def test_isolated_failure_does_not_open(self) -> None:
+        health = ProviderHealth()
+        self.assertFalse(
+            health.observe_capacity_failure("A", http_status=503)
+        )
+        self.assertFalse(health.circuit_open)
+        health.observe_success()
+        self.assertEqual(health.consecutive_failures, 0)
+
+    def test_three_retries_of_one_request_do_not_open(self) -> None:
+        health = ProviderHealth()
+        for _ in range(5):
+            self.assertFalse(
+                health.observe_capacity_failure("batch-1", http_status=503)
+            )
+        self.assertFalse(health.circuit_open)
+        self.assertEqual(health.distinct_requests(), 1)
+
+    def test_independent_failures_open_at_threshold(self) -> None:
+        health = ProviderHealth(provider="google", model="gemini-3.1-pro-preview")
+        self.assertFalse(health.observe_capacity_failure("A", http_status=503))
+        self.assertFalse(health.observe_capacity_failure("B", http_status=503))
+        self.assertTrue(health.observe_capacity_failure("C", http_status=503))
+        self.assertTrue(health.circuit_open)
+        self.assertIn("3 availability failures", health.circuit_reason)
+        self.assertEqual(health.label(), "google/gemini-3.1-pro-preview")
+        self.assertGreaterEqual(
+            health.consecutive_failures, PROVIDER_CIRCUIT_FAILURE_THRESHOLD
+        )
+        self.assertGreaterEqual(
+            health.distinct_requests(), PROVIDER_CIRCUIT_MIN_INDEPENDENT_REQUESTS
+        )
+
+    def test_success_resets_streak(self) -> None:
+        health = ProviderHealth()
+        health.observe_capacity_failure("A", http_status=503)
+        health.observe_capacity_failure("B", http_status=503)
+        health.observe_success()
+        self.assertFalse(health.observe_capacity_failure("C", http_status=503))
+        self.assertFalse(health.circuit_open)
+        self.assertEqual(health.consecutive_failures, 1)
+
+    def test_success_after_open_does_not_close(self) -> None:
+        health = ProviderHealth()
+        health.observe_capacity_failure("A", http_status=503)
+        health.observe_capacity_failure("B", http_status=503)
+        health.observe_capacity_failure("C", http_status=503)
+        health.observe_success()
+        self.assertTrue(health.circuit_open)
+
+    def test_retry_after_exceeding_remaining_budget_opens(self) -> None:
+        health = ProviderHealth()
+        opened = health.observe_capacity_failure(
+            "A",
+            http_status=429,
+            retry_after_seconds=500.0,
+            remaining_stage_seconds=120.0,
+        )
+        self.assertTrue(opened)
+        self.assertIn("Retry-After", health.circuit_reason)
+
+    def test_useful_retry_after_does_not_open_alone(self) -> None:
+        health = ProviderHealth()
+        opened = health.observe_capacity_failure(
+            "A",
+            http_status=429,
+            retry_after_seconds=12.0,
+            remaining_stage_seconds=400.0,
+        )
+        self.assertFalse(opened)
+
+    def test_status_line_distinguishes_independent_failures(self) -> None:
+        health = ProviderHealth()
+        health.observe_capacity_failure("A", http_status=503)
+        self.assertEqual(
+            health.status_line(), "Provider health: 1 recent availability failure"
+        )
+        health.observe_capacity_failure("B", http_status=503)
+        self.assertIn("2 failures across 2 independent requests", health.status_line())
+        health.observe_capacity_failure("C", http_status=503)
+        self.assertIn("3 failures across 3 independent requests", health.status_line())
+
+    def test_identical_failures_are_summarized(self) -> None:
+        health = ProviderHealth()
+        self.assertFalse(health.should_summarize_failure("HTTP 503: high demand"))
+        self.assertTrue(health.should_summarize_failure("HTTP 503: high demand"))
+        self.assertFalse(health.should_summarize_failure("HTTP 429: slow down"))
+
+
+class ProviderCircuitPipelineTests(unittest.TestCase):
+    """Map scheduler honors the provider circuit without burning the stage."""
+
+    def _capacity_error(self, status: int = 503, retry_after: float | None = None):
+        return ProviderRequestError(
+            ProviderFailureKind.CAPACITY,
+            f"Gemini HTTP {status}: high demand",
+            retry_after_seconds=retry_after,
+            http_status=status,
+        )
+
+    def _always_capacity(self, status: int = 503):
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                raise self._capacity_error(status)
+            raise AssertionError(f"later stage {stage} must not run after circuit open")
+
+        return fake
+
+    def test_isolated_503_retries_and_succeeds(self) -> None:
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 10_000.0}
+        calls = {"n": 0}
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise self._capacity_error()
+                return _map_chunks_json(_chunk_ids_in_prompt(user))
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        def fake_sleep(seconds: float) -> None:
+            clock["now"] += seconds
+
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            with mock.patch.object(rp.time, "sleep", fake_sleep):
+                review, coverage, _store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertFalse(stats.provider_circuit_open)
+        self.assertEqual(stats.map_capacity_retries, 1)
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_independent_503s_open_circuit_without_retries(self) -> None:
+        corpus = _synthetic_corpus(MapRetryBudgetTests._separate_batch_chunks(4))
+        calls: list[str] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                calls.append(",".join(_chunk_ids_in_prompt(user)))
+                raise self._capacity_error()
+            raise AssertionError("synthesis must not run against an open circuit")
+
+        review, coverage, _store, stats = _run_hierarchical(
+            corpus, fake, map_concurrency=4
+        )
+        self.assertTrue(stats.provider_circuit_open)
+        self.assertFalse(stats.map_deadline_exhausted)
+        self.assertFalse(stats.deadline_exhausted)
+        self.assertEqual(stats.map_capacity_retries, 0)
+        self.assertEqual(stats.synthesis_calls, 0)
+        self.assertEqual(len(calls), 4)
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(review.get("comments") or [], [])
+        self.assertNotIn("# APPROVE", review["body"])
+        self.assertIn("provider circuit open", stats.footer())
+        _assert_unsynthesized_fallback(self, review)
+
+    def test_no_new_primary_batch_after_circuit_opens(self) -> None:
+        corpus = _synthetic_corpus(MapRetryBudgetTests._separate_batch_chunks(5))
+        calls: list[str] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                calls.append(",".join(_chunk_ids_in_prompt(user)))
+                raise self._capacity_error()
+            raise AssertionError("later stages must not run")
+
+        _review, _coverage, _store, stats = _run_hierarchical(
+            corpus, fake, map_concurrency=4
+        )
+        self.assertTrue(stats.provider_circuit_open)
+        self.assertEqual(len(calls), 4)
+        self.assertGreater(stats.provider_circuit_prevented_calls, 0)
+
+    def test_in_flight_success_is_ingested_after_circuit_opens(self) -> None:
+        corpus = _synthetic_corpus(MapRetryBudgetTests._separate_batch_chunks(4))
+        started = threading.Barrier(4, timeout=5)
+        release_success = threading.Event()
+        real_observe = rp.ProviderHealth.observe_capacity_failure
+
+        def observe_and_release(self, *args, **kwargs):
+            opened = real_observe(self, *args, **kwargs)
+            if self.circuit_open:
+                release_success.set()
+            return opened
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                started.wait()
+                if ids == ["C1"]:
+                    if not release_success.wait(timeout=5):
+                        raise AssertionError("success batch was not released")
+                    return _map_chunks_json(ids)
+                raise self._capacity_error()
+            raise AssertionError("later stages must not run")
+
+        with mock.patch.object(
+            rp.ProviderHealth, "observe_capacity_failure", observe_and_release
+        ):
+            review, coverage, _store, stats = _run_hierarchical(
+                corpus, fake, map_concurrency=4
+            )
+        self.assertTrue(stats.provider_circuit_open)
+        self.assertNotIn("C1", coverage.uncovered_chunk_ids)
+        self.assertGreaterEqual(stats.map_chunks_acknowledged, 1)
+        self.assertEqual(stats.synthesis_calls, 0)
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_success_between_failures_does_not_open(self) -> None:
+        corpus = _synthetic_corpus(MapRetryBudgetTests._separate_batch_chunks(3))
+        attempts: dict[str, int] = {}
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                lead = ids[0]
+                attempts[lead] = attempts.get(lead, 0) + 1
+                if lead == "C2" or attempts[lead] > 1:
+                    return _map_chunks_json(ids)
+                raise self._capacity_error()
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        def fake_sleep(seconds: float) -> None:
+            return None
+
+        with mock.patch.object(rp.time, "sleep", fake_sleep):
+            _review, coverage, _store, stats = _run_hierarchical(
+                corpus, fake, map_concurrency=1
+            )
+        self.assertFalse(stats.provider_circuit_open)
+        self.assertNotIn("C2", coverage.uncovered_chunk_ids)
+
+    def test_repeated_429s_open_circuit(self) -> None:
+        corpus = _synthetic_corpus(MapRetryBudgetTests._separate_batch_chunks(3))
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                raise self._capacity_error(429, retry_after=4.0)
+            raise AssertionError("later stages must not run")
+
+        review, _coverage, _store, stats = _run_hierarchical(
+            corpus, fake, map_concurrency=3
+        )
+        self.assertTrue(stats.provider_circuit_open)
+        self.assertEqual(stats.synthesis_calls, 0)
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_single_429_with_useful_retry_after_retries(self) -> None:
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 10_000.0}
+        calls = {"n": 0}
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise self._capacity_error(429, retry_after=4.0)
+                return _map_chunks_json(_chunk_ids_in_prompt(user))
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        def fake_sleep(seconds: float) -> None:
+            clock["now"] += seconds
+
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            with mock.patch.object(rp.time, "sleep", fake_sleep):
+                _review, coverage, _store, stats = _run_hierarchical(
+                    corpus, fake, deadline=clock["now"] + 840.0
+                )
+        self.assertTrue(coverage.complete)
+        self.assertFalse(stats.provider_circuit_open)
+        self.assertEqual(stats.map_capacity_retries, 1)
+
+    def test_retry_after_larger_than_remaining_budget_opens_circuit(self) -> None:
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        map_cutoff = map_stage_deadline(deadline)
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                clock["now"] = map_cutoff - 80.0
+                raise self._capacity_error(429, retry_after=500.0)
+            raise AssertionError("later stages must not run")
+
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            review, coverage, _store, stats = _run_hierarchical(
+                corpus, fake, deadline=deadline
+            )
+        self.assertTrue(stats.provider_circuit_open)
+        self.assertFalse(stats.map_deadline_exhausted)
+        self.assertFalse(coverage.complete)
+        self.assertEqual(stats.synthesis_calls, 0)
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_latency_timeouts_do_not_open_circuit(self) -> None:
+        corpus = _synthetic_corpus(MapRetryBudgetTests._separate_batch_chunks(3))
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                raise ProviderRequestError(
+                    ProviderFailureKind.LATENCY_TIMEOUT, "timed out"
+                )
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        _review, coverage, _store, stats = _run_hierarchical(
+            corpus, fake, map_concurrency=3
+        )
+        self.assertFalse(stats.provider_circuit_open)
+        self.assertFalse(coverage.complete)
+
+    def test_circuit_open_cannot_approve(self) -> None:
+        corpus = _synthetic_corpus(MapRetryBudgetTests._separate_batch_chunks(3))
+        review, coverage, _store, stats = _run_hierarchical(
+            corpus, self._always_capacity(), map_concurrency=3
+        )
+        self.assertTrue(stats.provider_circuit_open)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertNotIn("# APPROVE", review["body"])
+        self.assertFalse(coverage.complete)
+
+    def test_unsynthesized_candidates_are_not_posted(self) -> None:
+        corpus = _synthetic_corpus(MapRetryBudgetTests._separate_batch_chunks(4))
+        success_ids = {"C1"}
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                if set(ids) == success_ids:
+                    return _map_chunks_json(
+                        ids,
+                        findings=[
+                            {
+                                "id": "F_LEAK",
+                                "severity": "BLOCKING",
+                                "path": "c1.c",
+                                "side": "RIGHT",
+                                "line": 1,
+                                "body": "raw mapper candidate must not post",
+                                "confidence": "CONFIRMED",
+                            }
+                        ],
+                    )
+                raise self._capacity_error()
+            raise AssertionError("later stages must not run")
+
+        review, _coverage, store, stats = _run_hierarchical(
+            corpus, fake, map_concurrency=4
+        )
+        self.assertTrue(stats.provider_circuit_open)
+        self.assertEqual(stats.synthesis_calls, 0)
+        _assert_unsynthesized_fallback(self, review)
+        self.assertTrue(any("raw mapper candidate" in item.body for item in store.findings.values()))
+        self.assertNotIn("raw mapper candidate must not post", review["body"])
+
+    def test_circuit_does_not_consume_map_stage_reserve_flag(self) -> None:
+        corpus = _synthetic_corpus(MapRetryBudgetTests._separate_batch_chunks(3))
+        _review, _coverage, _store, stats = _run_hierarchical(
+            corpus, self._always_capacity(), map_concurrency=3
+        )
+        self.assertTrue(stats.provider_circuit_open)
+        self.assertFalse(stats.map_deadline_exhausted)
+        self.assertFalse(stats.deadline_exhausted)
+        self.assertFalse(stats.validation_deadline_exhausted)
+        self.assertFalse(stats.reduce_deadline_exhausted)
 
 
 class MapFanoutAndDegradationTests(unittest.TestCase):
