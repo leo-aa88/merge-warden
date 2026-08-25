@@ -1368,6 +1368,61 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("validation:incomplete:include/missing.h", _by_local_id(store, "F17").evidence)
         self.assertTrue(any("could not load requested context" in note for note in stats.notes))
 
+    def test_unavailable_alias_path_records_canonical_incomplete_marker(self) -> None:
+        corpus = build_review_corpus(
+            _inputs(
+                files=[{"filename": "src/foo.c", "status": "modified", "additions": 1, "deletions": 0}],
+                diff=(
+                    "diff --git a/src/foo.c b/src/foo.c\n"
+                    "@@ -1 +1 @@\n"
+                    "-old\n"
+                    "+return borrowed_value();\n"
+                ),
+            )
+        )
+
+        def fake(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                finding = _likely_foo_finding()
+                finding["confidence"] = "CONFIRMED"
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[finding],
+                    needs_context=[
+                        {
+                            "path": "./include/missing.h",
+                            "reason": "Need return ownership contract",
+                            "finding_ids": ["F17"],
+                        }
+                    ],
+                )
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [_fid("F17")], "reject": [], "merge": []})
+            return json.dumps({"event": "APPROVE", "body": "# APPROVE\n", "comments": []})
+
+        loaded: list[str] = []
+
+        review, coverage, store, stats = run_hierarchical_review(
+            corpus=corpus,
+            synthesis_prompt="synth",
+            map_prompt="<!-- merge-warden-map -->",
+            reduce_prompt="<!-- merge-warden-reduce -->",
+            call_model=fake,
+            commentable_section="(none)\n",
+            max_map_request_chars=80_000,
+            max_reduce_request_chars=80_000,
+            map_overhead_chars=100,
+            context_loader=lambda path: loaded.append(path) or None,
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(loaded, ["include/missing.h"])
+        finding = _by_local_id(store, "F17")
+        self.assertIn("validation:incomplete:include/missing.h", finding.evidence)
+        self.assertNotIn("validation:incomplete:./include/missing.h", finding.evidence)
+        self.assertEqual(set(store.incomplete_context), {"include/missing.h"})
+        self.assertTrue(any("could not load requested context" in note for note in stats.notes))
+
     def test_lazy_source_cache_uses_exact_requested_path(self) -> None:
         map_chunk = _chunk(
             "diff:src/foo.c:1",
@@ -6136,6 +6191,108 @@ class ParallelValidationSchedulerTests(unittest.TestCase):
             [task.path for task in tasks],
             ["include/crowded.h", "include/minor.h"],
         )
+
+    def test_plan_validation_tasks_collapses_path_aliases(self) -> None:
+        store = EvidenceStore()
+        store.findings["c1/F1"] = _finding("c1/F1", severity="BLOCKING")
+        store.kept.add("c1/F1")
+        store.reduced = True
+        store.needs_context = [
+            rp.ContextNeed(
+                path="foo.h", reason="r", from_chunk="c1", finding_ids=["c1/F1"]
+            ),
+            rp.ContextNeed(
+                path="./foo.h", reason="r2", from_chunk="c1", finding_ids=["c1/F1"]
+            ),
+            rp.ContextNeed(
+                path="`foo.h`", reason="r3", from_chunk="c1", finding_ids=["c1/F1"]
+            ),
+        ]
+        tasks = plan_validation_tasks(store)
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].path, "foo.h")
+        self.assertEqual(
+            [need.path for need in tasks[0].related_needs],
+            ["foo.h", "./foo.h", "`foo.h`"],
+        )
+        self.assertEqual([finding.id for finding in tasks[0].related], ["c1/F1"])
+
+    def test_plan_validation_tasks_keeps_distinct_paths_and_dotfiles(self) -> None:
+        store = EvidenceStore()
+        store.findings["a"] = _finding("a", severity="MAJOR")
+        store.findings["b"] = _finding("b", severity="MAJOR")
+        store.findings["c"] = _finding("c", severity="MAJOR")
+        store.needs_context = [
+            rp.ContextNeed(path="foo.h", reason="root", finding_ids=["a"]),
+            rp.ContextNeed(
+                path="vendor/lib/foo.h", reason="vendor", finding_ids=["b"]
+            ),
+            rp.ContextNeed(path=".gitignore", reason="dotfile", finding_ids=["c"]),
+        ]
+        tasks = plan_validation_tasks(store)
+        self.assertEqual(
+            [task.path for task in tasks],
+            ["foo.h", "vendor/lib/foo.h", ".gitignore"],
+        )
+
+    def test_unscheduled_validation_needs_skips_aliases_already_claimed(self) -> None:
+        store = EvidenceStore()
+        store.findings["c1/F1"] = _finding("c1/F1", severity="BLOCKING")
+        store.needs_context = [
+            rp.ContextNeed(path="foo.h", reason="r", finding_ids=["c1/F1"]),
+        ]
+        scheduled: set[str] = set()
+        first = rp._unscheduled_validation_needs(store, scheduled)
+        self.assertEqual(first, [(0, "foo.h")])
+        self.assertEqual(scheduled, {"foo.h"})
+        store.needs_context.append(
+            rp.ContextNeed(path="./foo.h", reason="r2", finding_ids=["c1/F1"]),
+        )
+        second = rp._unscheduled_validation_needs(store, scheduled)
+        self.assertEqual(second, [])
+        self.assertEqual(scheduled, {"foo.h"})
+
+    def test_mark_incomplete_validation_collapses_path_aliases(self) -> None:
+        store = EvidenceStore()
+        finding = _finding("c1/F1", severity="BLOCKING")
+        store.findings[finding.id] = finding
+        store.kept.add(finding.id)
+        store.reduced = True
+        rp._mark_incomplete_validation(store, [finding], "include/missing.h")
+        rp._mark_incomplete_validation(store, [finding], "./include/missing.h")
+        self.assertEqual(
+            finding.evidence, ["validation:incomplete:include/missing.h"]
+        )
+        self.assertEqual(set(store.incomplete_context), {"include/missing.h"})
+        self.assertNotIn("./include/missing.h", store.incomplete_context)
+        self.assertNotIn(
+            "validation:incomplete:./include/missing.h", finding.evidence
+        )
+        self.assertTrue(rp._has_incomplete_validation(store))
+
+    def test_adopt_new_needs_does_not_schedule_alias_of_queued_path(self) -> None:
+        corpus = self._paths_corpus(["foo.h"])
+        findings, needs = self._specs([("F1", "BLOCKING", "LIKELY", "foo.h")])
+
+        def on_validation(_n: int, _user: str, ids: list[str]) -> str:
+            return _map_chunks_json(
+                ids,
+                needs_context=[
+                    {
+                        "path": "./foo.h",
+                        "reason": "same file, different spelling",
+                    }
+                ],
+            )
+
+        fake = self._pipeline(
+            findings=findings, needs_context=needs, on_validation=on_validation
+        )
+        _review, coverage, _store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.validation_requests, 1)
+        self.assertEqual(stats.validation_attempts, 1)
+        self.assertEqual(len(fake.validation_messages), 1)
 
     def test_prompt_demotion_copies_do_not_change_rank_views(self) -> None:
         store = EvidenceStore()
