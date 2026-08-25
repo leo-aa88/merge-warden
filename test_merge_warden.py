@@ -1122,11 +1122,11 @@ class HttpPostRetryTests(unittest.TestCase):
         self.assertIn("HTTP 400", str(ctx.exception))
         sleep.assert_not_called()
 
-    def test_gives_up_after_attempts(self) -> None:
+    def test_gives_up_after_timeout_attempts(self) -> None:
         error = urllib.error.URLError("timed out")
         with mock.patch("urllib.request.urlopen", side_effect=error) as urlopen:
             with mock.patch("time.sleep") as sleep:
-                with self.assertRaises(RuntimeError) as ctx:
+                with self.assertRaises(mw.ProviderRequestError) as ctx:
                     mw.http_post_json(
                         "https://example.test/v1",
                         {"a": 1},
@@ -1138,6 +1138,7 @@ class HttpPostRetryTests(unittest.TestCase):
         self.assertEqual(sleep.call_count, 2)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
         self.assertIn("after 3 attempts", str(ctx.exception))
+        self.assertEqual(ctx.exception.kind, mw.ProviderFailureKind.LATENCY_TIMEOUT)
 
     def test_urlerror_reason_remote_disconnected_is_retried(self) -> None:
         wrapped = urllib.error.URLError(
@@ -1302,11 +1303,11 @@ class ReviewDeadlineTests(unittest.TestCase):
         self.assertEqual(data, {"ok": True})
         self.assertAlmostEqual(urlopen.call_args.kwargs["timeout"], 10.0)
 
-    def test_http_socket_timeout_raises_deadline_failure(self) -> None:
+    def test_http_socket_timeout_raises_latency_failure(self) -> None:
         with mock.patch(
             "urllib.request.urlopen", side_effect=mw.socket.timeout("timed out")
         ):
-            with self.assertRaises(mw.RequestDeadlineExceeded) as caught:
+            with self.assertRaises(mw.ProviderRequestError) as caught:
                 mw.http_post_json(
                     "https://example.test/v1",
                     {"a": 1},
@@ -1316,12 +1317,13 @@ class ReviewDeadlineTests(unittest.TestCase):
                     label="xAI map",
                 )
         self.assertIn("140.0s", str(caught.exception))
+        self.assertEqual(caught.exception.kind, mw.ProviderFailureKind.LATENCY_TIMEOUT)
 
-    def test_http_urlerror_timeout_raises_deadline_failure(self) -> None:
+    def test_http_urlerror_timeout_raises_latency_failure(self) -> None:
         with mock.patch(
             "urllib.request.urlopen", side_effect=urllib.error.URLError("timed out")
         ):
-            with self.assertRaises(mw.RequestDeadlineExceeded) as caught:
+            with self.assertRaises(mw.ProviderRequestError) as caught:
                 mw.http_post_json(
                     "https://example.test/v1",
                     {"a": 1},
@@ -1331,6 +1333,7 @@ class ReviewDeadlineTests(unittest.TestCase):
                     label="xAI map",
                 )
         self.assertIn("140.0s", str(caught.exception))
+        self.assertEqual(caught.exception.kind, mw.ProviderFailureKind.LATENCY_TIMEOUT)
 
     def test_http_non_timeout_urlerror_remains_transport_failure(self) -> None:
         error = urllib.error.URLError("Temporary failure in name resolution")

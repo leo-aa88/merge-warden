@@ -3541,6 +3541,45 @@ class ValidationStageBudgetTests(unittest.TestCase):
         self.assertTrue(store.kept_findings())
         self.assertIn(CANDIDATE_FINDINGS_NOT_POSTED, review["body"])
 
+    def test_synthesis_provider_timeout_fail_closes_without_deadline_flag(
+        self,
+    ) -> None:
+        corpus = build_review_corpus(_inputs(diff="@@ -1 +1 @@\n-a\n+b\n"))
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[
+                        {
+                            "id": "F1",
+                            "severity": "MAJOR",
+                            "path": "src/foo.c",
+                            "side": "RIGHT",
+                            "line": 1,
+                            "body": "raw mapper candidate",
+                            "confidence": "LIKELY",
+                            "evidence": [],
+                        }
+                    ],
+                )
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [_fid("F1")], "reject": [], "merge": []})
+            raise ProviderRequestError(
+                ProviderFailureKind.LATENCY_TIMEOUT,
+                "xAI request timed out after 1 attempts",
+            )
+
+        review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertFalse(stats.deadline_exhausted)
+        self.assertEqual(stats.synthesis_calls, 0)
+        _assert_unsynthesized_fallback(self, review)
+        self.assertTrue(store.kept_findings())
+        self.assertNotIn("raw mapper candidate", review["body"])
+        self.assertIn(CANDIDATE_FINDINGS_NOT_POSTED, review["body"])
+
     def test_validation_deadline_with_successful_synthesis_keeps_inline_comments(
         self,
     ) -> None:

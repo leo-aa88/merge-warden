@@ -410,6 +410,16 @@ def url_error_is_timeout(exc: urllib.error.URLError) -> bool:
     return "timed out" in str(exc).lower()
 
 
+def provider_latency_timeout(label: str, attempts: int, request_timeout: float) -> ProviderRequestError:
+    return ProviderRequestError(
+        ProviderFailureKind.LATENCY_TIMEOUT,
+        (
+            f"{label} request timed out after {attempts} attempts "
+            f"(last timeout {request_timeout:.1f}s)"
+        ),
+    )
+
+
 def compute_review_deadlines(
     timeout_seconds: int,
     reserve_seconds: int,
@@ -872,19 +882,13 @@ def http_post_json(
             raise
         except (TimeoutError, socket.timeout) as exc:
             if attempt == attempts:
-                raise RequestDeadlineExceeded(
-                    f"{label} request timed out after {attempts} attempts "
-                    f"(last timeout {request_timeout:.1f}s)"
-                ) from exc
+                raise provider_latency_timeout(label, attempts, request_timeout) from exc
             error = str(exc)
             last_error = exc
         except urllib.error.URLError as exc:
             if url_error_is_timeout(exc):
                 if attempt == attempts:
-                    raise RequestDeadlineExceeded(
-                        f"{label} request timed out after {attempts} attempts "
-                        f"(last timeout {request_timeout:.1f}s)"
-                    ) from exc
+                    raise provider_latency_timeout(label, attempts, request_timeout) from exc
                 error = str(exc)
                 last_error = exc
             elif attempt == attempts:

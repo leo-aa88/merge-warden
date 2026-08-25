@@ -701,6 +701,51 @@ def _deadline_result(
     return review, coverage, store, stats
 
 
+def _provider_failure_preamble(
+    corpus: ReviewCorpus,
+    coverage: CoverageReport,
+    stats: PipelineStats,
+    error: BaseException,
+) -> str:
+    notice = (
+        "Merge Warden could not complete provider synthesis because a provider "
+        f"request failed: {sanitize_failure_note(str(error))}."
+    )
+    total = reviewable_member_count(corpus.reviewable_chunks)
+    uncovered_n = len(coverage.uncovered_chunk_ids)
+    analyzed = max(total - uncovered_n, 0)
+    if not all_reviewable_context_covered(coverage):
+        base = _incomplete_preamble(corpus, coverage, stats)
+        return base.replace("# COMMENT\n\n", f"# COMMENT\n\n{notice}\n\n", 1)
+    return (
+        "# COMMENT\n\n"
+        f"{notice}\n\n"
+        f"Primary context coverage: {analyzed}/{total} chunks.\n\n"
+        "Validation/reduction/synthesis did not complete, so no merge "
+        "recommendation was produced.\n\n"
+        "No approval decision was produced.\n"
+    )
+
+
+def _provider_failure_result(
+    *,
+    corpus: ReviewCorpus,
+    coverage: CoverageReport,
+    store: EvidenceStore,
+    stats: PipelineStats,
+    error: BaseException,
+) -> tuple[dict, CoverageReport, EvidenceStore, PipelineStats]:
+    stats.coverage_complete = all_reviewable_context_covered(coverage)
+    note = sanitize_failure_note(f"provider request failed: {error}")
+    if note and note not in stats.notes:
+        stats.notes.append(note)
+    _preserve_unresolved_findings(store)
+    review = findings_as_review(
+        store, _provider_failure_preamble(corpus, coverage, stats, error)
+    )
+    return review, coverage, store, stats
+
+
 def load_prompt(path: Path | str) -> str:
     return Path(path).read_text(encoding="utf-8")
 
@@ -2981,6 +3026,14 @@ def run_hierarchical_review(
 
     try:
         raw = _call(call_model, synthesis_prompt, synthesis_message, stats, "synthesis")
+    except ProviderRequestError as exc:
+        return _provider_failure_result(
+            corpus=corpus,
+            coverage=coverage,
+            store=store,
+            stats=stats,
+            error=exc,
+        )
     except PipelineDeadlineExceeded as exc:
         return _deadline_result(
             corpus=corpus,
