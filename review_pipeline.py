@@ -9,6 +9,7 @@ import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from pathlib import Path
 from typing import Callable
 
@@ -47,16 +48,17 @@ REDUCE_RESERVE_SECONDS = 120
 SYNTHESIS_RESERVE_SECONDS = 150
 # Map calls get a tighter latency budget than the whole provider window so a
 # slow batch splits while downstream reserves are still intact.
-MAP_CALL_BUDGET_SECONDS = 120
-MAP_HTTP_TIMEOUT_SECONDS = 90
-MAP_HTTP_ATTEMPTS = 2
+MAP_CALL_BUDGET_SECONDS = 150
+MAP_HTTP_TIMEOUT_SECONDS = 140
+MAP_HTTP_ATTEMPTS = 1
 # Soft packing target in chunk characters. Hard request limits still win.
-MAP_SOFT_REQUEST_TARGET_CHARS = 32_000
+MAP_SOFT_REQUEST_TARGET_CHARS = 16_000
 CANDIDATE_FINDINGS_NOT_POSTED = (
     "Candidate findings were intentionally not posted as inline comments "
     "because final synthesis did not complete."
 )
 MAP_MISSING_CHUNK_RETRIES = 1
+MAP_TRANSPORT_RETRIES = 1
 VALIDATION_MISSING_CHUNK_RETRIES = 1
 MISSING_VALIDATION_ID_NOTE_LIMIT = 12
 # Bound structured map output complexity independently of input size.
@@ -141,6 +143,21 @@ VALIDATION_IMPACT_ORDER = {
 
 CallModel = Callable[[str, str], str]
 ContextLoader = Callable[[str], str | None]
+
+
+class ProviderFailureKind(Enum):
+    """Failure class used by the map scheduler to choose retry vs split."""
+
+    TRANSIENT_TRANSPORT = "transient_transport"
+    LATENCY_TIMEOUT = "latency_timeout"
+
+
+class ProviderRequestError(RuntimeError):
+    """Retryable provider failure with scheduler-visible semantics."""
+
+    def __init__(self, kind: ProviderFailureKind, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 @dataclass
@@ -398,6 +415,7 @@ class MapAttemptResult:
     missing: list[ContextChunk]
     malformed: bool = False
     provider_failed: bool = False
+    provider_failure_kind: ProviderFailureKind | None = None
     budget_exhausted: bool = False
 
     @property
@@ -703,6 +721,51 @@ def _deadline_result(
         stats.notes.append(note)
     _preserve_unresolved_findings(store)
     review = findings_as_review(store, _deadline_preamble(corpus, coverage, stats))
+    return review, coverage, store, stats
+
+
+def _provider_failure_preamble(
+    corpus: ReviewCorpus,
+    coverage: CoverageReport,
+    stats: PipelineStats,
+    error: BaseException,
+) -> str:
+    notice = (
+        "Merge Warden could not complete provider synthesis because a provider "
+        f"request failed: {sanitize_failure_note(str(error))}."
+    )
+    total = reviewable_member_count(corpus.reviewable_chunks)
+    uncovered_n = len(coverage.uncovered_chunk_ids)
+    analyzed = max(total - uncovered_n, 0)
+    if not all_reviewable_context_covered(coverage):
+        base = _incomplete_preamble(corpus, coverage, stats)
+        return base.replace("# COMMENT\n\n", f"# COMMENT\n\n{notice}\n\n", 1)
+    return (
+        "# COMMENT\n\n"
+        f"{notice}\n\n"
+        f"Primary context coverage: {analyzed}/{total} chunks.\n\n"
+        "Validation/reduction/synthesis did not complete, so no merge "
+        "recommendation was produced.\n\n"
+        "No approval decision was produced.\n"
+    )
+
+
+def _provider_failure_result(
+    *,
+    corpus: ReviewCorpus,
+    coverage: CoverageReport,
+    store: EvidenceStore,
+    stats: PipelineStats,
+    error: BaseException,
+) -> tuple[dict, CoverageReport, EvidenceStore, PipelineStats]:
+    stats.coverage_complete = all_reviewable_context_covered(coverage)
+    note = sanitize_failure_note(f"provider request failed: {error}")
+    if note and note not in stats.notes:
+        stats.notes.append(note)
+    _preserve_unresolved_findings(store)
+    review = findings_as_review(
+        store, _provider_failure_preamble(corpus, coverage, stats, error)
+    )
     return review, coverage, store, stats
 
 
@@ -1841,6 +1904,11 @@ def apply_map_response(
         )
         return MapAttemptResult(acknowledged=[], missing=missing)
     if result.error is not None:
+        failure_kind = (
+            result.error.kind
+            if isinstance(result.error, ProviderRequestError)
+            else None
+        )
         stats.map_provider_failures += 1
         stats.notes.append(
             sanitize_failure_note(f"map batch {batch_tag} failed: {result.error}")
@@ -1849,6 +1917,7 @@ def apply_map_response(
             acknowledged=[],
             missing=missing,
             provider_failed=True,
+            provider_failure_kind=failure_kind,
         )
     seen = ingest_map_result(store, result.raw or "", batch, batch_tag)
     if seen is None:
@@ -1883,6 +1952,7 @@ def _follow_up_batches(
     current: list[ContextChunk],
     mapped_ids: set[str],
     single_failures: dict[str, int],
+    transport_failures: dict[tuple[str, ...], int],
     stats: PipelineStats,
     batch_tag: str,
     *,
@@ -1890,8 +1960,9 @@ def _follow_up_batches(
 ) -> list[list[ContextChunk]]:
     """Retry/split work for one ingested map result. Scheduler thread only.
 
-    Multi-chunk timeouts and provider failures split immediately rather than
-    retrying the same expensive shape. Single-chunk misses still get one retry.
+    Multi-chunk latency timeouts and generic provider failures split immediately
+    rather than retrying the same expensive shape. Cheap transport failures may
+    retry the same shape once.
     """
     remaining = [chunk for chunk in result.missing if chunk.id not in mapped_ids]
     if result.complete or not remaining or result.budget_exhausted:
@@ -1908,8 +1979,35 @@ def _follow_up_batches(
             )
         )
         return [part for part in (left, right) if part]
+    if result.provider_failure_kind == ProviderFailureKind.TRANSIENT_TRANSPORT:
+        signature = tuple(chunk.id for chunk in remaining)
+        retries = transport_failures.get(signature, 0)
+        if retries < MAP_TRANSPORT_RETRIES:
+            transport_failures[signature] = retries + 1
+            stats.notes.append(
+                sanitize_failure_note(
+                    f"map batch {batch_tag} transport failure after "
+                    f"{elapsed_seconds:.1f}s; retrying same request once"
+                )
+            )
+            return [remaining]
+        if len(current) == 1:
+            stats.notes.append(
+                sanitize_failure_note(
+                    f"map chunk {current[0].id} left uncovered after transport retry"
+                )
+            )
+            return []
+
     if len(current) == 1:
         chunk_id = current[0].id
+        if result.provider_failure_kind == ProviderFailureKind.LATENCY_TIMEOUT:
+            stats.notes.append(
+                sanitize_failure_note(
+                    f"map chunk {chunk_id} left uncovered after latency timeout"
+                )
+            )
+            return []
         retries = single_failures.get(chunk_id, 0)
         if retries < MAP_MISSING_CHUNK_RETRIES:
             single_failures[chunk_id] = retries + 1
@@ -1923,9 +2021,14 @@ def _follow_up_batches(
     left, right = split_map_batch(current)
     stats.map_batches_split += 1
     reason = (
-        f" exceeded call latency budget after {elapsed_seconds:.0f}s;"
-        if result.provider_failed and elapsed_seconds > 0
-        else ":"
+        f" exceeded call latency budget after {elapsed_seconds:.0f}s; "
+        "not retrying identical request;"
+        if result.provider_failure_kind == ProviderFailureKind.LATENCY_TIMEOUT
+        else (
+            f" failed after {elapsed_seconds:.1f}s;"
+            if result.provider_failed and elapsed_seconds > 0
+            else ":"
+        )
     )
     stats.notes.append(
         sanitize_failure_note(
@@ -2030,6 +2133,7 @@ def run_map_stage(
     mapped_ids: set[str] = set()
     analyzed: list[ContextChunk] = []
     single_failures: dict[str, int] = {}
+    transport_failures: dict[tuple[str, ...], int] = {}
     follow_up_serial: dict[str, int] = {}
     next_sequence = pending[-1].sequence if pending else 0
     next_ingest = 1
@@ -2143,6 +2247,7 @@ def run_map_stage(
                     f"request_chars={len(item.message)} "
                     f"stage_remaining={remaining_display} "
                     f"call_budget={MAP_CALL_BUDGET_SECONDS}s "
+                    f"http_timeout={MAP_HTTP_TIMEOUT_SECONDS}s "
                     f"({len(in_flight) + 1} in flight)",
                     flush=True,
                 )
@@ -2222,6 +2327,7 @@ def run_map_stage(
                         result.item.chunks,
                         mapped_ids,
                         single_failures,
+                        transport_failures,
                         stats,
                         result.item.batch_tag,
                         elapsed_seconds=result.elapsed_seconds,
@@ -2989,6 +3095,14 @@ def run_hierarchical_review(
 
     try:
         raw = _call(call_model, synthesis_prompt, synthesis_message, stats, "synthesis")
+    except ProviderRequestError as exc:
+        return _provider_failure_result(
+            corpus=corpus,
+            coverage=coverage,
+            store=store,
+            stats=stats,
+            error=exc,
+        )
     except PipelineDeadlineExceeded as exc:
         return _deadline_result(
             corpus=corpus,

@@ -53,6 +53,8 @@ from review_pipeline import (
     MAX_VALIDATION_CONCURRENCY,
     MAP_CALL_BUDGET_SECONDS,
     MAP_SOFT_REQUEST_TARGET_CHARS,
+    ProviderFailureKind,
+    ProviderRequestError,
     REDUCE_GROUP_SIZE,
     REDUCE_RESERVE_SECONDS,
     SYNTHESIS_RESERVE_SECONDS,
@@ -902,6 +904,26 @@ class PackTests(unittest.TestCase):
         self.assertGreaterEqual(len(balanced), 3)
         self.assertLess(max(sizes), 64_000 + 33_000)
         self.assertTrue(any(size == 64_000 for size in sizes))
+
+    def test_default_map_soft_target_keeps_batches_small(self) -> None:
+        chunks = [
+            _chunk("p11", "p11.c", "A" * 11_000),
+            _chunk("p9", "p9.c", "B" * 9_000),
+            _chunk("p8", "p8.c", "C" * 8_000),
+            _chunk("p7", "p7.c", "D" * 7_000),
+            _chunk("p6", "p6.c", "E" * 6_000),
+        ]
+        balanced = pack_map_batches(
+            chunks,
+            max_chars=201_000,
+            max_chunks=MAX_MAP_CHUNKS_PER_CALL,
+            soft_target=MAP_SOFT_REQUEST_TARGET_CHARS,
+        )
+        sizes = [sum(item.size for item in batch) for batch in balanced]
+        self.assertEqual(MAP_SOFT_REQUEST_TARGET_CHARS, 16_000)
+        for size, batch in zip(sizes, balanced):
+            if all(item.size <= MAP_SOFT_REQUEST_TARGET_CHARS for item in batch):
+                self.assertLessEqual(size, MAP_SOFT_REQUEST_TARGET_CHARS)
 
     def test_pack_map_batches_is_deterministic(self) -> None:
         chunks = [
@@ -3921,6 +3943,45 @@ class ValidationStageBudgetTests(unittest.TestCase):
         self.assertTrue(store.kept_findings())
         self.assertIn(CANDIDATE_FINDINGS_NOT_POSTED, review["body"])
 
+    def test_synthesis_provider_timeout_fail_closes_without_deadline_flag(
+        self,
+    ) -> None:
+        corpus = build_review_corpus(_inputs(diff="@@ -1 +1 @@\n-a\n+b\n"))
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[
+                        {
+                            "id": "F1",
+                            "severity": "MAJOR",
+                            "path": "src/foo.c",
+                            "side": "RIGHT",
+                            "line": 1,
+                            "body": "raw mapper candidate",
+                            "confidence": "LIKELY",
+                            "evidence": [],
+                        }
+                    ],
+                )
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [_fid("F1")], "reject": [], "merge": []})
+            raise ProviderRequestError(
+                ProviderFailureKind.LATENCY_TIMEOUT,
+                "xAI request timed out after 1 attempts",
+            )
+
+        review, coverage, store, stats = _run_hierarchical(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertFalse(stats.deadline_exhausted)
+        self.assertEqual(stats.synthesis_calls, 0)
+        _assert_unsynthesized_fallback(self, review)
+        self.assertTrue(store.kept_findings())
+        self.assertNotIn("raw mapper candidate", review["body"])
+        self.assertIn(CANDIDATE_FINDINGS_NOT_POSTED, review["body"])
+
     def test_validation_deadline_with_successful_synthesis_keeps_inline_comments(
         self,
     ) -> None:
@@ -4110,6 +4171,112 @@ class MapSchedulerInvariantTests(unittest.TestCase):
         self.assertGreaterEqual(stats.map_batches_split, 1)
         self.assertTrue(coverage.complete)
         self.assertLess(shapes.count(8), 3)
+
+    def test_early_transport_failure_retries_same_shape_once(self) -> None:
+        chunks = _tiny_chunks(8)
+        corpus = _synthetic_corpus(chunks)
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                shapes.append(len(ids))
+                if len(shapes) == 1:
+                    raise ProviderRequestError(
+                        ProviderFailureKind.TRANSIENT_TRANSPORT,
+                        "connection reset after 0.5s",
+                    )
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        _review, coverage, _store, stats = _run_hierarchical(corpus, fake)
+        self.assertEqual(shapes[:2], [8, 8])
+        self.assertEqual(stats.map_batches_split, 0)
+        self.assertTrue(coverage.complete)
+
+    def test_repeated_slow_child_batches_continue_splitting(self) -> None:
+        chunks = _tiny_chunks(8)
+        corpus = _synthetic_corpus(chunks)
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                shapes.append(len(ids))
+                if len(ids) > 2:
+                    raise ProviderRequestError(
+                        ProviderFailureKind.LATENCY_TIMEOUT,
+                        "map call latency budget exhausted",
+                    )
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        _review, coverage, _store, stats = _run_hierarchical(corpus, fake)
+        self.assertEqual(shapes.count(8), 1)
+        self.assertGreaterEqual(shapes.count(4), 2)
+        self.assertIn(2, shapes)
+        self.assertGreaterEqual(stats.map_batches_split, 3)
+        self.assertTrue(coverage.complete)
+
+    def test_single_chunk_latency_timeout_does_not_retry_forever(self) -> None:
+        chunks = _tiny_chunks(1)
+        corpus = _synthetic_corpus(chunks)
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                shapes.append(len(ids))
+                raise ProviderRequestError(
+                    ProviderFailureKind.LATENCY_TIMEOUT,
+                    "map call latency budget exhausted",
+                )
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        _review, coverage, _store, stats = _run_hierarchical(corpus, fake)
+        self.assertEqual(shapes, [1])
+        self.assertFalse(coverage.complete)
+        self.assertEqual(stats.map_attempts, 1)
+
+    def test_single_chunk_transport_failure_retries_once(self) -> None:
+        chunks = _tiny_chunks(1)
+        corpus = _synthetic_corpus(chunks)
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                shapes.append(len(ids))
+                raise ProviderRequestError(
+                    ProviderFailureKind.TRANSIENT_TRANSPORT,
+                    "connection reset after 0.5s",
+                )
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        _review, coverage, _store, stats = _run_hierarchical(corpus, fake)
+        self.assertEqual(shapes, [1, 1])
+        self.assertFalse(coverage.complete)
+        self.assertEqual(stats.map_attempts, 2)
 
     def test_child_batches_are_not_started_after_map_cutoff(self) -> None:
         chunks = _tiny_chunks(8)
