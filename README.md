@@ -197,8 +197,14 @@ pre-reduces equivalent mapper findings onto canonical survivors, runs a
 targeted source validation pass against those survivors when they still
 request more context, then hierarchically reduces finding IDs again
 (without rewriting their original bodies) and synthesizes the GitHub
-review. Independent map batches run concurrently (default 4 in-flight
-provider calls) so provider latency overlaps. After pre-reduce, remaining
+review. Diff chunk headers in the map prompt use `lines=` for the new-file
+range those hunks cover (first `+` or context line through the last), not
+the number of unified-diff lines in the chunk. LEFT-only deletion hunks
+fall back to the old-file range so the mapper is not given a raw 1-N count.
+Oversized hunk splits continue that file-line cursor across pieces instead
+of adding newline counts onto a hunk start. Independent map batches run
+concurrently (default 4 in-flight provider calls) so provider latency
+overlaps. After pre-reduce, remaining
 cross-context validation is ordered by finding severity (BLOCKING, then
 MAJOR, then MINOR) and merge-decision impact. Mapper aliases such as
 `BLOCKER` canonicalize to `BLOCKING` before ranking and merge joins;
