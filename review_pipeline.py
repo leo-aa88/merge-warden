@@ -85,6 +85,14 @@ MAP_CAPACITY_RETRIES = len(MAP_CAPACITY_BACKOFF_SECONDS)
 # bound this, because several batches can be deferred at once, so without a
 # stage-wide cap a flapping provider could sleep away the map allocation.
 MAX_MAP_CAPACITY_SLEEP_SECONDS = 120.0
+# Provider-wide availability: isolated 429/503 retries stay on the existing
+# per-request ladder. Several independent capacity failures in one run mean
+# the provider is unhealthy, so the scheduler stops creating more work rather
+# than burning the stage budget. Latency timeouts do not count; they still
+# split or widen. Thresholds are consecutive since the last success, so a
+# brief spike that recovers does not open the circuit.
+PROVIDER_CIRCUIT_FAILURE_THRESHOLD = 3
+PROVIDER_CIRCUIT_MIN_INDEPENDENT_REQUESTS = 2
 # A retried latency timeout gets a longer clock than the attempt that failed,
 # since a same-length retry would likely time out the same way.
 MAP_LATENCY_ESCALATION = 1.5
@@ -217,16 +225,144 @@ class ProviderRequestError(RuntimeError):
         message: str,
         *,
         retry_after_seconds: float | None = None,
+        http_status: int | None = None,
     ) -> None:
         super().__init__(message)
         self.kind = kind
         # Parsed Retry-After, when the provider sent one. The map scheduler
         # waits at least this long before re-issuing the same request.
         self.retry_after_seconds = retry_after_seconds
+        self.http_status = http_status
 
     @property
     def is_permanent(self) -> bool:
         return self.kind == ProviderFailureKind.PERMANENT_PROVIDER_ERROR
+
+
+@dataclass
+class ProviderHealth:
+    """Provider+model health for one review run. Scheduler thread only.
+
+    Workers must not mutate this object. Concurrent stages record capacity
+    failures as soon as a worker future lands, before sequential ingest, so
+    a free slot cannot dispatch more work after a 503 already exists.
+    An already-open circuit stays open after in-flight successes; those
+    successes are still ingested and are not treated as failures.
+    """
+
+    provider: str = ""
+    model: str = ""
+    consecutive_failures: int = 0
+    streak_request_ids: list[str] = field(default_factory=list)
+    successful_requests: int = 0
+    circuit_open: bool = False
+    circuit_reason: str = ""
+    prevented_calls: int = 0
+    last_http_status: int | None = None
+    last_message: str = ""
+    _repeat_signature: str = field(default="", repr=False)
+    _repeat_count: int = field(default=0, repr=False)
+
+    def label(self) -> str:
+        provider = (self.provider or "provider").strip() or "provider"
+        model = (self.model or "").strip()
+        if model:
+            return f"{provider}/{model}"
+        return provider
+
+    def distinct_requests(self) -> int:
+        return len(set(self.streak_request_ids))
+
+    def status_line(self) -> str:
+        n = self.consecutive_failures
+        distinct = self.distinct_requests()
+        if n <= 0:
+            return "Provider health: no recent availability failures"
+        if n == 1:
+            return "Provider health: 1 recent availability failure"
+        if distinct <= 1:
+            return f"Provider health: {n} recent availability failures"
+        return (
+            f"Provider health: {n} failures across {distinct} independent requests"
+        )
+
+    def observe_success(self) -> None:
+        """A completed provider response heals the transient streak.
+
+        An already-open circuit stays open: in-flight successes are evidence,
+        not a reason to start hammering the provider again.
+        """
+        self.successful_requests += 1
+        if self.circuit_open:
+            return
+        self.consecutive_failures = 0
+        self.streak_request_ids.clear()
+        self.last_http_status = None
+        self.last_message = ""
+        self._repeat_signature = ""
+        self._repeat_count = 0
+
+    def observe_capacity_failure(
+        self,
+        logical_id: str,
+        *,
+        http_status: int | None = None,
+        retry_after_seconds: float | None = None,
+        remaining_stage_seconds: float | None = None,
+        message: str = "",
+    ) -> bool:
+        """Record a 429/503. Returns True if the circuit is now open."""
+        if self.circuit_open:
+            return True
+        request_id = (logical_id or "").strip() or "unknown"
+        self.consecutive_failures += 1
+        self.streak_request_ids.append(request_id)
+        self.last_http_status = http_status
+        self.last_message = message
+        if (
+            retry_after_seconds is not None
+            and remaining_stage_seconds is not None
+            and retry_after_seconds > remaining_stage_seconds
+        ):
+            return self._open(
+                f"Retry-After {retry_after_seconds:.0f}s exceeds remaining "
+                f"stage budget {remaining_stage_seconds:.0f}s"
+            )
+        distinct = self.distinct_requests()
+        if (
+            self.consecutive_failures >= PROVIDER_CIRCUIT_FAILURE_THRESHOLD
+            and distinct >= PROVIDER_CIRCUIT_MIN_INDEPENDENT_REQUESTS
+        ):
+            status = f"HTTP {http_status} " if http_status else ""
+            return self._open(
+                f"{status}{self.consecutive_failures} availability failures "
+                f"across {distinct} independent requests"
+            )
+        return False
+
+    def note_prevented(self, count: int = 1) -> None:
+        if count > 0:
+            self.prevented_calls += int(count)
+
+    def should_summarize_failure(self, signature: str) -> bool:
+        """True when this identical capacity error was just logged.
+
+        The first occurrence is emitted in full. Repeats of the same
+        sanitized signature increment a counter so the job log does not
+        dump dozens of identical 503 bodies.
+        """
+        text = (signature or "").strip()
+        if text and text == self._repeat_signature:
+            self._repeat_count += 1
+            return True
+        self._repeat_signature = text
+        self._repeat_count = 1
+        return False
+
+    def _open(self, reason: str) -> bool:
+        self.circuit_open = True
+        self.circuit_reason = reason
+        return True
 
 
 @dataclass
@@ -395,6 +531,10 @@ class PipelineStats:
     map_chunks_uncovered: int = 0
     map_capacity_retries: int = 0
     map_latency_retries: int = 0
+    provider_circuit_open: bool = False
+    provider_circuit_reason: str = ""
+    provider_availability_failures: int = 0
+    provider_circuit_prevented_calls: int = 0
     validation_attempts: int = 0
     validation_calls_succeeded: int = 0
     validation_requests: int = 0
@@ -454,6 +594,8 @@ class PipelineStats:
             extras.append("pre-reduce budget exhausted")
         if self.reduce_deadline_exhausted:
             extras.append("reduce budget exhausted")
+        if self.provider_circuit_open:
+            extras.append("provider circuit open")
         if self.map_capacity_retries:
             extras.append(f"{self.map_capacity_retries} capacity retry(ies)")
         if self.map_latency_retries:
@@ -547,6 +689,9 @@ class MapWorkItem:
     # at dispatch so the footer reports retries that reached a provider rather
     # than retries that were planned and later abandoned.
     retry_kind: ProviderFailureKind | None = None
+    # Identity that survives retries. Follow-ups inherit the parent's id so
+    # three retries of one batch are not three independent health signals.
+    logical_id: str = ""
 
 
 def map_call_seconds_needed(http_timeout: float | None = None) -> float:
@@ -765,6 +910,7 @@ class MapStageResult:
     analyzed: list[ContextChunk] = field(default_factory=list)
     deadline_error: PipelineDeadlineExceeded | None = None
     stage_exhausted: bool = False
+    circuit_open: bool = False
     # Permanent provider/config failure. Stops the pipeline without retry or
     # split; evidence collected before the failure is preserved.
     provider_error: BaseException | None = None
@@ -792,12 +938,112 @@ def compact_failure_notes(notes: list[str]) -> list[str]:
             or "map chunk" in lower
             or "map attempt" in lower
             or "non-json" in lower
+            or "provider circuit" in lower
+            or "provider health" in lower
             or "stopping provider work" in lower
             or "permanent provider" in lower
         ):
             continue
         cleaned.append(text)
     return cleaned
+
+
+def _provider_http_status(error: BaseException) -> int | None:
+    """HTTP status carried by a provider error, or parsed from its message."""
+    if isinstance(error, ProviderRequestError) and error.http_status is not None:
+        try:
+            return int(error.http_status)
+        except (TypeError, ValueError):
+            return None
+    match = re.search(r"\bHTTP (\d{3})\b", str(error))
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _record_provider_circuit_open(stats: PipelineStats, health: ProviderHealth) -> None:
+    """Copy circuit state onto stats and emit a note distinct from stage cutoff."""
+    already = stats.provider_circuit_open
+    stats.provider_circuit_open = True
+    stats.provider_circuit_reason = health.circuit_reason
+    stats.provider_availability_failures = health.consecutive_failures
+    stats.provider_circuit_prevented_calls = health.prevented_calls
+    note = sanitize_failure_note(
+        f"provider circuit opened for {health.label()}: {health.circuit_reason}; "
+        "stopping new provider work and failing closed"
+    )
+    if note and note not in stats.notes:
+        stats.notes.append(note)
+    if already:
+        return
+    print(
+        f"Provider circuit opened for {health.label()}. "
+        "Stopping new provider work; preserving completed evidence and failing closed.",
+        flush=True,
+    )
+
+
+def _sync_provider_health_stats(stats: PipelineStats, health: ProviderHealth) -> None:
+    stats.provider_circuit_open = health.circuit_open
+    stats.provider_circuit_reason = health.circuit_reason
+    stats.provider_availability_failures = health.consecutive_failures
+    stats.provider_circuit_prevented_calls = health.prevented_calls
+
+
+def _circuit_open_notice(health: ProviderHealth) -> str:
+    reason = health.circuit_reason or "repeated availability failures"
+    return (
+        "Merge Warden opened the provider circuit after repeated availability "
+        f"failures ({sanitize_failure_note(reason)}) and stopped scheduling new "
+        "provider work. This is not a stage-budget exhaustion."
+    )
+
+
+def _observe_provider_result(
+    health: ProviderHealth | None,
+    stats: PipelineStats,
+    *,
+    logical_id: str,
+    error: BaseException | None,
+    remaining_stage_seconds: float | None = None,
+    succeeded: bool,
+) -> bool:
+    """Record success or a capacity failure. Returns True if the circuit is open.
+
+    Non-capacity errors (latency, transport, malformed JSON) do not affect
+    provider health. ``health`` may be None when a stage is invoked from a
+    unit test that does not share run-level state.
+
+    A True return means the breaker is open, including after a success that
+    landed once it was already open. Callers must not treat that as "this
+    result failed."
+    """
+    if health is None:
+        return False
+    if succeeded:
+        health.observe_success()
+        _sync_provider_health_stats(stats, health)
+        return health.circuit_open
+    if not isinstance(error, ProviderRequestError):
+        return health.circuit_open
+    if error.kind != ProviderFailureKind.CAPACITY:
+        return health.circuit_open
+    signature = sanitize_failure_note(str(error))
+    opened = health.observe_capacity_failure(
+        logical_id,
+        http_status=_provider_http_status(error),
+        retry_after_seconds=error.retry_after_seconds,
+        remaining_stage_seconds=remaining_stage_seconds,
+        message=str(error),
+    )
+    if not health.should_summarize_failure(signature):
+        print(f"{logical_id} failed: {signature}", flush=True)
+    print(health.status_line(), flush=True)
+    if opened:
+        _record_provider_circuit_open(stats, health)
+    else:
+        _sync_provider_health_stats(stats, health)
+    return health.circuit_open
 
 
 def reviewable_member_count(chunks: list[ContextChunk]) -> int:
@@ -955,6 +1201,52 @@ def _provider_failure_result(
     _preserve_unresolved_findings(store)
     review = findings_as_review(
         store, _provider_failure_preamble(corpus, coverage, stats, error)
+    )
+    return review, coverage, store, stats
+
+
+def _circuit_open_preamble(
+    corpus: ReviewCorpus,
+    coverage: CoverageReport,
+    stats: PipelineStats,
+    health: ProviderHealth,
+) -> str:
+    notice = _circuit_open_notice(health)
+    total = reviewable_member_count(corpus.reviewable_chunks)
+    uncovered_n = len(coverage.uncovered_chunk_ids)
+    analyzed = max(total - uncovered_n, 0)
+    if not all_reviewable_context_covered(coverage):
+        base = _incomplete_preamble(corpus, coverage, stats)
+        return base.replace("# COMMENT\n\n", f"# COMMENT\n\n{notice}\n\n", 1)
+    return (
+        "# COMMENT\n\n"
+        f"{notice}\n\n"
+        f"Primary context coverage: {analyzed}/{total} chunks.\n\n"
+        "Validation/reduction/synthesis did not complete, so no merge "
+        "recommendation was produced.\n\n"
+        "No approval decision was produced.\n"
+    )
+
+
+def _circuit_open_result(
+    *,
+    corpus: ReviewCorpus,
+    coverage: CoverageReport,
+    store: EvidenceStore,
+    stats: PipelineStats,
+    health: ProviderHealth,
+    analyzed: list[ContextChunk] | None = None,
+) -> tuple[dict, CoverageReport, EvidenceStore, PipelineStats]:
+    if analyzed is not None:
+        mark_chunks_covered(coverage, analyzed)
+        stats.map_chunks_acknowledged = len(analyzed)
+        stats.map_chunks_uncovered = max(stats.chunks - len(analyzed), 0)
+        stats.raw_finding_count = len(store.findings)
+    _record_provider_circuit_open(stats, health)
+    stats.coverage_complete = all_reviewable_context_covered(coverage)
+    _preserve_unresolved_findings(store)
+    review = findings_as_review(
+        store, _circuit_open_preamble(corpus, coverage, stats, health)
     )
     return review, coverage, store, stats
 
@@ -1771,6 +2063,7 @@ def hierarchical_reduce(
     findings: list[Finding] | None = None,
     deadline: float | None = None,
     stage_token: str = "",
+    provider_health: ProviderHealth | None = None,
 ) -> None:
     if findings is None:
         findings = list(store.findings.values())
@@ -1802,6 +2095,9 @@ def hierarchical_reduce(
         round_number += 1
         next_kept_ids: list[str] = []
         for group in groups:
+            if provider_health is not None and provider_health.circuit_open:
+                _preserve_unresolved_findings(store)
+                return
             if deadline_reached():
                 stop_for_deadline()
                 return
@@ -1831,16 +2127,43 @@ def hierarchical_reduce(
                         f"reduce call failed ({exc}); keeping original findings"
                     )
                 )
+                if _observe_provider_result(
+                    provider_health,
+                    stats,
+                    logical_id=f"reduce:{','.join(item.id for item in group)}",
+                    error=exc,
+                    remaining_stage_seconds=remaining_stage_seconds(deadline),
+                    succeeded=False,
+                ):
+                    _preserve_unresolved_findings(store)
+                    return
                 for item in group:
                     store.kept.add(item.id)
                     next_kept_ids.append(item.id)
                 continue
             except Exception as exc:  # pragma: no cover - defensive
                 stats.notes.append(f"reduce call failed ({exc}); keeping original findings")
+                if _observe_provider_result(
+                    provider_health,
+                    stats,
+                    logical_id=f"reduce:{','.join(item.id for item in group)}",
+                    error=exc,
+                    remaining_stage_seconds=remaining_stage_seconds(deadline),
+                    succeeded=False,
+                ):
+                    _preserve_unresolved_findings(store)
+                    return
                 for item in group:
                     store.kept.add(item.id)
                     next_kept_ids.append(item.id)
                 continue
+            _observe_provider_result(
+                provider_health,
+                stats,
+                logical_id=f"reduce:{','.join(item.id for item in group)}",
+                error=None,
+                succeeded=True,
+            )
             group_ids = [item.id for item in group]
             apply_reduce_decision(store, raw, group_ids)
             for item in group:
@@ -1903,6 +2226,7 @@ def run_pre_reduce(
     max_request_chars: int,
     stats: PipelineStats,
     deadline: float | None = None,
+    provider_health: ProviderHealth | None = None,
 ) -> None:
     """Triage raw mapper findings before cross-context validation.
 
@@ -1920,6 +2244,7 @@ def run_pre_reduce(
         stats,
         deadline=deadline,
         stage_token=PRE_REDUCE_STAGE_TOKEN,
+        provider_health=provider_health,
     )
     store.reduced = True
     prune_context_needs(store)
@@ -2408,6 +2733,7 @@ def _plan_primary_map_work(
                     batch_tag=tag,
                     sequence=sequence,
                     message=request.message,
+                    logical_id=tag,
                 )
             )
     return items
@@ -2435,6 +2761,7 @@ def run_map_stage(
     max_request_chars: int,
     map_concurrency: int,
     deadline: float | None = None,
+    provider_health: ProviderHealth | None = None,
 ) -> MapStageResult:
     """Map packed chunks with bounded parallel provider calls.
 
@@ -2446,8 +2773,13 @@ def run_map_stage(
     and leaves remaining chunks uncovered so validation, reduce, and
     synthesis can still use their reserved windows. A global
     ``PipelineDeadlineExceeded`` still aborts the whole review.
+
+    ``provider_health`` tracks 429/503 signals across independent requests.
+    Opening the circuit stops new map work without consuming later-stage
+    reserves; that is a different event from ``stage_exhausted``.
     """
     concurrency = normalize_map_concurrency(map_concurrency)
+    health = provider_health if provider_health is not None else ProviderHealth()
     pending: deque[MapWorkItem] = deque(
         _plan_primary_map_work(
             corpus=corpus,
@@ -2533,8 +2865,15 @@ def run_map_stage(
         time.sleep(delay)
         return True
 
-    def enqueue(follow_ups: list[MapFollowUp], parent_tag: str) -> None:
+    def enqueue(
+        follow_ups: list[MapFollowUp],
+        parent_tag: str,
+        parent_logical_id: str = "",
+    ) -> None:
         nonlocal next_sequence, backoff_spent
+        if health.circuit_open:
+            health.note_prevented(len(follow_ups))
+            return
         if not map_call_fits_remaining_budget():
             # Not even a standard call fits, so no follow-up can dispatch. Stop
             # map so synthesis can still use its reserved window.
@@ -2584,6 +2923,7 @@ def run_map_stage(
                     ready_at=now + follow_up.delay_seconds,
                     http_timeout=follow_up.http_timeout,
                     retry_kind=follow_up.retry_kind,
+                    logical_id=parent_logical_id or parent_tag,
                 )
             )
 
@@ -2599,6 +2939,11 @@ def run_map_stage(
         nonlocal deadline_error
         if error is not None:
             deadline_error = deadline_error or error
+        abandon_pending()
+
+    def open_provider_circuit() -> None:
+        health.note_prevented(len(pending))
+        _record_provider_circuit_open(stats, health)
         abandon_pending()
 
     def stop_for_permanent_provider(error: BaseException) -> None:
@@ -2622,6 +2967,40 @@ def run_map_stage(
         stage_exhausted = True
         abandon_pending()
 
+    def apply_health_from_worker(result: MapWorkerResult) -> None:
+        """Update provider health as soon as a future lands on this thread.
+
+        Concurrent 503s are counted here, before sequential ingest plans
+        retries, so three independent capacity failures open the circuit
+        without first dispatching a retry storm.
+        """
+        if result.skipped or result.oversized:
+            return
+        if result.error is None:
+            health.observe_success()
+            _sync_provider_health_stats(stats, health)
+            return
+        if not isinstance(result.error, ProviderRequestError):
+            return
+        if result.error.kind != ProviderFailureKind.CAPACITY:
+            return
+        signature = sanitize_failure_note(str(result.error))
+        opened = health.observe_capacity_failure(
+            result.item.logical_id or result.item.batch_tag,
+            http_status=_provider_http_status(result.error),
+            retry_after_seconds=result.error.retry_after_seconds,
+            remaining_stage_seconds=remaining_map_seconds(),
+            message=str(result.error),
+        )
+        if not health.should_summarize_failure(signature):
+            print(
+                f"Map batch {result.item.batch_tag} failed: {signature}",
+                flush=True,
+            )
+        print(health.status_line(), flush=True)
+        if opened:
+            open_provider_circuit()
+
     executor = ThreadPoolExecutor(
         max_workers=concurrency,
         thread_name_prefix="mw-map",
@@ -2634,6 +3013,7 @@ def run_map_stage(
                 and deadline_error is None
                 and permanent_error is None
                 and not stage_exhausted
+                and not health.circuit_open
             ):
                 if map_stage_reached():
                     exhaust_map_stage()
@@ -2761,7 +3141,12 @@ def run_map_stage(
                 if _is_permanent_provider_error(result.error):
                     stop_for_permanent_provider(result.error)
                     continue
-                if deadline_error is not None or permanent_error is not None or stage_exhausted:
+                if (
+                    deadline_error is not None
+                    or permanent_error is not None
+                    or stage_exhausted
+                    or health.circuit_open
+                ):
                     continue
                 if stats.map_attempts >= MAX_MAP_ATTEMPTS:
                     _record_map_budget_exhausted(stats)
@@ -2780,6 +3165,7 @@ def run_map_stage(
                         elapsed_seconds=result.elapsed_seconds,
                     ),
                     result.item.batch_tag,
+                    result.item.logical_id or result.item.batch_tag,
                 )
 
             if not in_flight:
@@ -2787,6 +3173,7 @@ def run_map_stage(
                     deadline_error is not None
                     or permanent_error is not None
                     or stage_exhausted
+                    or health.circuit_open
                     or stats.map_attempts >= MAX_MAP_ATTEMPTS
                 ):
                     abandon_pending()
@@ -2819,6 +3206,7 @@ def run_map_stage(
                 in_flight.pop(sequence)
                 worker_result = future.result()
                 completed[sequence] = worker_result
+                apply_health_from_worker(worker_result)
                 if isinstance(worker_result.error, PipelineDeadlineExceeded):
                     stop_scheduling(worker_result.error)
                 elif isinstance(worker_result.error, StageDeadlineExceeded):
@@ -2836,10 +3224,12 @@ def run_map_stage(
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
+    _sync_provider_health_stats(stats, health)
     return MapStageResult(
         analyzed=analyzed,
         deadline_error=deadline_error,
         stage_exhausted=stage_exhausted or stats.map_deadline_exhausted,
+        circuit_open=health.circuit_open,
         provider_error=permanent_error,
     )
 
@@ -3126,6 +3516,7 @@ def run_validation_pass(
     context_loader: ContextLoader | None = None,
     deadline: float | None = None,
     validation_concurrency: int = DEFAULT_VALIDATION_CONCURRENCY,
+    provider_health: ProviderHealth | None = None,
 ) -> None:
     """Run targeted validation until the call cap or stage deadline.
 
@@ -3187,6 +3578,10 @@ def run_validation_pass(
         deadline_note_added = True
 
     def cannot_start_provider_call() -> bool:
+        nonlocal stop_validation
+        if provider_health is not None and provider_health.circuit_open:
+            stop_validation = True
+            return True
         if permanent_error is not None:
             return True
         if stop_validation or (
@@ -3318,6 +3713,38 @@ def run_validation_pass(
             return
         finalize_task(task)
 
+    def apply_health_from_worker(result: ValidationWorkerResult) -> None:
+        """Update provider health as soon as a future lands on this thread.
+
+        Same policy as map: concurrent 503s are counted here, before
+        sequential ingest, so a free worker cannot take another path after
+        the breaker should already be open.
+        """
+        nonlocal stop_validation
+        if provider_health is None:
+            return
+        if isinstance(
+            result.error, (PipelineDeadlineExceeded, StageDeadlineExceeded)
+        ):
+            return
+        if _is_permanent_provider_error(result.error):
+            return
+        was_open = provider_health.circuit_open
+        _observe_provider_result(
+            provider_health,
+            stats,
+            logical_id=f"validation:{result.item.path}",
+            error=result.error,
+            remaining_stage_seconds=remaining_stage_seconds(deadline),
+            succeeded=result.error is None,
+        )
+        if not provider_health.circuit_open:
+            return
+        stop_validation = True
+        if not was_open:
+            provider_health.note_prevented(len(pending))
+        abandon_pending()
+
     executor = ThreadPoolExecutor(
         max_workers=concurrency,
         thread_name_prefix="mw-val",
@@ -3392,6 +3819,19 @@ def run_validation_pass(
                 fresh = seen - task.acknowledged_ids
                 task.acknowledged_ids.update(seen)
                 stats.validation_chunks_acknowledged += len(fresh)
+                circuit_open = (
+                    provider_health is not None and provider_health.circuit_open
+                )
+                if circuit_open or stop_validation:
+                    # In-flight successes still count. Do not stamp
+                    # validation:incomplete on a path that just acknowledged
+                    # chunks. Remaining work cannot start another provider call.
+                    if result.error is not None or not seen:
+                        defer_task(task)
+                    elif task.pending_batches or _validation_remaining(task):
+                        finalize_task(task)
+                    abandon_pending()
+                    continue
                 adopt_new_needs()
                 requeue_or_finish(task)
 
@@ -3415,6 +3855,7 @@ def run_validation_pass(
                 )
                 in_flight.pop(sequence)
                 completed[sequence] = future.result()
+                apply_health_from_worker(completed[sequence])
                 error = completed[sequence].error
                 if isinstance(
                     error, (PipelineDeadlineExceeded, StageDeadlineExceeded)
@@ -3455,6 +3896,8 @@ def run_hierarchical_review(
     validation_concurrency: int = DEFAULT_VALIDATION_CONCURRENCY,
     context_loader: ContextLoader | None = None,
     deadline: float | None = None,
+    provider: str = "",
+    model: str = "",
 ) -> tuple[dict, CoverageReport, EvidenceStore, PipelineStats]:
     stats = PipelineStats(
         chunks=len(corpus.reviewable_chunks),
@@ -3462,6 +3905,7 @@ def run_hierarchical_review(
     )
     coverage = corpus.coverage
     store = EvidenceStore()
+    health = ProviderHealth(provider=provider, model=model)
 
     if corpus.limit_error:
         stats.notes.append(corpus.limit_error)
@@ -3504,6 +3948,7 @@ def run_hierarchical_review(
         max_request_chars=max_map_request_chars,
         map_concurrency=map_concurrency,
         deadline=map_deadline,
+        provider_health=health,
     )
     analyzed.extend(map_result.analyzed)
     stats.raw_finding_count = len(store.findings)
@@ -3533,6 +3978,15 @@ def run_hierarchical_review(
     stats.map_chunks_uncovered = max(stats.chunks - len(analyzed), 0)
     if map_result.stage_exhausted:
         stats.map_deadline_exhausted = True
+    if health.circuit_open:
+        return _circuit_open_result(
+            corpus=corpus,
+            coverage=coverage,
+            store=store,
+            stats=stats,
+            health=health,
+        )
+    mapped_ids: set[str] = set()
     try:
         run_pre_reduce(
             store,
@@ -3541,28 +3995,33 @@ def run_hierarchical_review(
             max_reduce_request_chars,
             stats,
             deadline=validation_stage_deadline(deadline),
+            provider_health=health,
         )
-        mapped_ids = set(store.findings)
-        run_validation_pass(
-            corpus,
-            store,
-            map_prompt,
-            call_model,
-            max_map_request_chars,
-            stats,
-            context_loader=context_loader,
-            deadline=validation_stage_deadline(deadline),
-            validation_concurrency=validation_concurrency,
-        )
-        hierarchical_reduce(
-            store,
-            reduce_prompt,
-            call_model,
-            max_reduce_request_chars,
-            stats,
-            findings=seed_final_reduce(store, mapped_ids),
-            deadline=reduce_stage_deadline(deadline),
-        )
+        if not health.circuit_open:
+            mapped_ids = set(store.findings)
+            run_validation_pass(
+                corpus,
+                store,
+                map_prompt,
+                call_model,
+                max_map_request_chars,
+                stats,
+                context_loader=context_loader,
+                deadline=validation_stage_deadline(deadline),
+                validation_concurrency=validation_concurrency,
+                provider_health=health,
+            )
+        if not health.circuit_open:
+            hierarchical_reduce(
+                store,
+                reduce_prompt,
+                call_model,
+                max_reduce_request_chars,
+                stats,
+                findings=seed_final_reduce(store, mapped_ids),
+                deadline=reduce_stage_deadline(deadline),
+                provider_health=health,
+            )
     except ProviderRequestError as exc:
         if not exc.is_permanent:
             raise
@@ -3583,6 +4042,14 @@ def run_hierarchical_review(
         note = sanitize_failure_note(f"stage deadline exhausted: {exc}")
         if note and note not in stats.notes:
             stats.notes.append(note)
+    if health.circuit_open:
+        return _circuit_open_result(
+            corpus=corpus,
+            coverage=coverage,
+            store=store,
+            stats=stats,
+            health=health,
+        )
     stats.coverage_complete = all_reviewable_context_covered(coverage)
 
     coverage_complete = all_reviewable_context_covered(coverage)

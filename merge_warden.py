@@ -526,8 +526,13 @@ def provider_http_error(
             ProviderFailureKind.CAPACITY,
             message,
             retry_after_seconds=parse_retry_after(retry_after),
+            http_status=code,
         )
-    return ProviderRequestError(ProviderFailureKind.TRANSIENT_TRANSPORT, message)
+    return ProviderRequestError(
+        ProviderFailureKind.TRANSIENT_TRANSPORT,
+        message,
+        http_status=code,
+    )
 
 
 # Explicit model/config failure markers. Deliberately excludes bare "invalid",
@@ -2294,6 +2299,8 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             env_int("MERGE_WARDEN_MAX_LAZY_CONTEXT_BYTES", MAX_LAZY_CONTEXT_BYTES),
         ),
         deadline=provider_deadline,
+        provider=provider,
+        model=model,
     )
     if not coverage.complete:
         print(
@@ -2338,6 +2345,16 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             file=sys.stderr,
             flush=True,
         )
+    if getattr(stats, "provider_circuit_open", False) is True:
+        reason = str(getattr(stats, "provider_circuit_reason", "") or "").strip()
+        suffix = f" ({reason})" if reason else ""
+        print(
+            "::warning::Merge Warden provider circuit opened; "
+            "stopped scheduling new provider work and failing closed"
+            f"{suffix}",
+            file=sys.stderr,
+            flush=True,
+        )
     for note in stats.notes:
         print(f"::warning::{note}", file=sys.stderr, flush=True)
     print(stats.footer(), flush=True)
@@ -2345,10 +2362,13 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
         synthesis_calls = int(getattr(stats, "synthesis_calls", 0) or 0)
     except (TypeError, ValueError):
         synthesis_calls = 0
-    synthesis_completed = not stats.deadline_exhausted and synthesis_calls > 0
-    unsynthesized = stats.deadline_exhausted or not synthesis_completed
+    circuit_open = getattr(stats, "provider_circuit_open", False) is True
+    synthesis_completed = (
+        not stats.deadline_exhausted and synthesis_calls > 0 and not circuit_open
+    )
+    unsynthesized = stats.deadline_exhausted or not synthesis_completed or circuit_open
     fail_closed_inline = unsynthesized and (
-        not coverage.complete or stats.deadline_exhausted
+        not coverage.complete or stats.deadline_exhausted or circuit_open
     )
     if fail_closed_inline:
         # Synthesis did not complete. Mapper candidates are not review findings.
