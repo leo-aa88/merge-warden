@@ -151,13 +151,9 @@ Do not escalate severity merely through stronger wording.
 
 Do not APPROVE if the coverage report says the review is incomplete.
 
-A finding carrying evidence beginning with:
+A `validation:incomplete:` marker means required context was not successfully validated.
 
-`validation:incomplete:`
-
-has an unresolved cross-context dependency.
-
-Do not promote such a finding to CONFIRMED unless the required context was actually validated.
+Do not promote that finding to CONFIRMED unless the missing context is later successfully validated.
 
 If evidence is insufficient:
 
