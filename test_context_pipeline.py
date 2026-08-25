@@ -2260,6 +2260,100 @@ class ValidationAcknowledgementTests(unittest.TestCase):
                 )
 
 
+class IncompleteValidationApproveGuardTests(unittest.TestCase):
+    """A failed validation stays binding even after the finding is rejected."""
+
+    def _rejected_incomplete_store(self) -> EvidenceStore:
+        store = EvidenceStore()
+        f1 = Finding(
+            "F1", "BLOCKING", "a.c", "RIGHT", 1, "needs foo.h", "LIKELY", ["chunk:c1"],
+        )
+        f2 = Finding(
+            "F2", "MINOR", "b.c", "RIGHT", 2, "style", "CONFIRMED", ["chunk:c2"],
+        )
+        store.findings["F1"] = f1
+        store.findings["F2"] = f2
+        rp._mark_incomplete_validation(store, [f1], "foo.h")
+        store.kept.update({"F1", "F2"})
+        store.reduced = True
+        self.assertTrue(rp._has_incomplete_validation(store))
+        store.kept.discard("F1")
+        store.rejected["F1"] = "unproven after failed validation"
+        return store
+
+    def test_rejecting_incomplete_finding_still_blocks_approve(self) -> None:
+        store = self._rejected_incomplete_store()
+        self.assertEqual(store.incomplete_context, {"foo.h": {"F1"}})
+        self.assertTrue(rp._has_incomplete_validation(store))
+        event, body = rp.apply_incomplete_validation_guard(
+            "APPROVE", "# APPROVE\n", store
+        )
+        self.assertEqual(event, "COMMENT")
+        self.assertIn("could not validate all requested context", body)
+        self.assertNotEqual(rp.normalize_event(event, body), "APPROVE")
+
+    def test_unrelated_kept_finding_cannot_approve_after_incomplete_reject(
+        self,
+    ) -> None:
+        store = self._rejected_incomplete_store()
+        kept = store.kept_findings()
+        self.assertEqual([item.id for item in kept], ["F2"])
+        self.assertEqual(kept[0].severity, "MINOR")
+        event, body = rp.apply_incomplete_validation_guard(
+            "APPROVE", "# APPROVE\n\nLooks good.\n", store
+        )
+        self.assertEqual(event, "COMMENT")
+        self.assertIn("could not validate all requested context", body)
+
+    def test_incomplete_marker_on_rejected_finding_blocks_approve(self) -> None:
+        store = EvidenceStore()
+        store.findings["F1"] = Finding(
+            "F1",
+            "BLOCKING",
+            "a.c",
+            "RIGHT",
+            1,
+            "needs foo.h",
+            "LIKELY",
+            ["chunk:c1", "validation:incomplete:foo.h"],
+        )
+        store.findings["F2"] = Finding(
+            "F2", "MINOR", "b.c", "RIGHT", 2, "style", "CONFIRMED", ["chunk:c2"],
+        )
+        store.kept.add("F2")
+        store.rejected["F1"] = "unproven after failed validation"
+        store.reduced = True
+        self.assertFalse(store.incomplete_context)
+        self.assertTrue(rp._has_incomplete_validation(store))
+        event, _body = rp.apply_incomplete_validation_guard(
+            "APPROVE", "# APPROVE\n", store
+        )
+        self.assertEqual(event, "COMMENT")
+
+    def test_alias_approve_blocked_after_incomplete_finding_rejected(self) -> None:
+        store = self._rejected_incomplete_store()
+        event, body = rp.apply_incomplete_validation_guard(
+            "lgtm", "# APPROVE\n", store
+        )
+        self.assertEqual(event, "COMMENT")
+        self.assertNotEqual(rp.normalize_event(event, body), "APPROVE")
+
+    def test_complete_validation_without_markers_still_allows_approve(self) -> None:
+        store = EvidenceStore()
+        store.findings["F2"] = Finding(
+            "F2", "MINOR", "b.c", "RIGHT", 2, "style", "CONFIRMED", ["chunk:c2"],
+        )
+        store.kept.add("F2")
+        store.reduced = True
+        self.assertFalse(store.incomplete_context)
+        self.assertFalse(rp._has_incomplete_validation(store))
+        event, body = rp.apply_incomplete_validation_guard(
+            "APPROVE", "# APPROVE\n", store
+        )
+        self.assertEqual(event, "APPROVE")
+        self.assertEqual(body, "# APPROVE\n")
+
+
 class ContextNeedOwnershipTests(unittest.TestCase):
     def _map_then(
         self,

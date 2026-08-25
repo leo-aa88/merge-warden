@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 import merge_warden as mw
-from review_pipeline import EvidenceStore, Finding
+from review_pipeline import EvidenceStore, Finding, _mark_incomplete_validation
 
 
 def _chunk_ids_in_prompt(user: str) -> list[str]:
@@ -1135,6 +1135,58 @@ class IncompletePipelinePostingTests(unittest.TestCase):
         self.assertIn("could not validate all requested context", payload["body"])
         self.assertIn("could not validate all requested context", markdown)
         self.assertNotEqual(mw.normalize_event(payload["event"], payload["body"]), "APPROVE")
+
+    def test_generate_review_rejected_incomplete_validation_cannot_approve(
+        self,
+    ) -> None:
+        review = {
+            "event": "APPROVE",
+            "body": "# APPROVE\n\nLooks good.\n",
+            "comments": [self.RAW_COMMENT],
+        }
+        coverage, stats = self._stats(complete=True, deadline_exhausted=False)
+        stats.synthesis_calls = 1
+        store = EvidenceStore()
+        f1 = Finding(
+            id="F1",
+            severity="BLOCKING",
+            path="a.c",
+            side="RIGHT",
+            line=1,
+            body="needs foo.h",
+            confidence="LIKELY",
+            evidence=["chunk:c1"],
+        )
+        f2 = Finding(
+            id="F2",
+            severity="MINOR",
+            path="b.c",
+            side="RIGHT",
+            line=2,
+            body="style",
+            confidence="CONFIRMED",
+            evidence=["chunk:c2"],
+        )
+        store.findings["F1"] = f1
+        store.findings["F2"] = f2
+        _mark_incomplete_validation(store, [f1], "foo.h")
+        store.kept.update({"F1", "F2"})
+        store.reduced = True
+        store.kept.discard("F1")
+        store.rejected["F1"] = "unproven after failed validation"
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp)
+            rc = self._generate(args, review, coverage, stats, store=store)
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+            markdown = Path(args.output).read_text(encoding="utf-8")
+        self.assertEqual(rc, 0)
+        self.assertEqual(payload["event"], "COMMENT")
+        self.assertEqual(payload.get("comments") or [], [])
+        self.assertIn("could not validate all requested context", payload["body"])
+        self.assertIn("could not validate all requested context", markdown)
+        self.assertNotEqual(
+            mw.normalize_event(payload["event"], payload["body"]), "APPROVE"
+        )
 
     def test_synthesized_incomplete_coverage_cannot_approve(self) -> None:
         review = {
