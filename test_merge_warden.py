@@ -1118,6 +1118,119 @@ class StaleHeadTests(unittest.TestCase):
         self.assertGreaterEqual(call_model.call_count, 2)
 
 
+class IssueRefScrapeTests(unittest.TestCase):
+    """Body scrape must collect GitHub issue refs, not language versions or steps."""
+
+    REPRO_MUST_NOT_MATCH = (
+        "C#12",
+        "C#13",
+        "Python#3",
+        "step #1 of the plan",
+        "see PR #238",
+        "PR #238",
+    )
+    CLOSING_KEYWORD_CASES = (
+        ("Fixes #12", 12),
+        ("close #3", 3),
+        ("closes #3", 3),
+        ("closed #3", 3),
+        ("fix #3", 3),
+        ("fixes #3", 3),
+        ("fixed #3", 3),
+        ("resolve #9", 9),
+        ("resolves #9", 9),
+        ("resolved #9", 9),
+        ("FIXES #12", 12),
+        ("Closes #3", 3),
+        ("RESOLVED #9", 9),
+    )
+
+    def _viewed(self, body: str, closing: list[dict] | None = None) -> tuple[list[int], int, list[int]]:
+        calls: list[int] = []
+
+        def fake_gh_json(args: list[str]):
+            number = int(args[2])
+            calls.append(number)
+            return {
+                "number": number,
+                "title": "t",
+                "body": "b",
+                "state": "open",
+                "labels": [],
+            }
+
+        with mock.patch.object(mw, "gh_json", side_effect=fake_gh_json):
+            records, omitted = mw.collect_issue_records("o/r", body, closing or [])
+        return [record["number"] for record in records], omitted, calls
+
+    def test_repro_strings_are_not_language_or_step_refs(self) -> None:
+        for text in self.REPRO_MUST_NOT_MATCH:
+            with self.subTest(text=text):
+                self.assertEqual(mw.scrape_issue_numbers(text), [], text)
+
+    def test_issue_ref_re_rejects_hash_glued_to_a_letter(self) -> None:
+        self.assertEqual(mw.ISSUE_REF_RE.findall("C#12"), [])
+        self.assertEqual(mw.ISSUE_REF_RE.findall("C#13"), [])
+        self.assertEqual(mw.ISSUE_REF_RE.findall("Python#3"), [])
+        self.assertEqual(mw.ISSUE_REF_RE.findall("Fixes #12"), ["12"])
+
+    def test_repro_csharp_body_scrapes_only_real_issue(self) -> None:
+        text = "Update to C#12 and C#13. Fixes #400."
+        self.assertEqual(mw.ISSUE_REF_RE.findall(text), ["400"])
+        self.assertEqual(mw.scrape_issue_numbers(text), [400])
+
+    def test_closing_keyword_variants_extract_the_number(self) -> None:
+        for text, number in self.CLOSING_KEYWORD_CASES:
+            with self.subTest(text=text):
+                self.assertEqual(mw.ISSUE_REF_RE.findall(text), [str(number)], text)
+                self.assertEqual(mw.scrape_issue_numbers(text), [number], text)
+
+    def test_bare_hash_after_whitespace_or_brackets_is_an_issue(self) -> None:
+        self.assertEqual(mw.scrape_issue_numbers("#12"), [12])
+        self.assertEqual(mw.scrape_issue_numbers("see #12 please"), [12])
+        self.assertEqual(mw.scrape_issue_numbers("see (#42) and [#7]"), [42, 7])
+
+    def test_pull_request_prefix_is_not_an_issue(self) -> None:
+        self.assertEqual(mw.scrape_issue_numbers("see pull request #5"), [])
+        self.assertEqual(mw.scrape_issue_numbers("see Pull Request #5"), [])
+
+    def test_step_as_a_suffix_does_not_exclude_a_token_hash(self) -> None:
+        self.assertEqual(mw.scrape_issue_numbers("nextstep #8"), [8])
+
+    def test_paired_fenced_code_hash_is_not_an_issue(self) -> None:
+        text = "Fixes #400.\n```python\n#1\nprint('#2')\n```\n"
+        self.assertEqual(mw.scrape_issue_numbers(text), [400])
+
+    def test_unclosed_fence_does_not_drop_later_issue_refs(self) -> None:
+        text = "```\n#1\nFixes #400."
+        self.assertEqual(mw.scrape_issue_numbers(text), [1, 400])
+
+    def test_whitespace_separated_bare_hashes_remain_issue_refs(self) -> None:
+        body = " ".join(f"#{index}" for index in range(1, 51))
+        self.assertEqual(mw.scrape_issue_numbers(body), list(range(1, 51)))
+
+    def test_collect_issue_records_skips_csharp_versions(self) -> None:
+        body = "Update to C#12 and C#13. Fixes #400."
+        numbers, omitted, calls = self._viewed(body, [])
+        self.assertEqual(numbers, [400])
+        self.assertEqual(calls, [400])
+        self.assertEqual(omitted, 0)
+
+    def test_closing_issue_references_are_prepended(self) -> None:
+        body = "Update to C#12 and C#13. Fixes #400. Also #7"
+        numbers, omitted, calls = self._viewed(body, [{"number": 99}])
+        self.assertEqual(numbers, [99, 400, 7])
+        self.assertEqual(calls, [99, 400, 7])
+        self.assertEqual(omitted, 0)
+
+    def test_official_closing_refs_win_over_false_positive_text(self) -> None:
+        body = "Update to C#12. Fixes #400."
+        numbers, omitted, calls = self._viewed(body, [{"number": 12}])
+        self.assertEqual(numbers, [12, 400])
+        self.assertEqual(calls, [12, 400])
+        self.assertEqual(omitted, 0)
+
+
 class LinkedIssueCapTests(unittest.TestCase):
     def test_issue_fanout_is_capped_before_github_calls(self) -> None:
         body = " ".join(f"#{index}" for index in range(1, 51))

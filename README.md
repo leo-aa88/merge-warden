@@ -169,7 +169,12 @@ with `git show`.
 - `comment-count` — `posted-comment-count` when posting, otherwise `generated-comment-count`
 
 Injected after the system prompt for the primary pass: architectural docs,
-issue bodies, PR description, and the complete diff. If `gh pr diff` fails,
+issue bodies, PR description, and the complete diff. Linked issues come from
+GitHub's `closingIssuesReferences` first, then a body scrape capped at 20.
+The scrape collects `Fixes #N` (and the other close/fix/resolve forms) and
+token `#N` after whitespace, `(`, or `[`. It does not treat `C#12`,
+`Python#3`, `step #1`, or `PR #238` as issues. Paired fenced code blocks are
+skipped so an example `#1` is not fetched. If `gh pr diff` fails,
 Merge Warden reconstructs hunks from the per-file `patch` fields already
 returned by the Pulls Files API and treats those hunks as review evidence.
 `APPROVE` stays unreachable unless every non-excluded changed file with
