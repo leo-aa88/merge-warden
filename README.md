@@ -269,15 +269,47 @@ time reserved for later stages:
 - synthesis uses the remaining provider budget
 
 Map calls also have a tighter per-call latency budget (140s HTTP timeout, 150s
-logical call budget, 1 HTTP attempt) so valid Grok responses longer than 90s
-can complete while slow batches still split before downstream reserves are
-threatened. A multi-chunk map call that exhausts its latency budget is split
-immediately instead of retrying the same expensive shape. A cheap transient
-transport failure may retry the same shape once when enough map budget remains.
-A map follow-up is not started unless a full call budget remains. Exhausting
-the map-stage allocation leaves remaining primary chunks uncovered and
-**continues** into validation, reduction, and synthesis. Exhausting the global
-provider deadline still fail-closes immediately.
+logical call budget, 1 HTTP attempt) so valid Grok responses longer than 90s can
+complete while slow batches still split before downstream reserves are
+threatened. Map performs no in-call retry: a single attempt returns its failure
+to the map scheduler, which can defer a batch without holding a worker thread
+and keeps the failure classification intact.
+
+How a failed map batch recovers depends on why it failed:
+
+| Failure | Recovery |
+| --- | --- |
+| Capacity (HTTP 429/503) | Re-send the same request after a backoff, up to four times. Never split: a provider shedding load is not asking for a smaller request, and splitting would double the request rate against it |
+| Latency timeout, multi-chunk | Split immediately rather than repeat an expensive shape |
+| Latency timeout, single chunk | Re-send under a widened clock (1.5x the failed attempt, capped at 240s), since the same clock would likely time out again |
+| Transport fault | Re-send the same request |
+| Malformed or partial response | Split, or re-send a single chunk |
+
+Capacity backoff honors a provider `Retry-After` header when present, capped at
+60s, and otherwise backs off 4s, 8s, 16s, 30s. A deferred batch does not hold a
+worker while it waits, and the scheduler only waits once no completed or
+in-flight work remains to process. The map stage spends at most 120s in total
+waiting out capacity backoff, so one flapping batch cannot sleep away the
+allocation that other batches still need.
+
+Every retry is bounded by the **remaining map budget**, not by a fixed counter.
+Merge Warden schedules another attempt only when the stage can still fund one of
+roughly the observed cost, so a chunk is abandoned because time ran out rather
+than because a counter did. Fixed ceilings remain as safety rails against a
+provider that rejects instantly; they are counted per chunk, so splitting a
+batch does not hand its halves a fresh retry allowance. A map call is not
+started unless its
+own call budget remains, which for a widened retry is larger than the standard
+one; a widened retry that no longer fits leaves its chunk uncovered rather than
+re-running under the clock that already failed.
+
+When a capacity retry or a widened latency retry happens, the pipeline footer
+in `merge-warden.md` reports it, so these paths are visible in the job log.
+
+Exhausting the map-stage allocation leaves remaining primary chunks uncovered
+and **continues** into validation, reduction, and synthesis. Exhausting the
+global provider deadline still fail-closes immediately. Uncovered chunks always
+make `APPROVE` unreachable, however they came to be uncovered.
 
 Once a stage cutoff is reached, that stage stops scheduling new provider
 calls and the pipeline continues. Remaining cross-context checks are marked
