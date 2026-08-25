@@ -125,13 +125,13 @@ authored by the same GitHub identity that is posting the new review. The
 marker is necessary, not sufficient: a pasted `<!-- merge-warden -->` on a
 human or foreign-bot comment is not owned and is not deleted. Posting identity
 comes from the credentials in use (`GET /user` login for a PAT, `{app_slug}[bot]`
-from `GET /installation` for a GitHub App, or `github-actions[bot]` for the
-default Actions `github.token` when those lookups 403). `GITHUB_ACTOR` is the
-triggering user and is not used. If identity lookup fails, the new review is
-still posted and previous comments are left in place — duplicates are
-preferable to deleting another author's threads. Replacement DELETE runs only
-after GitHub accepts the new review; a failed post also leaves previous
-threads in place.
+from `GET /installation` for a GitHub App). `GITHUB_ACTIONS` identifies the
+execution environment, not the credential identity, and `GITHUB_ACTOR` is the
+triggering user; neither is used as proof of ownership. If identity lookup
+fails, the new review is still posted and previous comments are left in
+place — duplicates are preferable to deleting another author's threads.
+Replacement DELETE runs only after GitHub accepts the new review; a failed
+post also leaves previous threads in place.
 
 If GitHub rejects `APPROVE` or `REQUEST_CHANGES`, the action posts a `COMMENT`
 instead of failing. Use `generated-event` / `posted-event` (and the matching

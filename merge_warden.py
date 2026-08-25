@@ -1543,14 +1543,11 @@ def authenticated_github_login() -> str | None:
     1. GET /user — PAT / user tokens expose a non-empty ``login``.
     2. GET /installation — GitHub App installation tokens expose ``app_slug``;
        reviews post as ``{app_slug}[bot]``.
-    3. If both lookups fail and ``GITHUB_ACTIONS`` is set, ``github-actions[bot]``.
-       Default ``github.token`` in Actions typically 403s ``/user`` and has no
-       installation document; that fallback resolves the Actions token identity,
-       it is not an author allowlist. ``GITHUB_ACTOR`` is the triggering user
-       and must not be used.
 
     Returns None when identity cannot be established. Callers must skip
     previous-comment deletion rather than fall back to marker-only matching.
+    ``GITHUB_ACTIONS`` identifies the execution environment, not the token's
+    posting principal, and must not be used as an ownership signal.
     """
     try:
         data = gh_api("GET", "user")
@@ -1570,8 +1567,6 @@ def authenticated_github_login() -> str | None:
     except CommandError:
         pass
 
-    if parse_bool(os.environ.get("GITHUB_ACTIONS"), default=False):
-        return "github-actions[bot]"
     return None
 
 
