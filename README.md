@@ -118,6 +118,10 @@ provider default, or set it to a specific model id.
 Merge Warden may *generate* `APPROVE`, `COMMENT`, or `REQUEST_CHANGES`.
 `GITHUB_TOKEN` cannot approve pull requests unless the repository enables
 [Allow GitHub Actions to create and approve pull requests](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository).
+Pass a PAT or GitHub App token as `github-token` when you need `APPROVE` to
+post. Previous Merge Warden comments (inline and conversation) are replaced by
+matching the HTML marker `<!-- merge-warden -->`, not by author login, so those
+tokens do not accumulate duplicate threads across runs.
 
 If GitHub rejects `APPROVE` or `REQUEST_CHANGES`, the action posts a `COMMENT`
 instead of failing. Use `generated-event` / `posted-event` (and the matching
