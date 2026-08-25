@@ -6488,6 +6488,487 @@ def _heading_doc(title: str, sections: int, filler: str = "body") -> str:
     return "\n".join(parts)
 
 
+class PermanentProviderErrorTests(unittest.TestCase):
+    """Issue #72: permanent provider/config errors must not retry or split."""
+
+    def _run(self, corpus: ReviewCorpus, fake, **kwargs):
+        return _run_hierarchical(corpus, fake, **kwargs)
+
+    def _permanent(
+        self, message: str = "Gemini permanent provider error"
+    ) -> ProviderRequestError:
+        return ProviderRequestError(
+            ProviderFailureKind.PERMANENT_PROVIDER_ERROR,
+            message,
+        )
+
+    def test_retired_model_404_does_not_split_or_retry(self) -> None:
+        chunks = _tiny_chunks(8)
+        corpus = _synthetic_corpus(chunks)
+        shapes: list[int] = []
+        stages: list[str] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            stages.append(stage)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                shapes.append(len(ids))
+                raise self._permanent(
+                    "Gemini permanent provider error: configured model is "
+                    "unavailable (HTTP 404): models/gemini-2.5-pro is not found"
+                )
+            raise AssertionError(
+                f"unexpected provider stage after permanent map: {stage}"
+            )
+
+        review, coverage, store, stats = self._run(
+            corpus, fake, map_concurrency=1
+        )
+        self.assertEqual(shapes, [8])
+        self.assertEqual(stats.map_attempts, 1)
+        self.assertEqual(stats.map_batches_split, 0)
+        self.assertEqual(stats.map_provider_failures, 1)
+        self.assertEqual(stages, ["map"])
+        self.assertEqual(stats.synthesis_calls, 0)
+        self.assertEqual(stats.reduce_calls, 0)
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(review["comments"], [])
+        self.assertIn("permanent provider", review["body"].lower())
+        self.assertIn("Stopping provider work", "\n".join(stats.notes))
+        self.assertNotIn("# APPROVE", review["body"])
+        self.assertEqual(store.findings, {})
+
+    def test_authentication_failure_stops_globally(self) -> None:
+        chunks = _tiny_chunks(8)
+        corpus = _synthetic_corpus(chunks)
+        calls = {"n": 0}
+
+        def fake(system: str, user: str) -> str:
+            calls["n"] += 1
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                raise self._permanent(
+                    "OpenAI permanent provider error: authentication or "
+                    "authorization failed (HTTP 401)"
+                )
+            raise AssertionError(f"unexpected stage {stage}")
+
+        review, coverage, _store, stats = self._run(
+            corpus, fake, map_concurrency=4
+        )
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(stats.map_attempts, 1)
+        self.assertEqual(stats.map_batches_split, 0)
+        self.assertEqual(stats.validation_attempts, 0)
+        self.assertEqual(stats.reduce_calls, 0)
+        self.assertEqual(stats.synthesis_calls, 0)
+        self.assertFalse(coverage.complete)
+        _assert_unsynthesized_fallback(self, review)
+
+    def test_authorization_failure_stops_globally(self) -> None:
+        chunks = _tiny_chunks(4)
+        corpus = _synthetic_corpus(chunks)
+
+        def fake(system: str, user: str) -> str:
+            if mw.provider_call_stage(system, user) == "map":
+                raise self._permanent(
+                    "xAI permanent provider error: authentication or "
+                    "authorization failed (HTTP 403)"
+                )
+            raise AssertionError("later stages must not run")
+
+        review, _coverage, _store, stats = self._run(corpus, fake)
+        self.assertEqual(stats.map_attempts, 1)
+        self.assertEqual(stats.map_batches_split, 0)
+        self.assertEqual(stats.synthesis_calls, 0)
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_partial_map_evidence_preserved_after_permanent_error(self) -> None:
+        # Two large chunks pack into separate map batches: the first succeeds
+        # and deposits a finding, the second hits a permanent provider error.
+        chunks = [
+            _chunk("C1", "a.c", "int a(void) { return 1; }\n" + ("A" * 40_000)),
+            _chunk("C2", "b.c", "int b(void) { return 2; }\n" + ("B" * 40_000)),
+        ]
+        corpus = _synthetic_corpus(chunks)
+        map_calls = {"n": 0}
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                map_calls["n"] += 1
+                if map_calls["n"] == 1:
+                    return _map_payloads_json(
+                        ids,
+                        lambda _cid: {"findings": [_type_name_finding(path="a.c")]},
+                    )
+                raise self._permanent(
+                    "Gemini permanent provider error: configured model is "
+                    "unavailable (HTTP 404)"
+                )
+            raise AssertionError(f"unexpected stage {stage}")
+
+        review, coverage, store, stats = self._run(
+            corpus,
+            fake,
+            map_concurrency=1,
+            max_map_request_chars=60_000,
+            map_overhead_chars=0,
+        )
+        self.assertGreaterEqual(stats.map_calls_succeeded, 1)
+        self.assertGreaterEqual(stats.map_provider_failures, 1)
+        self.assertEqual(stats.map_batches_split, 0)
+        self.assertGreater(len(store.findings), 0)
+        self.assertFalse(coverage.complete)
+        self.assertLess(stats.map_chunks_acknowledged, len(chunks))
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(review["comments"], [])
+        self.assertNotIn(TYPE_NAME_BODY, review["body"])
+        self.assertIn("permanent provider", review["body"].lower())
+        self.assertEqual(stats.synthesis_calls, 0)
+
+    def test_permanent_failure_does_not_burn_map_budget_with_splits(self) -> None:
+        chunks = _tiny_chunks(16)
+        corpus = _synthetic_corpus(chunks)
+        clock = {"now": 1_000.0}
+
+        def fake_monotonic() -> float:
+            return clock["now"]
+
+        def fake(system: str, user: str) -> str:
+            if mw.provider_call_stage(system, user) == "map":
+                clock["now"] += 0.05
+                raise self._permanent(
+                    "Gemini permanent provider error: configured model is "
+                    "unavailable (HTTP 404)"
+                )
+            raise AssertionError("later stages must not run")
+
+        # Leave room for map + downstream reserves so the stage actually runs.
+        provider_horizon = (
+            VALIDATION_RESERVE_SECONDS
+            + REDUCE_RESERVE_SECONDS
+            + SYNTHESIS_RESERVE_SECONDS
+            + 300.0
+        )
+        with mock.patch("review_pipeline.time.monotonic", side_effect=fake_monotonic):
+            with mock.patch("time.monotonic", side_effect=fake_monotonic):
+                review, coverage, _store, stats = self._run(
+                    corpus,
+                    fake,
+                    map_concurrency=1,
+                    deadline=clock["now"] + provider_horizon,
+                )
+        self.assertEqual(stats.map_attempts, 1)
+        self.assertEqual(stats.map_batches_split, 0)
+        self.assertLess(clock["now"] - 1_000.0, 1.0)
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_transient_503_still_retries_without_permanent_stop(self) -> None:
+        chunks = _tiny_chunks(2)
+        corpus = _synthetic_corpus(chunks)
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                shapes.append(len(ids))
+                if len(shapes) == 1:
+                    raise ProviderRequestError(
+                        ProviderFailureKind.CAPACITY,
+                        "xAI HTTP 503: overloaded",
+                        retry_after_seconds=0.0,
+                    )
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        with mock.patch("review_pipeline.time.sleep"):
+            _review, coverage, _store, stats = self._run(corpus, fake)
+        self.assertEqual(shapes[:2], [2, 2])
+        self.assertEqual(stats.map_batches_split, 0)
+        self.assertGreaterEqual(stats.map_capacity_retries, 1)
+        self.assertTrue(coverage.complete)
+        self.assertFalse(
+            any("Stopping provider work" in note for note in stats.notes)
+        )
+
+    def test_latency_timeout_still_splits_multi_chunk(self) -> None:
+        chunks = _tiny_chunks(8)
+        corpus = _synthetic_corpus(chunks)
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                shapes.append(len(ids))
+                if len(ids) >= 8:
+                    raise ProviderRequestError(
+                        ProviderFailureKind.LATENCY_TIMEOUT,
+                        "map call latency budget exhausted",
+                    )
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        _review, coverage, _store, stats = self._run(corpus, fake)
+        self.assertEqual(shapes.count(8), 1)
+        self.assertGreaterEqual(stats.map_batches_split, 1)
+        self.assertTrue(coverage.complete)
+
+    def test_transport_reset_still_retries_same_shape(self) -> None:
+        chunks = _tiny_chunks(4)
+        corpus = _synthetic_corpus(chunks)
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                shapes.append(len(ids))
+                if len(shapes) == 1:
+                    raise ProviderRequestError(
+                        ProviderFailureKind.TRANSIENT_TRANSPORT,
+                        "connection reset",
+                    )
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        _review, coverage, _store, stats = self._run(corpus, fake)
+        self.assertEqual(shapes[:2], [4, 4])
+        self.assertEqual(stats.map_batches_split, 0)
+        self.assertTrue(coverage.complete)
+
+    def test_context_length_400_still_splits_multi_chunk_map(self) -> None:
+        """Request-shape 400 must split, not fail-close the review."""
+        chunks = _tiny_chunks(8)
+        corpus = _synthetic_corpus(chunks)
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                shapes.append(len(ids))
+                if len(ids) >= 8:
+                    raise RuntimeError(
+                        "OpenAI HTTP 400: This model's maximum context length "
+                        "is 8192 tokens (code=context_length_exceeded)"
+                    )
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        review, coverage, _store, stats = self._run(corpus, fake)
+        self.assertEqual(shapes.count(8), 1)
+        self.assertGreaterEqual(stats.map_batches_split, 1)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertFalse(any("Stopping provider work" in note for note in stats.notes))
+        self.assertNotIn("permanent provider", review["body"].lower())
+
+    def test_http_413_still_splits_multi_chunk_map(self) -> None:
+        chunks = _tiny_chunks(8)
+        corpus = _synthetic_corpus(chunks)
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                shapes.append(len(ids))
+                if len(ids) >= 8:
+                    raise RuntimeError("xAI HTTP 413: payload too large")
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        _review, coverage, _store, stats = self._run(corpus, fake)
+        self.assertEqual(shapes.count(8), 1)
+        self.assertGreaterEqual(stats.map_batches_split, 1)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.synthesis_calls, 1)
+
+    def test_permanent_error_during_synthesis_fail_closes(self) -> None:
+        chunks = _tiny_chunks(1)
+        corpus = _synthetic_corpus(chunks)
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                return _map_chunks_json(_chunk_ids_in_prompt(user))
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            if stage == "synthesis":
+                raise self._permanent(
+                    "Anthropic permanent provider error: authentication or "
+                    "authorization failed (HTTP 401)"
+                )
+            raise AssertionError(stage)
+
+        review, coverage, _store, stats = self._run(corpus, fake)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.synthesis_calls, 0)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(review["comments"], [])
+        self.assertIn("permanent provider", review["body"].lower())
+        self.assertIn("Stopping provider work", "\n".join(stats.notes))
+
+    def test_permanent_error_during_validation_stops_pipeline(self) -> None:
+        corpus, _matching = _header_validation_corpus(2)
+        stages: list[str] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            stages.append(stage)
+            if stage == "map":
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[_likely_foo_finding()],
+                    needs_context=[
+                        {
+                            "path": "include/foo.h",
+                            "reason": "cross-context check",
+                            "finding_ids": ["F17"],
+                        }
+                    ],
+                )
+            if stage == "validation":
+                raise self._permanent(
+                    "Gemini permanent provider error: authentication or "
+                    "authorization failed (HTTP 401)"
+                )
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": ["F17"], "reject": [], "merge": []})
+            raise AssertionError(f"unexpected stage {stage}")
+
+        review, coverage, store, stats = self._run(corpus, fake)
+        self.assertIn("validation", stages)
+        self.assertNotIn("synthesis", stages)
+        self.assertEqual(stats.synthesis_calls, 0)
+        self.assertFalse(stats.validation_deadline_exhausted)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(review["comments"], [])
+        self.assertIn("permanent provider", review["body"].lower())
+        self.assertTrue(store.findings)
+        self.assertNotIn(_likely_foo_finding()["body"], review["body"])
+        self.assertFalse(
+            any("validation stage deadline exhausted" in note for note in stats.notes)
+        )
+
+    def test_permanent_error_during_reduce_stops_pipeline(self) -> None:
+        chunks = _tiny_chunks(1)
+        corpus = _synthetic_corpus(chunks)
+        stages: list[str] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            stages.append(stage)
+            if stage == "map":
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[
+                        {
+                            "id": "F1",
+                            "severity": "MAJOR",
+                            "path": "c1.c",
+                            "side": "RIGHT",
+                            "line": 1,
+                            "body": "first candidate",
+                            "confidence": "LIKELY",
+                            "evidence": [],
+                        },
+                        {
+                            "id": "F2",
+                            "severity": "MAJOR",
+                            "path": "c1.c",
+                            "side": "RIGHT",
+                            "line": 2,
+                            "body": "second candidate",
+                            "confidence": "LIKELY",
+                            "evidence": [],
+                        },
+                    ],
+                )
+            if stage in {"pre-reduce", "reduce"}:
+                raise self._permanent(
+                    "xAI permanent provider error: authentication or "
+                    "authorization failed (HTTP 403)"
+                )
+            raise AssertionError(f"unexpected stage {stage}")
+
+        review, coverage, store, stats = self._run(corpus, fake)
+        self.assertTrue(any(stage in {"pre-reduce", "reduce"} for stage in stages))
+        self.assertNotIn("synthesis", stages)
+        self.assertEqual(stats.synthesis_calls, 0)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(review["comments"], [])
+        self.assertIn("permanent provider", review["body"].lower())
+        self.assertGreaterEqual(len(store.findings), 2)
+        self.assertNotIn("first candidate", review["body"])
+
+    def test_concurrent_permanent_error_abandons_pending_batches(self) -> None:
+        """Two in-flight batches fail permanently; a third pending batch never runs."""
+        chunks = [
+            _chunk(f"C{i}", f"c{i}.c", f"int f{i}(void) {{ return {i}; }}\n" + ("X" * 40_000))
+            for i in range(1, 4)
+        ]
+        corpus = _synthetic_corpus(chunks)
+        barrier = threading.Barrier(2)
+        calls = {"n": 0}
+        lock = threading.Lock()
+
+        def fake(system: str, user: str) -> str:
+            if mw.provider_call_stage(system, user) != "map":
+                raise AssertionError("later stages must not run")
+            with lock:
+                calls["n"] += 1
+                n = calls["n"]
+            if n > 2:
+                raise AssertionError("pending third batch must not be dispatched")
+            barrier.wait(timeout=5)
+            raise self._permanent(
+                "Gemini permanent provider error: configured model is "
+                "unavailable (HTTP 404)"
+            )
+
+        review, coverage, _store, stats = self._run(
+            corpus,
+            fake,
+            map_concurrency=2,
+            max_map_request_chars=60_000,
+            map_overhead_chars=0,
+        )
+        self.assertEqual(stats.map_attempts, 2)
+        self.assertEqual(stats.map_batches_split, 0)
+        self.assertEqual(stats.synthesis_calls, 0)
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertIn("Stopping provider work", "\n".join(stats.notes))
+
+
 class MapFanoutAndDegradationTests(unittest.TestCase):
     def _run(self, corpus: ReviewCorpus, fake, **kwargs):
         return _run_hierarchical(corpus, fake, **kwargs)
