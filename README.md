@@ -292,7 +292,11 @@ Optional environment overrides:
 | `MERGE_WARDEN_VALIDATION_CONCURRENCY` | 2 | Max independent validation provider requests in flight (1–4) |
 
 GitHub review bodies and inline comments still have posting size limits
-(60k / 8k). Those are GitHub API limits, not source truncation.
+(60k / 8k). Those are GitHub API limits, not source truncation. A review is
+also limited to 25 inline comments. After merging comments that share a
+path/side/line, Merge Warden keeps BLOCKING, then MAJOR, then MINOR (stable
+within a rank) and appends any overflow to the posted review body so a
+blocker is never dropped to keep 25 MINOR notes.
 
 Provider HTTP calls retry transient failures (disconnects, timeouts,
 HTTP 429/5xx) a few times with exponential backoff. HTTP 429 honors
