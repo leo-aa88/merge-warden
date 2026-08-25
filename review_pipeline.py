@@ -3135,6 +3135,24 @@ def run_map_stage(
         stage_exhausted = True
         abandon_pending()
 
+    def skip_unrefundable(item: MapWorkItem, reason: str) -> bool:
+        """Skip a retry that cannot take a shortened clock. Exhaust if last.
+
+        Returning True means the stage should stop dispatching. A capacity
+        or widened retry must not kill a sibling that can still repair, but
+        skip-and-continue with an empty queue leaves leftover map seconds
+        unsurrendered and synthesis unreachable.
+        """
+        stats.notes.append(sanitize_failure_note(reason))
+        completed[item.sequence] = MapWorkerResult(item=item, skipped=True)
+        if any(_item_is_repairable(candidate) for candidate in pending):
+            return False
+        extra = sum(
+            1 for chunk in item.chunks if chunk.id not in mapped_ids
+        )
+        exhaust_map_stage(extra_uncovered=extra)
+        return True
+
     def apply_health_from_worker(result: MapWorkerResult) -> None:
         """Update provider health as soon as a future lands on this thread.
 
@@ -3216,15 +3234,12 @@ def run_map_stage(
                         # would be dispatched under the clock that already
                         # timed out. Leave this chunk uncovered instead of
                         # spending the rest of the stage proving that again.
-                        stats.notes.append(
-                            sanitize_failure_note(
-                                f"map batch {item.batch_tag} left uncovered: "
-                                f"widened retry no longer fits the map budget"
-                            )
-                        )
-                        completed[item.sequence] = MapWorkerResult(
-                            item=item, skipped=True
-                        )
+                        if skip_unrefundable(
+                            item,
+                            f"map batch {item.batch_tag} left uncovered: "
+                            f"widened retry no longer fits the map budget",
+                        ):
+                            break
                         continue
                 elif remaining is not None:
                     # Untried work in the tail of the map window gets a
@@ -3232,9 +3247,9 @@ def run_map_stage(
                     # cannot outlive the cutoff. Remaining below the floor
                     # is abandoned honestly: a doomed few-second call is
                     # worse than handing those seconds to later stages.
-                    # Capacity retries keep their envelope and are skipped
-                    # here rather than exhausting siblings that can still
-                    # take a shortened clock.
+                    # Capacity retries keep their envelope: skip this item
+                    # so a repairable sibling can still run, then exhaust
+                    # when nothing repairable remains.
                     if remaining < MAP_CALL_BUDGET_SECONDS:
                         timeout = shortened_map_http_timeout(remaining)
                         if timeout is not None and _item_is_repairable(item):
@@ -3244,16 +3259,13 @@ def run_map_stage(
                             pending.appendleft(item)
                             exhaust_map_stage()
                             break
+                        elif skip_unrefundable(
+                            item,
+                            f"map batch {item.batch_tag} left uncovered: "
+                            f"retry envelope no longer fits the map budget",
+                        ):
+                            break
                         else:
-                            stats.notes.append(
-                                sanitize_failure_note(
-                                    f"map batch {item.batch_tag} left uncovered: "
-                                    f"retry envelope no longer fits the map budget"
-                                )
-                            )
-                            completed[item.sequence] = MapWorkerResult(
-                                item=item, skipped=True
-                            )
                             continue
                     elif not map_call_fits_remaining_budget(item):
                         pending.appendleft(item)
@@ -3436,6 +3448,29 @@ def run_map_stage(
                     stop_for_permanent_provider(worker_result.error)
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
+
+    remaining = remaining_map_seconds()
+    if (
+        not stage_exhausted
+        and not health.circuit_open
+        and permanent_error is None
+        and deadline_error is None
+        and remaining is not None
+        and remaining < MAP_CALL_BUDGET_SECONDS
+    ):
+        # Dispatch can start the next primary batch before ingesting a
+        # capacity failure, so a same-shape retry may never be queued.
+        # The skip-unrefundable branch then never runs, leftover seconds
+        # sit below a full envelope, and synthesis is skipped. Surrender
+        # that tail here so unused map time still reaches later stages.
+        extra = sum(
+            1
+            for batch in packed
+            for chunk in batch
+            if chunk.id not in mapped_ids
+        )
+        if extra:
+            exhaust_map_stage(extra_uncovered=extra)
 
     _sync_provider_health_stats(stats, health)
     return MapStageResult(

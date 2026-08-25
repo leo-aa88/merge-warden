@@ -6715,6 +6715,88 @@ class MapCoverageRepairTests(unittest.TestCase):
         self.assertIn("C2", {chunk.id for chunk in corpus.reviewable_chunks})
         self.assertNotIn("C2", coverage.uncovered_chunk_ids)
 
+    def test_unrefundable_tail_retry_exhausts_when_nothing_repairable_remains(
+        self,
+    ) -> None:
+        """A skipped capacity retry must still surrender leftover map time.
+
+        One batch 503s and queues a same-shape retry. The next batch consumes
+        the window down to 148s. The retry cannot take a shortened clock, so
+        it is skipped — but if it was the last pending work, skip-and-continue
+        leaves ``map_deadline_exhausted`` false and synthesis never runs.
+        """
+        corpus = _synthetic_corpus(self._separate_batch_chunks(2))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        attempts: list[str] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                attempts.append(",".join(ids))
+                if ids == ["C1"]:
+                    raise ProviderRequestError(
+                        ProviderFailureKind.CAPACITY,
+                        "Gemini HTTP 503: high demand",
+                    )
+                clock["now"] += 272.0
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        (review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline, map_concurrency=1
+        )
+        self.assertEqual(attempts, ["C1", "C2"])
+        self.assertEqual(stats.map_capacity_retries, 0)
+        self.assertFalse(coverage.complete)
+        self.assertIn("C1", coverage.uncovered_chunk_ids)
+        self.assertTrue(stats.map_deadline_exhausted)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_unrefundable_tail_retry_does_not_kill_a_repairable_sibling(
+        self,
+    ) -> None:
+        """The inverse: skip the retry, still shorten an untried sibling."""
+        corpus = _synthetic_corpus(self._separate_batch_chunks(3))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        attempts: list[tuple[str, float | None]] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                attempts.append((",".join(ids), rp.map_call_timeout_override.get()))
+                if ids == ["C1"]:
+                    raise ProviderRequestError(
+                        ProviderFailureKind.CAPACITY,
+                        "Gemini HTTP 503: high demand",
+                    )
+                clock["now"] += 272.0 if ids == ["C2"] else 100.0
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        (_review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline, map_concurrency=1
+        )
+        names = [name for name, _timeout in attempts]
+        self.assertEqual(names, ["C1", "C2", "C3"])
+        self.assertIsNone(attempts[1][1])
+        self.assertIsNotNone(attempts[2][1])
+        self.assertEqual(stats.map_repair_attempts, 1)
+        self.assertNotIn("C3", coverage.uncovered_chunk_ids)
+        self.assertIn("C1", coverage.uncovered_chunk_ids)
+
     def test_stranded_tail_covers_the_untried_chunk(self) -> None:
         """Issue #74 row 1: 148s left, gate used to demand 150s, chunk untried."""
         corpus = _synthetic_corpus(self._separate_batch_chunks(3))
