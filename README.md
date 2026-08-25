@@ -279,6 +279,7 @@ How a failed map batch recovers depends on why it failed:
 
 | Failure | Recovery |
 | --- | --- |
+| Permanent provider/config (HTTP 401/403/404, invalid model, …) | Stop provider work immediately. Never retry or split: changing request shape cannot fix a bad credential or retired model |
 | Capacity (HTTP 429/503) | Re-send the same request after a backoff, up to four times. Never split: a provider shedding load is not asking for a smaller request, and splitting would double the request rate against it |
 | Latency timeout, multi-chunk | Split immediately rather than repeat an expensive shape |
 | Latency timeout, single chunk | Re-send under a widened clock (1.5x the failed attempt, capped at 240s), since the same clock would likely time out again |
@@ -361,9 +362,12 @@ blocker is never dropped to keep 25 MINOR notes.
 Provider HTTP calls outside the map stage retry transient failures
 (disconnects, timeouts, HTTP 429/5xx) a few times with exponential backoff.
 Map provider calls use one HTTP attempt and hand the classified failure to the
-map scheduler, which owns all map backoff. It re-sends the same request for a
-capacity rejection, re-sends a single chunk under a longer timeout after a
-latency timeout, and splits a multi-chunk request only when request shape could
-plausibly be the problem. HTTP 429 honors `Retry-After` when present, capped at
-60 seconds. Every provider socket timeout and retry delay is also bounded by the
-remaining internal review budget.
+map scheduler, which owns all map backoff. Permanent provider and configuration
+failures (HTTP 401/403/404, invalid model names, and other non-retryable client
+errors) stop new provider work immediately across the pipeline and fail closed
+to `COMMENT`; they are never retried or split. The scheduler re-sends the same
+request for a capacity rejection, re-sends a single chunk under a longer timeout
+after a latency timeout, and splits a multi-chunk request only when request shape
+could plausibly be the problem. HTTP 429 honors `Retry-After` when present,
+capped at 60 seconds. Every provider socket timeout and retry delay is also
+bounded by the remaining internal review budget.

@@ -512,12 +512,16 @@ def provider_http_error(
     detail: str,
     retry_after: str | None,
 ) -> ProviderRequestError:
-    """Classify a retryable HTTP status for the map scheduler.
+    """Classify an HTTP status for the map scheduler.
 
     429 and 503 are capacity signals: the request shape is fine and the
-    provider is asking for a delay. Every other retryable code stays a
-    transport failure and keeps the existing retry-then-split handling.
+    provider is asking for a delay. Other retryable codes stay transport
+    failures and keep the existing retry-then-split handling. Non-retryable
+    codes are permanent: changing request shape cannot fix a bad credential,
+    retired model, or invalid configuration.
     """
+    if code not in RETRYABLE_HTTP_CODES:
+        return provider_permanent_http_error(label, code, detail)
     message = f"{label} HTTP {code}: {detail}"
     if code in CAPACITY_HTTP_CODES:
         return ProviderRequestError(
@@ -526,6 +530,55 @@ def provider_http_error(
             retry_after_seconds=parse_retry_after(retry_after),
         )
     return ProviderRequestError(ProviderFailureKind.TRANSIENT_TRANSPORT, message)
+
+
+def _permanent_http_summary(code: int, detail: str) -> str:
+    """Short human summary for a permanent HTTP failure."""
+    text = " ".join((detail or "").split()).lower()
+    if code in {401, 403}:
+        return "authentication or authorization failed"
+    if code == 404:
+        if any(
+            token in text
+            for token in (
+                "model",
+                "not found",
+                "not available",
+                "does not exist",
+                "unknown",
+                "retired",
+            )
+        ):
+            return "configured model is unavailable"
+        return "endpoint or model is unavailable"
+    if code == 400:
+        if any(
+            token in text
+            for token in ("model", "unsupported", "invalid", "not supported")
+        ):
+            return "invalid model or provider configuration"
+        return "invalid provider request"
+    return "permanent provider or configuration error"
+
+
+def provider_permanent_http_error(
+    label: str,
+    code: int,
+    detail: str,
+) -> ProviderRequestError:
+    summary = _permanent_http_summary(code, detail)
+    # Keep a sanitized snippet of the provider body for logs; never the raw
+    # multi-kilobyte JSON dump that some providers return on 404.
+    snippet = " ".join((detail or "").split())
+    if len(snippet) > 160:
+        snippet = snippet[:159].rstrip() + "…"
+    message = f"{label} permanent provider error: {summary} (HTTP {code})"
+    if snippet:
+        message = f"{message}: {snippet}"
+    return ProviderRequestError(
+        ProviderFailureKind.PERMANENT_PROVIDER_ERROR,
+        message,
+    )
 
 
 def latency_retry_fits(
@@ -1045,7 +1098,7 @@ def http_post_json(
             if exc.headers:
                 retry_after = exc.headers.get("Retry-After")
             if exc.code not in RETRYABLE_HTTP_CODES:
-                raise RuntimeError(f"{label} HTTP {exc.code}: {detail}") from exc
+                raise provider_permanent_http_error(label, exc.code, detail) from exc
             if attempt == attempts:
                 raise provider_http_error(label, exc.code, detail, retry_after) from exc
             error = f"HTTP {exc.code}"
