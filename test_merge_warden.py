@@ -81,7 +81,7 @@ class ProviderResolutionTests(unittest.TestCase):
         self.assertEqual(mw.resolve_model("xai", ""), "grok-4.6")
         self.assertEqual(mw.resolve_model("openai", "  "), "gpt-4.1")
         self.assertEqual(mw.resolve_model("anthropic", None or ""), "claude-sonnet-4-6")
-        self.assertEqual(mw.resolve_model("google", ""), "gemini-2.5-pro")
+        self.assertEqual(mw.resolve_model("google", ""), "gemini-3.1-pro-preview")
         self.assertEqual(mw.resolve_model("openai", "gpt-4o"), "gpt-4o")
 
     def test_api_key_prefers_first_set_env(self) -> None:
