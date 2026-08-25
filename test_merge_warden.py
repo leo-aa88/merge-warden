@@ -1696,7 +1696,7 @@ class PostReviewTests(unittest.TestCase):
         self.assertNotIn("ghs_", stderr.getvalue())
         self.assertNotIn("token", stderr.getvalue().lower())
 
-    def test_actions_token_fallback_deletes_only_actions_bot_comments(self) -> None:
+    def test_actions_lookup_failure_posts_without_deleting(self) -> None:
         ops: list[tuple] = []
         review_comments = [
             _comment(11, "github-actions[bot]", f"{mw.MARKER}\nold inline"),
@@ -1715,23 +1715,27 @@ class PostReviewTests(unittest.TestCase):
             user=mw.CommandError("GET /user 403"),
             installation=mw.CommandError("GET /installation 404"),
         )
+        stderr = io.StringIO()
         with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=False):
-            with api, paginate, run:
-                event, posted = mw.post_review(
-                    "o/r",
-                    "1",
-                    {
-                        "commit_id": "abc",
-                        "event": "COMMENT",
-                        "body": f"{mw.MARKER}\n# COMMENT\n",
-                        "comments": [{"path": "parser.c", "line": 10, "body": "n"}],
-                    },
-                )
+            with mock.patch.object(sys, "stderr", stderr):
+                with api, paginate, run:
+                    event, posted = mw.post_review(
+                        "o/r",
+                        "1",
+                        {
+                            "commit_id": "abc",
+                            "event": "COMMENT",
+                            "body": f"{mw.MARKER}\n# COMMENT\n",
+                            "comments": [{"path": "parser.c", "line": 10, "body": "n"}],
+                        },
+                    )
         self.assertEqual(event, "COMMENT")
         self.assertEqual(len(posted), 1)
-        deleted = [op[1] for op in ops if op[0] == "DELETE"]
-        self.assertEqual(deleted, ["repos/o/r/pulls/comments/11"])
-        self.assertNotIn("repos/o/r/pulls/comments/12", deleted)
+        kinds = [op[0] for op in ops]
+        self.assertIn("POST", kinds)
+        self.assertNotIn("DELETE", kinds)
+        self.assertNotIn("LIST", kinds)
+        self.assertIn("Could not resolve", stderr.getvalue())
 
 
 def _comment(comment_id: int, login: str, body: str) -> dict:
@@ -1965,7 +1969,14 @@ class AuthenticatedGithubLoginTests(unittest.TestCase):
             self.fail(f"unexpected {method} {path}")
             return None
 
-        self.assertEqual(self._login(fake_gh_api), "merge-warden-app[bot]")
+        self.assertEqual(
+            self._login(
+                fake_gh_api,
+                environ={"GITHUB_ACTIONS": "true"},
+                drop=(),
+            ),
+            "merge-warden-app[bot]",
+        )
         self.assertEqual(calls, [("GET", "user"), ("GET", "installation")])
 
     def test_empty_user_login_falls_through_to_installation(self) -> None:
@@ -2009,16 +2020,15 @@ class AuthenticatedGithubLoginTests(unittest.TestCase):
         self.assertIsNone(
             self._login(fake_gh_api, environ={"GITHUB_ACTOR": "human"})
         )
-        self.assertEqual(
+        self.assertIsNone(
             self._login(
                 fake_gh_api,
                 environ={"GITHUB_ACTIONS": "true", "GITHUB_ACTOR": "human"},
                 drop=(),
-            ),
-            "github-actions[bot]",
+            )
         )
 
-    def test_actions_token_fallback_when_lookups_fail(self) -> None:
+    def test_actions_environment_does_not_prove_bot_identity(self) -> None:
         def fake_gh_api(
             method: str,
             path: str,
@@ -2027,13 +2037,12 @@ class AuthenticatedGithubLoginTests(unittest.TestCase):
         ):
             raise mw.CommandError("HTTP 403")
 
-        self.assertEqual(
+        self.assertIsNone(
             self._login(
                 fake_gh_api,
                 environ={"GITHUB_ACTIONS": "true"},
                 drop=(),
-            ),
-            "github-actions[bot]",
+            )
         )
 
 
