@@ -73,7 +73,7 @@ DEFAULT_MODELS = {
     "xai": "grok-4.6",
     "openai": "gpt-4.1",
     "anthropic": "claude-sonnet-4-6",
-    "google": "gemini-2.5-pro",
+    "google": "gemini-3.1-pro-preview",
 }
 PROVIDER_ALIASES = {
     "xai": "xai",
