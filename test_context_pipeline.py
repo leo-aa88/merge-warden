@@ -664,6 +664,71 @@ class DiffChunkTests(unittest.TestCase):
         self.assertIn("lines=40-41", header)
         self.assertNotEqual(chunk.start_line, 10)
 
+    def test_mixed_hunk_prefers_right_span_not_longer_left(self) -> None:
+        # Three deletions + one addition + one context: LEFT is 10-13, RIGHT is 10-11.
+        # Preferring LEFT would still match tests whose two sides share a span.
+        diff = (
+            "diff --git a/foo.c b/foo.c\n"
+            "--- a/foo.c\n"
+            "+++ b/foo.c\n"
+            "@@ -10,5 +10,2 @@\n"
+            "-gone1\n"
+            "-gone2\n"
+            "-gone3\n"
+            "+new\n"
+            " keep\n"
+        )
+        chunks = chunk_diff(diff, limit=100_000)
+        self.assertEqual(len(chunks), 1)
+        chunk = chunks[0]
+        self.assertEqual(chunk.start_line, 10)
+        self.assertEqual(chunk.end_line, 11)
+        header = format_chunk_for_prompt(chunk).splitlines()[0]
+        self.assertIn("lines=10-11", header)
+        self.assertNotIn("lines=10-13", header)
+
+    def test_left_only_then_right_hunk_uses_right_span(self) -> None:
+        diff = (
+            "diff --git a/foo.c b/foo.c\n"
+            "--- a/foo.c\n"
+            "+++ b/foo.c\n"
+            "@@ -40,2 +10,0 @@\n"
+            "-gone1\n"
+            "-gone2\n"
+            "@@ -500,3 +500,3 @@\n"
+            " int y;\n"
+            "-int z;\n"
+            "+int Z;\n"
+            " int w;\n"
+        )
+        chunks = chunk_diff(diff, limit=100_000)
+        self.assertEqual(len(chunks), 1)
+        chunk = chunks[0]
+        self.assertEqual(chunk.start_line, 500)
+        self.assertEqual(chunk.end_line, 502)
+        header = format_chunk_for_prompt(chunk).splitlines()[0]
+        self.assertIn("lines=500-502", header)
+        self.assertNotEqual(chunk.start_line, 40)
+
+    def test_no_newline_marker_does_not_extend_right_span(self) -> None:
+        diff = (
+            "diff --git a/foo.c b/foo.c\n"
+            "--- a/foo.c\n"
+            "+++ b/foo.c\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+            "\\ No newline at end of file\n"
+        )
+        chunks = chunk_diff(diff, limit=100_000)
+        self.assertEqual(len(chunks), 1)
+        chunk = chunks[0]
+        self.assertEqual(chunk.start_line, 1)
+        self.assertEqual(chunk.end_line, 1)
+        header = format_chunk_for_prompt(chunk).splitlines()[0]
+        self.assertIn("lines=1-1", header)
+        self.assertNotIn("lines=1-2", header)
+
     def test_oversized_split_continues_file_line_cursor_not_raw_newlines(self) -> None:
         header = (
             "diff --git a/foo.c b/foo.c\n"
@@ -684,6 +749,10 @@ class DiffChunkTests(unittest.TestCase):
             raw_lines += 1
         bogus_next_start = 500 + raw_lines
         self.assertTrue(any("-int z;" in chunk.text for chunk in later))
+        self.assertEqual(first.start_line, 500)
+        self.assertEqual(first.end_line, 500)
+        self.assertEqual(later[0].start_line, 501)
+        self.assertEqual(later[0].end_line, 502)
         for piece in later:
             self.assertNotEqual(piece.start_line, bogus_next_start)
             self.assertIsNotNone(piece.start_line)
