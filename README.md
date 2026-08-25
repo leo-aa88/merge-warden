@@ -184,9 +184,13 @@ line changes is represented in that reconstruction (`limit_error` /
 incomplete coverage). Skipped binaries and files with 0 additions and 0
 deletions do not require a patch. The `gh pr diff` error string is never
 treated as reviewed source. Inline comments are anchored to path/side/line
-triples parsed from that same complete `gh pr diff` when it loads. GitHub's
-Pulls Files API omits `patch` above ~20 KB / 3000 lines; commentable lines
-for those files still come from the unified diff rather than an empty map.
+triples parsed from that same complete `gh pr diff` when it loads. Numeric
+lines still snap to the nearest commentable line in the same file. Missing
+or non-numeric `line` values (`N/A`, `null`, omitted, bools, floats) are
+dropped rather than snapped to line 1; the finding stays in the review body
+only if synthesis already put it there. GitHub's Pulls Files API omits
+`patch` above ~20 KB / 3000 lines; commentable lines for those files still
+come from the unified diff rather than an empty map.
 If `gh pr diff` fails, commentable lines fall back to per-file `patch`
 fields, so a large file with an omitted patch stays un-commentable rather
 than inventing anchors. Changed-file source is not eagerly mapped as

@@ -298,6 +298,99 @@ class InlineCommentLocationTests(unittest.TestCase):
         self.assertEqual(set(comments[0]), {"path", "side", "line", "body"})
         self.assertNotIn("subject_type", comments[0])
 
+    def test_missing_or_non_numeric_line_is_dropped_not_snapped_to_line_1(self) -> None:
+        commentable = sample_commentable()
+        cases = (
+            {"path": "parser.c", "side": "RIGHT", "line": "N/A", "body": "x"},
+            {"path": "parser.c", "side": "RIGHT", "body": "x"},
+            {"path": "parser.c", "side": "RIGHT", "line": None, "body": "x"},
+            {"path": "parser.c", "side": "RIGHT", "line": "", "body": "x"},
+            {"path": "parser.c", "side": "RIGHT", "line": "foo", "body": "x"},
+        )
+        for item in cases:
+            with self.subTest(line=item.get("line", "<missing>")):
+                snapped = mw.snap_comment(item, commentable)
+                self.assertIsNone(snapped)
+                self.assertNotEqual(
+                    snapped, {"path": "parser.c", "side": "RIGHT", "line": 10}
+                )
+                self.assertNotEqual(
+                    snapped, {"path": "README.md", "side": "RIGHT", "line": 1}
+                )
+
+        blocking_cases = (
+            {
+                "path": "parser.c",
+                "side": "RIGHT",
+                "line": "N/A",
+                "severity": "blocking",
+                "body": "parser mishandles EOF",
+            },
+            {
+                "path": "parser.c",
+                "side": "RIGHT",
+                "severity": "blocking",
+                "body": "parser mishandles EOF",
+            },
+            {
+                "path": "parser.c",
+                "side": "RIGHT",
+                "line": None,
+                "severity": "blocking",
+                "body": "parser mishandles EOF",
+            },
+        )
+        for item in blocking_cases:
+            with self.subTest(build_line=item.get("line", "<missing>")):
+                self.assertEqual(
+                    mw.build_inline_comments(
+                        {"event": "REQUEST_CHANGES", "comments": [item]},
+                        commentable,
+                    ),
+                    [],
+                )
+                kept, overflow = mw.prepare_inline_comments(
+                    {"comments": [item]}, commentable
+                )
+                self.assertEqual(kept, [])
+                self.assertEqual(overflow, [])
+
+    def test_digit_string_line_is_usable(self) -> None:
+        commentable = sample_commentable()
+        snapped = mw.snap_comment(
+            {"path": "parser.c", "side": "RIGHT", "line": "11", "body": "x"},
+            commentable,
+        )
+        self.assertEqual(snapped, {"path": "parser.c", "side": "RIGHT", "line": 11})
+        comments = mw.build_inline_comments(
+            {
+                "event": "REQUEST_CHANGES",
+                "comments": [
+                    {
+                        "path": "parser.c",
+                        "line": "11",
+                        "severity": "major",
+                        "body": "leak",
+                    }
+                ],
+            },
+            commentable,
+        )
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0]["path"], "parser.c")
+        self.assertEqual(comments[0]["line"], 11)
+
+    def test_bool_and_float_lines_are_dropped(self) -> None:
+        commentable = sample_commentable()
+        for line in (True, False, 10.7, 11.0):
+            with self.subTest(line=line):
+                self.assertIsNone(
+                    mw.snap_comment(
+                        {"path": "parser.c", "side": "RIGHT", "line": line, "body": "x"},
+                        commentable,
+                    )
+                )
+
 
 def _omitted_patch_file(path: str = "huge.c") -> dict:
     return {
