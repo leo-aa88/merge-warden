@@ -232,7 +232,7 @@ in-flight, max 4). Evidence ingestion stays single-threaded and deterministic.
 Failed map batches split into smaller requests instead of abandoning sibling
 chunks; a global cap of 32 logical map attempts still fail-closes the review.
 Initial map batches are balanced by chunk size (largest-first bin packing with
-a soft ~16k-character target) so one giant request is not scheduled beside
+a soft ~32k-character target) so one giant request is not scheduled beside
 several tiny ones. Hard per-request character limits still win.
 
 Binary and generated files can be excluded, but that exclusion is explicit in
@@ -268,15 +268,12 @@ time reserved for later stages:
 - reduce stops `150s` before the provider cutoff
 - synthesis uses the remaining provider budget
 
-Map calls also have a tighter per-call latency budget (140s HTTP timeout, 150s
-logical call budget, 1 HTTP attempt) so a slow batch splits while downstream
-reserves are still intact. The HTTP layer does not retry a timed-out map
-inference as the same payload; the scheduler splits multi-chunk failures
-immediately and still retries a single-chunk miss once. A map follow-up is
-not started unless a full call budget remains. Exhausting the map-stage
-allocation leaves remaining primary chunks uncovered and **continues** into
-validation, reduction, and synthesis. Exhausting the global provider
-deadline still fail-closes immediately.
+Map calls also have a tighter per-call latency budget (90s HTTP timeout, 120s
+logical call budget, 2 HTTP attempts) so a slow batch splits while downstream
+reserves are still intact. A map follow-up is not started unless a full call
+budget remains. Exhausting the map-stage allocation leaves remaining
+primary chunks uncovered and **continues** into validation, reduction, and
+synthesis. Exhausting the global provider deadline still fail-closes immediately.
 
 Once a stage cutoff is reached, that stage stops scheduling new provider
 calls and the pipeline continues. Remaining cross-context checks are marked
