@@ -24,7 +24,9 @@ from context_pipeline import (
     build_review_corpus,
     failed_complete_diff_placeholder,
     format_char_count,
+    is_failed_complete_diff,
     omitted_required_patch_paths,
+    parse_diff_files,
 )
 from review_pipeline import (
     DEFAULT_MAP_CONCURRENCY,
@@ -614,13 +616,43 @@ def compact_ranges(lines: set[int]) -> str:
     return ", ".join(ranges)
 
 
-def commentable_by_path(files: list[dict]) -> dict[str, dict[str, set[int]]]:
+def commentable_from_diff(diff: str) -> dict[str, dict[str, set[int]]]:
+    """Commentable RIGHT/LEFT lines from a complete unified diff.
+
+    The Pulls Files API omits `patch` above ~20 KB / 3000 lines. `gh pr diff`
+    still returns those hunks, and that is the corpus the mapper reads. The
+    failed-complete placeholder is not a diff and must not mint anchors.
+    """
+    if not (diff or "").strip() or is_failed_complete_diff(diff):
+        return {}
+    mapping: dict[str, dict[str, set[int]]] = {}
+    for path, header, hunks in parse_diff_files(diff):
+        if not path or path == "(unknown path)":
+            continue
+        patch = header + "".join(text for text, _start in hunks)
+        parsed = parse_patch(patch)
+        if not parsed["RIGHT"] and not parsed["LEFT"]:
+            continue
+        sides = mapping.setdefault(path, {"RIGHT": set(), "LEFT": set()})
+        sides["RIGHT"] |= parsed["RIGHT"]
+        sides["LEFT"] |= parsed["LEFT"]
+    return mapping
+
+
+def commentable_by_path(
+    files: list[dict],
+    diff: str = "",
+) -> dict[str, dict[str, set[int]]]:
     mapping: dict[str, dict[str, set[int]]] = {}
     for file_info in files:
         path = file_info.get("filename") or ""
         if not path:
             continue
         mapping[path] = parse_patch(file_info.get("patch") or "")
+    for path, sides in commentable_from_diff(diff).items():
+        current = mapping.setdefault(path, {"RIGHT": set(), "LEFT": set()})
+        current["RIGHT"] |= sides["RIGHT"]
+        current["LEFT"] |= sides["LEFT"]
     return mapping
 
 
@@ -1796,7 +1828,6 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
         if fetched and skip_stale_workflow_run(expected, fetched, fetched=True):
             return 0
     files = collect_pr_files(repo, args.pr)
-    commentable = commentable_by_path(files)
     diff_result = run(["gh", "pr", "diff", args.pr, "--repo", repo], check=False)
     if diff_result.returncode == 0:
         diff = diff_result.stdout
@@ -1818,6 +1849,10 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
                 file=sys.stderr,
             )
         diff = failed_complete_diff_placeholder(diff_result.stderr)
+    # After the reviewable diff is known: Files API `patch` first, then
+    # hunks from a loaded complete `gh pr diff` so large omitted patches
+    # remain commentable. The placeholder contributes nothing.
+    commentable = commentable_by_path(files, diff)
 
     corpus = build_corpus(
         repo=repo,

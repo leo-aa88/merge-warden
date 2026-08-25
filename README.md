@@ -183,7 +183,13 @@ returned by the Pulls Files API and treats those hunks as review evidence.
 line changes is represented in that reconstruction (`limit_error` /
 incomplete coverage). Skipped binaries and files with 0 additions and 0
 deletions do not require a patch. The `gh pr diff` error string is never
-treated as reviewed source. Changed-file source is not eagerly mapped as
+treated as reviewed source. Inline comments are anchored to path/side/line
+triples parsed from that same complete `gh pr diff` when it loads. GitHub's
+Pulls Files API omits `patch` above ~20 KB / 3000 lines; commentable lines
+for those files still come from the unified diff rather than an empty map.
+If `gh pr diff` fails, commentable lines fall back to per-file `patch`
+fields, so a large file with an omitted patch stays un-commentable rather
+than inventing anchors. Changed-file source is not eagerly mapped as
 full files; when the map stage emits `needs_context`, Merge Warden loads
 the requested file from the PR head and sends numbered source chunks
 through targeted validation. That material is treated as untrusted data,
