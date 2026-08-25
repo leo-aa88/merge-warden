@@ -2263,6 +2263,29 @@ class HttpPostRetryTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
         self.assertIn("after 3 attempts", str(ctx.exception))
 
+    def test_map_latency_timeout_is_not_retried_as_same_payload(self) -> None:
+        """Map HTTP attempts=1 so a timed-out inference is not reissued."""
+        timeout, attempts, _budget = mw.provider_call_limits("map")
+        payload = {"prompt": "expensive 8-chunk map batch"}
+        error = urllib.error.URLError("timed out")
+        with mock.patch("urllib.request.urlopen", side_effect=error) as urlopen:
+            with mock.patch("time.sleep") as sleep:
+                with self.assertRaises(RuntimeError) as ctx:
+                    mw.http_post_json(
+                        "https://example.test/v1",
+                        payload,
+                        {"h": "v"},
+                        label="xAI",
+                        timeout=timeout,
+                        attempts=attempts,
+                    )
+        self.assertEqual(attempts, 1)
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+        self.assertIn("after 1 attempts", str(ctx.exception))
+        sent = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(sent, payload)
+
     def test_urlerror_reason_remote_disconnected_is_retried(self) -> None:
         wrapped = urllib.error.URLError(
             http.client.RemoteDisconnected("Remote end closed connection without response")
@@ -2322,16 +2345,33 @@ class ReviewDeadlineTests(unittest.TestCase):
 
     def test_map_call_limits_are_tighter_than_global_http_defaults(self) -> None:
         timeout, attempts, budget = mw.provider_call_limits("map")
+        self.assertEqual(timeout, 140)
+        self.assertEqual(attempts, 1)
+        self.assertEqual(budget, 150)
         self.assertEqual(timeout, mw.MAP_HTTP_TIMEOUT_SECONDS)
         self.assertEqual(attempts, mw.MAP_HTTP_ATTEMPTS)
         self.assertEqual(budget, mw.MAP_CALL_BUDGET_SECONDS)
+        self.assertLessEqual(timeout, budget)
         self.assertLess(timeout, mw.HTTP_TIMEOUT_SECONDS)
         self.assertLess(attempts, mw.HTTP_ATTEMPTS)
         self.assertLess(budget, mw.HTTP_TIMEOUT_SECONDS)
+        self.assertEqual(mw.HTTP_TIMEOUT_SECONDS, 300)
         other_timeout, other_attempts, other_budget = mw.provider_call_limits("synthesis")
         self.assertEqual(other_timeout, mw.HTTP_TIMEOUT_SECONDS)
         self.assertEqual(other_attempts, mw.HTTP_ATTEMPTS)
         self.assertIsNone(other_budget)
+        # Observed Grok 4.6 map successes at 132s fit; the old 90s timeout did not.
+        observed_success = 130.0
+        self.assertGreaterEqual(timeout, observed_success)
+        self.assertGreaterEqual(budget, observed_success)
+        now = 1000.0
+        call_deadline = mw.bound_call_deadline(
+            stage_deadline=now + 400.0,
+            provider_deadline=now + 840.0,
+            call_budget=budget,
+            now=now,
+        )
+        self.assertGreaterEqual(call_deadline - now, observed_success)
 
     def test_map_call_deadline_is_min_of_stage_provider_and_call_budget(self) -> None:
         now = 1000.0

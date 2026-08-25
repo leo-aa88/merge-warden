@@ -931,6 +931,33 @@ class PackTests(unittest.TestCase):
             self.assertLessEqual(sum(item.size for item in batch), 50)
         self.assertEqual(len(batches), 2)
 
+    def test_default_map_soft_target_is_sixteen_k(self) -> None:
+        self.assertEqual(MAP_SOFT_REQUEST_TARGET_CHARS, 16_000)
+        at_target = [
+            _chunk("a", "a.c", "a" * 8_000),
+            _chunk("b", "b.c", "b" * 8_000),
+        ]
+        over_target = [
+            _chunk("c", "c.c", "c" * 9_000),
+            _chunk("d", "d.c", "d" * 8_000),
+        ]
+        packed_at = pack_map_batches(
+            at_target, max_chars=201_000, max_chunks=MAX_MAP_CHUNKS_PER_CALL
+        )
+        packed_over = pack_map_batches(
+            over_target, max_chars=201_000, max_chunks=MAX_MAP_CHUNKS_PER_CALL
+        )
+        self.assertEqual(len(packed_at), 1)
+        self.assertEqual(sum(item.size for item in packed_at[0]), 16_000)
+        self.assertEqual(len(packed_over), 2)
+        explicit_old = pack_map_batches(
+            over_target,
+            max_chars=201_000,
+            max_chunks=MAX_MAP_CHUNKS_PER_CALL,
+            soft_target=32_000,
+        )
+        self.assertEqual(len(explicit_old), 1)
+
 
 class CorpusTests(unittest.TestCase):
     def test_huge_diff_tail_is_in_corpus(self) -> None:
