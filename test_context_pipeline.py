@@ -533,6 +533,69 @@ class ReviewDeadlinePipelineTests(unittest.TestCase):
         self.assertNotIn("overflow candidate", review["body"])
         self.assertEqual(review.get("comments") or [], [])
 
+    def test_unparseable_synthesis_json_fail_closes(self) -> None:
+        """Prose synthesis after successful map/reduce must COMMENT, not raise.
+
+        Issue #47: the synthesis stage raised RuntimeError when the model
+        returned a non-JSON body, crashing the Action instead of fail-closing.
+        """
+
+        def call_model(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[self._mapped_finding(body="prose candidate")],
+                )
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return "thanks, I will not return JSON"
+
+        review, coverage, store, stats = self._run(call_model)
+        _assert_unsynthesized_fallback(self, review)
+        self.assertTrue(coverage.complete)
+        self.assertFalse(stats.deadline_exhausted)
+        self.assertGreater(stats.synthesis_calls, 0)
+        self.assertTrue(
+            any("synthesis JSON could not be parsed" in note for note in stats.notes)
+        )
+        self.assertTrue(store.kept_findings())
+        self.assertIn("prose candidate", [item.body for item in store.kept_findings()])
+        self.assertNotIn("prose candidate", review["body"])
+        self.assertEqual(review.get("comments") or [], [])
+        self.assertNotEqual(
+            mw.normalize_event(review["event"], review["body"]), "APPROVE"
+        )
+
+    def test_fenced_truncated_synthesis_garbage_fail_closes(self) -> None:
+        """A truncated fenced blob is not a review decision."""
+
+        def call_model(system: str, user: str) -> str:
+            if "merge-warden-map" in system:
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=[self._mapped_finding(body="truncated candidate")],
+                )
+            if "merge-warden-reduce" in system:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return (
+                '```json\n{"event":"APPROVE","body":"# APPROVE\\nLooks good.",'
+                '"comments":[{"path":"a.c","line":1,"body":"ship it"}]\n'
+            )
+
+        review, coverage, store, stats = self._run(call_model)
+        _assert_unsynthesized_fallback(self, review)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(review.get("comments") or [], [])
+        self.assertNotIn("truncated candidate", review["body"])
+        self.assertNotIn("ship it", json.dumps(review))
+        self.assertTrue(
+            any("synthesis JSON could not be parsed" in note for note in stats.notes)
+        )
+        self.assertTrue(store.findings)
+        self.assertNotEqual(
+            mw.normalize_event(review["event"], review["body"]), "APPROVE"
+        )
+
 
 class SplitTests(unittest.TestCase):
     def test_split_text_keeps_line_boundaries_and_the_tail(self) -> None:
@@ -7064,6 +7127,36 @@ class GenerateReviewPipelineTests(unittest.TestCase):
         self.assertIn("did not perform a complete review", markdown)
         self.assertNotEqual(mw.normalize_event(payload["event"], payload["body"]), "APPROVE")
         self.assertNotIn("# APPROVE", markdown)
+
+    def test_generate_review_unparseable_synthesis_writes_comment_json(self) -> None:
+        """Prose synthesis must not make generate_review return 1 or skip JSON."""
+        files = [
+            {
+                "filename": "a.c",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 1,
+                "patch": "@@ -1,1 +1,1 @@\n-old\n+new\n",
+            }
+        ]
+
+        def call_model(_provider, system, user, _model, _key, **_kwargs):
+            if "merge-warden-map" in system or "merge-warden-reduce" in system:
+                return _pipeline_model_response(system, user)
+            return "thanks, I will not return JSON"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._generate_args(tmp)
+            rc = self._run_generate_review(args, files, call_model)
+            json_path = Path(args.json_output)
+            self.assertTrue(json_path.is_file())
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(payload["event"], "COMMENT")
+        self.assertEqual(payload.get("comments") or [], [])
+        self.assertNotEqual(
+            mw.normalize_event(payload["event"], payload["body"]), "APPROVE"
+        )
 
     def test_generate_review_failed_diff_mixed_patches_cannot_approve(self) -> None:
         files = [

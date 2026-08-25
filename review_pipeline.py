@@ -2985,7 +2985,24 @@ def run_hierarchical_review(
         )
     parsed = _maybe_json_object(raw)
     if parsed is None:
-        raise RuntimeError(f"Model did not return JSON: {(raw or '')[:2000]}")
+        # Same class as a synthesis deadline miss: no trustworthy event.
+        # Keep store/coverage artifacts and fail closed to COMMENT.
+        note = sanitize_failure_note(
+            "synthesis JSON could not be parsed; no merge decision was produced"
+        )
+        if note and note not in stats.notes:
+            stats.notes.append(note)
+        if not all_reviewable_context_covered(coverage):
+            preamble = _incomplete_preamble(corpus, coverage, stats)
+        else:
+            preamble = (
+                "# COMMENT\n\n"
+                "Merge Warden could not parse the synthesis JSON, so no merge "
+                "recommendation was produced.\n\n"
+                "No approval decision was produced.\n"
+            )
+        review = findings_as_review(store, preamble)
+        return review, coverage, store, stats
     event = str(parsed.get("event") or "COMMENT")
     body = str(parsed.get("body") or "")
     comments = parsed.get("comments") if isinstance(parsed.get("comments"), list) else []

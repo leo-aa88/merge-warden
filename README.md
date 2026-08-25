@@ -265,7 +265,8 @@ share one validation slot and one marker. Remaining reduce groups are kept.
 Incomplete validation is acceptable; a review with no synthesis is not. A
 surviving `validation:incomplete:` marker makes `APPROVE` unreachable, using
 the same event normalizer as posting, even when primary coverage is complete. If
-synthesis itself hits the provider cutoff, the pipeline fail-closes to
+synthesis itself hits the provider cutoff, or returns a body that is not a
+JSON object, the pipeline fail-closes to
 `COMMENT` with **no inline comments**. If map-stage exhaustion leaves primary
 coverage incomplete, synthesis still runs when time remains and must not
 `APPROVE`;
