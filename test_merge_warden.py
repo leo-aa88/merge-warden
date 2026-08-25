@@ -2580,6 +2580,7 @@ class HttpPostRetryTests(unittest.TestCase):
         sleep.assert_called_once_with(60)
 
     def test_does_not_retry_http_400(self) -> None:
+        """Generic 400 is not retried at HTTP layer; shape may still help map."""
         with mock.patch(
             "urllib.request.urlopen", side_effect=self._http_error(400, b"bad request")
         ):
@@ -2592,7 +2593,129 @@ class HttpPostRetryTests(unittest.TestCase):
                         label="xAI",
                     )
         self.assertIn("HTTP 400", str(ctx.exception))
+        self.assertNotIsInstance(ctx.exception, mw.ProviderRequestError)
         sleep.assert_not_called()
+
+    def test_context_length_400_is_not_permanent(self) -> None:
+        body = (
+            b'{"error":{"message":"This models maximum context length is 8192 '
+            b'tokens","type":"invalid_request_error","code":"context_length_exceeded"}}'
+        )
+        with mock.patch(
+            "urllib.request.urlopen", side_effect=self._http_error(400, body)
+        ):
+            with mock.patch("time.sleep") as sleep:
+                with self.assertRaises(RuntimeError) as ctx:
+                    mw.http_post_json(
+                        "https://example.test/v1",
+                        {"a": 1},
+                        {"h": "v"},
+                        label="OpenAI",
+                    )
+        self.assertNotIsInstance(ctx.exception, mw.ProviderRequestError)
+        self.assertIn("context_length_exceeded", str(ctx.exception))
+        self.assertNotIn("permanent provider error", str(ctx.exception))
+        self.assertNotIn("invalid model or provider configuration", str(ctx.exception))
+        sleep.assert_not_called()
+
+    def test_http_413_is_not_permanent(self) -> None:
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=self._http_error(413, b"payload too large"),
+        ):
+            with mock.patch("time.sleep") as sleep:
+                with self.assertRaises(RuntimeError) as ctx:
+                    mw.http_post_json(
+                        "https://example.test/v1",
+                        {"a": 1},
+                        {"h": "v"},
+                        label="xAI",
+                    )
+        self.assertNotIsInstance(ctx.exception, mw.ProviderRequestError)
+        self.assertIn("HTTP 413", str(ctx.exception))
+        sleep.assert_not_called()
+
+    def test_http_401_is_permanent_and_not_retried(self) -> None:
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=self._http_error(401, b"invalid api key"),
+        ):
+            with mock.patch("time.sleep") as sleep:
+                with self.assertRaises(mw.ProviderRequestError) as ctx:
+                    mw.http_post_json(
+                        "https://example.test/v1",
+                        {"a": 1},
+                        {"h": "v"},
+                        label="Gemini",
+                        attempts=3,
+                    )
+        self.assertEqual(ctx.exception.kind, mw.ProviderFailureKind.PERMANENT_PROVIDER_ERROR)
+        self.assertTrue(ctx.exception.is_permanent)
+        self.assertIn("authentication or authorization failed", str(ctx.exception))
+        sleep.assert_not_called()
+
+    def test_http_403_is_permanent_and_not_retried(self) -> None:
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=self._http_error(403, b"permission denied"),
+        ):
+            with mock.patch("time.sleep") as sleep:
+                with self.assertRaises(mw.ProviderRequestError) as ctx:
+                    mw.http_post_json(
+                        "https://example.test/v1",
+                        {"a": 1},
+                        {"h": "v"},
+                        label="OpenAI",
+                        attempts=3,
+                    )
+        self.assertEqual(ctx.exception.kind, mw.ProviderFailureKind.PERMANENT_PROVIDER_ERROR)
+        sleep.assert_not_called()
+
+    def test_retired_model_404_is_permanent(self) -> None:
+        body = b'{"error":{"message":"models/gemini-2.5-pro is not found for API version"}}'
+        with mock.patch(
+            "urllib.request.urlopen", side_effect=self._http_error(404, body)
+        ):
+            with mock.patch("time.sleep") as sleep:
+                with self.assertRaises(mw.ProviderRequestError) as ctx:
+                    mw.http_post_json(
+                        "https://example.test/v1",
+                        {"a": 1},
+                        {"h": "v"},
+                        label="Gemini",
+                    )
+        self.assertEqual(ctx.exception.kind, mw.ProviderFailureKind.PERMANENT_PROVIDER_ERROR)
+        self.assertIn("configured model is unavailable", str(ctx.exception))
+        self.assertIn("HTTP 404", str(ctx.exception))
+        sleep.assert_not_called()
+
+    def test_invalid_model_400_is_permanent(self) -> None:
+        body = (
+            '{"error":{"message":"invalid model: grok-nope",'
+            '"type":"invalid_request_error","code":"model_not_found"}}'
+        )
+        error = mw.classify_non_retryable_http_error("xAI", 400, body)
+        self.assertIsInstance(error, mw.ProviderRequestError)
+        self.assertEqual(error.kind, mw.ProviderFailureKind.PERMANENT_PROVIDER_ERROR)
+        self.assertIn("invalid model or provider configuration", str(error))
+
+    def test_invalid_request_error_envelope_alone_is_not_permanent(self) -> None:
+        body = (
+            '{"error":{"message":"Missing required parameter: \'messages\'.",'
+            '"type":"invalid_request_error","code":"invalid_request_error"}}'
+        )
+        error = mw.classify_non_retryable_http_error("OpenAI", 400, body)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertNotIsInstance(error, mw.ProviderRequestError)
+
+    def test_permanent_http_error_sanitizes_long_provider_bodies(self) -> None:
+        detail = "model not found " + ("Z" * 4000)
+        error = mw.provider_permanent_http_error("Gemini", 404, detail)
+        message = str(error)
+        self.assertLessEqual(len(message), 400)
+        self.assertNotIn("Z" * 4000, message)
+        self.assertIn("…", message)
+        self.assertIn("configured model is unavailable", message)
 
     def test_gives_up_after_timeout_attempts(self) -> None:
         error = urllib.error.URLError(TimeoutError("timed out"))

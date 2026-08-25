@@ -205,16 +205,19 @@ class ProviderFailureKind(Enum):
     nothing about request size, so splitting is the wrong response: the same
     request usually succeeds once the provider recovers. ``TRANSIENT_TRANSPORT``
     covers connection-level faults, and ``LATENCY_TIMEOUT`` means the request
-    needed more time than its call budget allowed.
+    needed more time than its call budget allowed. ``PERMANENT_PROVIDER_ERROR``
+    covers configuration and authentication failures whose outcome does not
+    depend on request shape: retrying or splitting cannot recover them.
     """
 
     TRANSIENT_TRANSPORT = "transient_transport"
     LATENCY_TIMEOUT = "latency_timeout"
     CAPACITY = "capacity"
+    PERMANENT_PROVIDER_ERROR = "permanent_provider_error"
 
 
 class ProviderRequestError(RuntimeError):
-    """Retryable provider failure with scheduler-visible semantics."""
+    """Provider failure with scheduler-visible semantics."""
 
     def __init__(
         self,
@@ -230,6 +233,10 @@ class ProviderRequestError(RuntimeError):
         # waits at least this long before re-issuing the same request.
         self.retry_after_seconds = retry_after_seconds
         self.http_status = http_status
+
+    @property
+    def is_permanent(self) -> bool:
+        return self.kind == ProviderFailureKind.PERMANENT_PROVIDER_ERROR
 
 
 @dataclass
@@ -902,6 +909,9 @@ class MapStageResult:
     deadline_error: PipelineDeadlineExceeded | None = None
     stage_exhausted: bool = False
     circuit_open: bool = False
+    # Permanent provider/config failure. Stops the pipeline without retry or
+    # split; evidence collected before the failure is preserved.
+    provider_error: BaseException | None = None
 
 
 def sanitize_failure_note(note: str, *, max_chars: int = 240) -> str:
@@ -928,6 +938,8 @@ def compact_failure_notes(notes: list[str]) -> list[str]:
             or "non-json" in lower
             or "provider circuit" in lower
             or "provider health" in lower
+            or "stopping provider work" in lower
+            or "permanent provider" in lower
         ):
             continue
         cleaned.append(text)
@@ -1115,16 +1127,43 @@ def _deadline_result(
     return review, coverage, store, stats
 
 
+def _is_permanent_provider_error(error: BaseException | None) -> bool:
+    return isinstance(error, ProviderRequestError) and error.is_permanent
+
+
+def _record_permanent_provider_stop(
+    stats: PipelineStats,
+    error: BaseException,
+    *,
+    stage: str,
+) -> None:
+    """Log that provider work stops because retry/split cannot recover."""
+    detail = sanitize_failure_note(str(error))
+    note = (
+        f"{detail}. Stopping provider work at {stage}; "
+        "retrying or splitting cannot recover this failure."
+    )
+    if note not in stats.notes:
+        stats.notes.append(note)
+    print(note, flush=True)
+
+
 def _provider_failure_preamble(
     corpus: ReviewCorpus,
     coverage: CoverageReport,
     stats: PipelineStats,
     error: BaseException,
 ) -> str:
-    notice = (
-        "Merge Warden could not complete provider synthesis because a provider "
-        f"request failed: {sanitize_failure_note(str(error))}."
-    )
+    if _is_permanent_provider_error(error):
+        notice = (
+            "Merge Warden stopped the review because of a permanent provider "
+            f"or configuration error: {sanitize_failure_note(str(error))}."
+        )
+    else:
+        notice = (
+            "Merge Warden could not complete provider synthesis because a "
+            f"provider request failed: {sanitize_failure_note(str(error))}."
+        )
     total = reviewable_member_count(corpus.reviewable_chunks)
     uncovered_n = len(coverage.uncovered_chunk_ids)
     analyzed = max(total - uncovered_n, 0)
@@ -2074,6 +2113,28 @@ def hierarchical_reduce(
             except (PipelineDeadlineExceeded, StageDeadlineExceeded):
                 stop_for_deadline()
                 return
+            except ProviderRequestError as exc:
+                if exc.is_permanent:
+                    raise
+                stats.notes.append(
+                    sanitize_failure_note(
+                        f"reduce call failed ({exc}); keeping original findings"
+                    )
+                )
+                if _observe_provider_result(
+                    provider_health,
+                    stats,
+                    logical_id=f"reduce:{','.join(item.id for item in group)}",
+                    error=exc,
+                    remaining_stage_seconds=remaining_stage_seconds(deadline),
+                    succeeded=False,
+                ):
+                    _preserve_unresolved_findings(store)
+                    return
+                for item in group:
+                    store.kept.add(item.id)
+                    next_kept_ids.append(item.id)
+                continue
             except Exception as exc:  # pragma: no cover - defensive
                 stats.notes.append(f"reduce call failed ({exc}); keeping original findings")
                 if _observe_provider_result(
@@ -2738,6 +2799,7 @@ def run_map_stage(
     completed: dict[int, MapWorkerResult] = {}
     in_flight: dict[int, Future[MapWorkerResult]] = {}
     deadline_error: PipelineDeadlineExceeded | None = None
+    permanent_error: BaseException | None = None
     stage_exhausted = False
     # Total capacity backoff already committed by this stage. Charged at
     # enqueue time so the accounting stays on the scheduler thread.
@@ -2878,6 +2940,13 @@ def run_map_stage(
         _record_provider_circuit_open(stats, health)
         abandon_pending()
 
+    def stop_for_permanent_provider(error: BaseException) -> None:
+        nonlocal permanent_error
+        if permanent_error is None:
+            permanent_error = error
+            _record_permanent_provider_stop(stats, error, stage="map")
+        abandon_pending()
+
     def exhaust_map_stage(*, extra_uncovered: int = 0) -> None:
         nonlocal stage_exhausted
         if not stage_exhausted:
@@ -2936,6 +3005,7 @@ def run_map_stage(
                 pending
                 and len(in_flight) < concurrency
                 and deadline_error is None
+                and permanent_error is None
                 and not stage_exhausted
                 and not health.circuit_open
             ):
@@ -3062,8 +3132,12 @@ def run_map_stage(
                         continue
                     mapped_ids.add(chunk.id)
                     analyzed.append(chunk)
+                if _is_permanent_provider_error(result.error):
+                    stop_for_permanent_provider(result.error)
+                    continue
                 if (
                     deadline_error is not None
+                    or permanent_error is not None
                     or stage_exhausted
                     or health.circuit_open
                 ):
@@ -3091,6 +3165,7 @@ def run_map_stage(
             if not in_flight:
                 if (
                     deadline_error is not None
+                    or permanent_error is not None
                     or stage_exhausted
                     or health.circuit_open
                     or stats.map_attempts >= MAX_MAP_ATTEMPTS
@@ -3136,6 +3211,10 @@ def run_map_stage(
                             if chunk.id not in mapped_ids
                         )
                     )
+                elif _is_permanent_provider_error(worker_result.error):
+                    # Stop new dispatches immediately. Ingest still runs in
+                    # sequence order so earlier batches keep their evidence.
+                    stop_for_permanent_provider(worker_result.error)
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
@@ -3145,6 +3224,7 @@ def run_map_stage(
         deadline_error=deadline_error,
         stage_exhausted=stage_exhausted or stats.map_deadline_exhausted,
         circuit_open=health.circuit_open,
+        provider_error=permanent_error,
     )
 
 
@@ -3467,6 +3547,7 @@ def run_validation_pass(
     limit_note_added = False
     deadline_note_added = False
     stop_validation = False
+    permanent_error: BaseException | None = None
 
     def record_limit_reached() -> None:
         nonlocal limit_note_added
@@ -3494,6 +3575,8 @@ def run_validation_pass(
         nonlocal stop_validation
         if provider_health is not None and provider_health.circuit_open:
             stop_validation = True
+            return True
+        if permanent_error is not None:
             return True
         if stop_validation or (
             deadline is not None and deadline - time.monotonic() <= 0
@@ -3630,7 +3713,12 @@ def run_validation_pass(
     )
     try:
         while pending or in_flight or completed:
-            while pending and len(in_flight) < concurrency and not stop_validation:
+            while (
+                pending
+                and len(in_flight) < concurrency
+                and not stop_validation
+                and permanent_error is None
+            ):
                 if cannot_start_provider_call():
                     abandon_pending()
                     break
@@ -3670,6 +3758,16 @@ def run_validation_pass(
                         f"after {result.elapsed_seconds:.1f}s",
                         flush=True,
                     )
+                    defer_task(task)
+                    abandon_pending()
+                    continue
+                if _is_permanent_provider_error(result.error):
+                    if permanent_error is None:
+                        permanent_error = result.error
+                    if not any("Stopping provider work" in note for note in stats.notes):
+                        _record_permanent_provider_stop(
+                            stats, result.error, stage="validation"
+                        )
                     defer_task(task)
                     abandon_pending()
                     continue
@@ -3724,11 +3822,24 @@ def run_validation_pass(
                     error, (PipelineDeadlineExceeded, StageDeadlineExceeded)
                 ):
                     stop_validation = True
+                elif _is_permanent_provider_error(error):
+                    # Stop new dispatches without pretending the stage timed out.
+                    if permanent_error is None:
+                        permanent_error = error
+                    if not any(
+                        "Stopping provider work" in note for note in stats.notes
+                    ):
+                        _record_permanent_provider_stop(
+                            stats, error, stage="validation"
+                        )
+                    abandon_pending()
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
     if pending:
         abandon_pending()
+    if permanent_error is not None:
+        raise permanent_error
 
 
 def run_hierarchical_review(
@@ -3811,6 +3922,17 @@ def run_hierarchical_review(
             analyzed=analyzed,
             error=map_result.deadline_error,
         )
+    if map_result.provider_error is not None:
+        mark_chunks_covered(coverage, analyzed)
+        stats.map_chunks_acknowledged = len(analyzed)
+        stats.map_chunks_uncovered = max(stats.chunks - len(analyzed), 0)
+        return _provider_failure_result(
+            corpus=corpus,
+            coverage=coverage,
+            store=store,
+            stats=stats,
+            error=map_result.provider_error,
+        )
 
     mark_chunks_covered(coverage, analyzed)
     stats.map_chunks_acknowledged = len(analyzed)
@@ -3861,6 +3983,18 @@ def run_hierarchical_review(
                 deadline=reduce_stage_deadline(deadline),
                 provider_health=health,
             )
+    except ProviderRequestError as exc:
+        if not exc.is_permanent:
+            raise
+        if not any("Stopping provider work" in note for note in stats.notes):
+            _record_permanent_provider_stop(stats, exc, stage="pipeline")
+        return _provider_failure_result(
+            corpus=corpus,
+            coverage=coverage,
+            store=store,
+            stats=stats,
+            error=exc,
+        )
     except (PipelineDeadlineExceeded, StageDeadlineExceeded) as exc:
         # Stage cutoffs inside pre-reduce/validation/reduce are swallowed by
         # those functions. If one still escapes, keep evidence and continue
@@ -3908,6 +4042,10 @@ def run_hierarchical_review(
     try:
         raw = _call(call_model, synthesis_prompt, synthesis_message, stats, "synthesis")
     except ProviderRequestError as exc:
+        if exc.is_permanent and not any(
+            "Stopping provider work" in note for note in stats.notes
+        ):
+            _record_permanent_provider_stop(stats, exc, stage="synthesis")
         return _provider_failure_result(
             corpus=corpus,
             coverage=coverage,
