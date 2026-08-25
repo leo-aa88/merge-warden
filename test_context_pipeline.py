@@ -6755,6 +6755,62 @@ class PermanentProviderErrorTests(unittest.TestCase):
         self.assertEqual(stats.map_batches_split, 0)
         self.assertTrue(coverage.complete)
 
+    def test_context_length_400_still_splits_multi_chunk_map(self) -> None:
+        """Request-shape 400 must split, not fail-close the review."""
+        chunks = _tiny_chunks(8)
+        corpus = _synthetic_corpus(chunks)
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                shapes.append(len(ids))
+                if len(ids) >= 8:
+                    raise RuntimeError(
+                        "OpenAI HTTP 400: This model's maximum context length "
+                        "is 8192 tokens (code=context_length_exceeded)"
+                    )
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        review, coverage, _store, stats = self._run(corpus, fake)
+        self.assertEqual(shapes.count(8), 1)
+        self.assertGreaterEqual(stats.map_batches_split, 1)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.synthesis_calls, 1)
+        self.assertFalse(any("Stopping provider work" in note for note in stats.notes))
+        self.assertNotIn("permanent provider", review["body"].lower())
+
+    def test_http_413_still_splits_multi_chunk_map(self) -> None:
+        chunks = _tiny_chunks(8)
+        corpus = _synthetic_corpus(chunks)
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                shapes.append(len(ids))
+                if len(ids) >= 8:
+                    raise RuntimeError("xAI HTTP 413: payload too large")
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        _review, coverage, _store, stats = self._run(corpus, fake)
+        self.assertEqual(shapes.count(8), 1)
+        self.assertGreaterEqual(stats.map_batches_split, 1)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.synthesis_calls, 1)
+
     def test_permanent_error_during_synthesis_fail_closes(self) -> None:
         chunks = _tiny_chunks(1)
         corpus = _synthetic_corpus(chunks)
@@ -6812,11 +6868,15 @@ class PermanentProviderErrorTests(unittest.TestCase):
         self.assertIn("validation", stages)
         self.assertNotIn("synthesis", stages)
         self.assertEqual(stats.synthesis_calls, 0)
+        self.assertFalse(stats.validation_deadline_exhausted)
         self.assertEqual(review["event"], "COMMENT")
         self.assertEqual(review["comments"], [])
         self.assertIn("permanent provider", review["body"].lower())
         self.assertTrue(store.findings)
         self.assertNotIn(_likely_foo_finding()["body"], review["body"])
+        self.assertFalse(
+            any("validation stage deadline exhausted" in note for note in stats.notes)
+        )
 
     def test_permanent_error_during_reduce_stops_pipeline(self) -> None:
         chunks = _tiny_chunks(1)

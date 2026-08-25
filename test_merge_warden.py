@@ -2549,20 +2549,59 @@ class HttpPostRetryTests(unittest.TestCase):
         sleep.assert_called_once_with(60)
 
     def test_does_not_retry_http_400(self) -> None:
+        """Generic 400 is not retried at HTTP layer; shape may still help map."""
         with mock.patch(
             "urllib.request.urlopen", side_effect=self._http_error(400, b"bad request")
         ):
             with mock.patch("time.sleep") as sleep:
-                with self.assertRaises(mw.ProviderRequestError) as ctx:
+                with self.assertRaises(RuntimeError) as ctx:
                     mw.http_post_json(
                         "https://example.test/v1",
                         {"a": 1},
                         {"h": "v"},
                         label="xAI",
                     )
-        self.assertEqual(ctx.exception.kind, mw.ProviderFailureKind.PERMANENT_PROVIDER_ERROR)
         self.assertIn("HTTP 400", str(ctx.exception))
-        self.assertIn("permanent provider error", str(ctx.exception))
+        self.assertNotIsInstance(ctx.exception, mw.ProviderRequestError)
+        sleep.assert_not_called()
+
+    def test_context_length_400_is_not_permanent(self) -> None:
+        body = (
+            b'{"error":{"message":"This models maximum context length is 8192 '
+            b'tokens","type":"invalid_request_error","code":"context_length_exceeded"}}'
+        )
+        with mock.patch(
+            "urllib.request.urlopen", side_effect=self._http_error(400, body)
+        ):
+            with mock.patch("time.sleep") as sleep:
+                with self.assertRaises(RuntimeError) as ctx:
+                    mw.http_post_json(
+                        "https://example.test/v1",
+                        {"a": 1},
+                        {"h": "v"},
+                        label="OpenAI",
+                    )
+        self.assertNotIsInstance(ctx.exception, mw.ProviderRequestError)
+        self.assertIn("context_length_exceeded", str(ctx.exception))
+        self.assertNotIn("permanent provider error", str(ctx.exception))
+        self.assertNotIn("invalid model or provider configuration", str(ctx.exception))
+        sleep.assert_not_called()
+
+    def test_http_413_is_not_permanent(self) -> None:
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=self._http_error(413, b"payload too large"),
+        ):
+            with mock.patch("time.sleep") as sleep:
+                with self.assertRaises(RuntimeError) as ctx:
+                    mw.http_post_json(
+                        "https://example.test/v1",
+                        {"a": 1},
+                        {"h": "v"},
+                        label="xAI",
+                    )
+        self.assertNotIsInstance(ctx.exception, mw.ProviderRequestError)
+        self.assertIn("HTTP 413", str(ctx.exception))
         sleep.assert_not_called()
 
     def test_http_401_is_permanent_and_not_retried(self) -> None:
@@ -2620,10 +2659,23 @@ class HttpPostRetryTests(unittest.TestCase):
         sleep.assert_not_called()
 
     def test_invalid_model_400_is_permanent(self) -> None:
-        body = b'{"error":{"message":"invalid model: grok-nope","type":"invalid_request_error"}}'
-        error = mw.provider_http_error("xAI", 400, body.decode(), None)
+        body = (
+            '{"error":{"message":"invalid model: grok-nope",'
+            '"type":"invalid_request_error","code":"model_not_found"}}'
+        )
+        error = mw.classify_non_retryable_http_error("xAI", 400, body)
+        self.assertIsInstance(error, mw.ProviderRequestError)
         self.assertEqual(error.kind, mw.ProviderFailureKind.PERMANENT_PROVIDER_ERROR)
         self.assertIn("invalid model or provider configuration", str(error))
+
+    def test_invalid_request_error_envelope_alone_is_not_permanent(self) -> None:
+        body = (
+            '{"error":{"message":"Missing required parameter: \'messages\'.",'
+            '"type":"invalid_request_error","code":"invalid_request_error"}}'
+        )
+        error = mw.classify_non_retryable_http_error("OpenAI", 400, body)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertNotIsInstance(error, mw.ProviderRequestError)
 
     def test_permanent_http_error_sanitizes_long_provider_bodies(self) -> None:
         detail = "model not found " + ("Z" * 4000)

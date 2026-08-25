@@ -2241,18 +2241,6 @@ def _follow_up_batches(
 
     kind = result.provider_failure_kind
 
-    if kind == ProviderFailureKind.PERMANENT_PROVIDER_ERROR:
-        # Configuration/auth/model failures do not depend on request shape.
-        # Leave chunks uncovered and let the pipeline fail closed.
-        stats.notes.append(
-            sanitize_failure_note(
-                f"map batch {batch_tag} permanent provider error after "
-                f"{elapsed_seconds:.1f}s; not retrying or splitting "
-                f"({len(remaining)} chunk(s) uncovered)"
-            )
-        )
-        return []
-
     def spent(counter: dict[str, int]) -> int:
         """Retries already charged to the most-retried chunk in this batch.
 
@@ -3199,6 +3187,8 @@ def run_validation_pass(
         deadline_note_added = True
 
     def cannot_start_provider_call() -> bool:
+        if permanent_error is not None:
+            return True
         if stop_validation or (
             deadline is not None and deadline - time.monotonic() <= 0
         ):
@@ -3334,7 +3324,12 @@ def run_validation_pass(
     )
     try:
         while pending or in_flight or completed:
-            while pending and len(in_flight) < concurrency and not stop_validation:
+            while (
+                pending
+                and len(in_flight) < concurrency
+                and not stop_validation
+                and permanent_error is None
+            ):
                 if cannot_start_provider_call():
                     abandon_pending()
                     break
@@ -3380,10 +3375,10 @@ def run_validation_pass(
                 if _is_permanent_provider_error(result.error):
                     if permanent_error is None:
                         permanent_error = result.error
+                    if not any("Stopping provider work" in note for note in stats.notes):
                         _record_permanent_provider_stop(
                             stats, result.error, stage="validation"
                         )
-                    stop_validation = True
                     defer_task(task)
                     abandon_pending()
                     continue
@@ -3426,7 +3421,16 @@ def run_validation_pass(
                 ):
                     stop_validation = True
                 elif _is_permanent_provider_error(error):
-                    stop_validation = True
+                    # Stop new dispatches without pretending the stage timed out.
+                    if permanent_error is None:
+                        permanent_error = error
+                    if not any(
+                        "Stopping provider work" in note for note in stats.notes
+                    ):
+                        _record_permanent_provider_stop(
+                            stats, error, stage="validation"
+                        )
+                    abandon_pending()
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 

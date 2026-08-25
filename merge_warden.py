@@ -512,16 +512,14 @@ def provider_http_error(
     detail: str,
     retry_after: str | None,
 ) -> ProviderRequestError:
-    """Classify an HTTP status for the map scheduler.
+    """Classify a retryable HTTP status for the map scheduler.
 
     429 and 503 are capacity signals: the request shape is fine and the
-    provider is asking for a delay. Other retryable codes stay transport
-    failures and keep the existing retry-then-split handling. Non-retryable
-    codes are permanent: changing request shape cannot fix a bad credential,
-    retired model, or invalid configuration.
+    provider is asking for a delay. Every other retryable code stays a
+    transport failure and keeps the existing retry-then-split handling.
+
+    Non-retryable statuses belong to ``classify_non_retryable_http_error``.
     """
-    if code not in RETRYABLE_HTTP_CODES:
-        return provider_permanent_http_error(label, code, detail)
     message = f"{label} HTTP {code}: {detail}"
     if code in CAPACITY_HTTP_CODES:
         return ProviderRequestError(
@@ -532,32 +530,97 @@ def provider_http_error(
     return ProviderRequestError(ProviderFailureKind.TRANSIENT_TRANSPORT, message)
 
 
+# Explicit model/config failure markers. Deliberately excludes bare "invalid",
+# which matches the OpenAI/Anthropic ``invalid_request_error`` envelope used
+# for almost every 400, including context-length and missing fields.
+_PERMANENT_MODEL_CONFIG_MARKERS = (
+    "model_not_found",
+    "model not found",
+    "invalid model",
+    "unknown model",
+    "unsupported model",
+    "model is not found",
+    "is not found for api version",
+    "not a valid model",
+    "model_not_available",
+    "retired model",
+    "models/",  # Gemini-style "models/<name> is not found"
+)
+
+_REQUEST_TOO_LARGE_MARKERS = (
+    "context_length_exceeded",
+    "maximum context length",
+    "context length",
+    "too many tokens",
+    "request too large",
+    "payload too large",
+    "prompt is too long",
+    "token limit",
+)
+
+
+def _normalized_provider_detail(detail: str) -> str:
+    return " ".join((detail or "").split()).lower()
+
+
+def _body_reports_request_too_large(detail: str) -> bool:
+    text = _normalized_provider_detail(detail)
+    return any(marker in text for marker in _REQUEST_TOO_LARGE_MARKERS)
+
+
+def _body_reports_invalid_model_or_config(detail: str) -> bool:
+    """True when the provider body identifies a bad model or configuration.
+
+    Shape-dependent failures (context length, payload size) are excluded even
+    when they arrive wrapped in ``invalid_request_error``.
+    """
+    if _body_reports_request_too_large(detail):
+        return False
+    text = _normalized_provider_detail(detail)
+    return any(marker in text for marker in _PERMANENT_MODEL_CONFIG_MARKERS)
+
+
+def http_error_is_permanent(code: int, detail: str) -> bool:
+    """Whether changing request shape cannot recover this HTTP failure.
+
+    Permanence is not ``code not in RETRYABLE_HTTP_CODES``. 401/403 and
+    unknown/retired-model (or wrong-endpoint) 404 cannot be fixed by splitting.
+    HTTP 413 and context-length 400 can — those stay on the map split path.
+    HTTP 400 is permanent only when the body reports invalid model/config.
+    """
+    if code in {401, 403}:
+        return True
+    if code == 404:
+        # Wrong endpoint or missing/retired model. Request shape cannot help.
+        return True
+    if code == 413:
+        return False
+    if code == 400:
+        return _body_reports_invalid_model_or_config(detail)
+    return False
+
+
+def _sanitize_http_detail_snippet(detail: str, *, limit: int = 160) -> str:
+    snippet = " ".join((detail or "").split())
+    if len(snippet) > limit:
+        return snippet[: limit - 1].rstrip() + "…"
+    return snippet
+
+
 def _permanent_http_summary(code: int, detail: str) -> str:
     """Short human summary for a permanent HTTP failure."""
-    text = " ".join((detail or "").split()).lower()
     if code in {401, 403}:
         return "authentication or authorization failed"
     if code == 404:
+        text = _normalized_provider_detail(detail)
         if any(
             token in text
-            for token in (
-                "model",
-                "not found",
-                "not available",
-                "does not exist",
-                "unknown",
-                "retired",
-            )
+            for token in ("model", "not found", "not available", "does not exist", "retired")
         ):
             return "configured model is unavailable"
         return "endpoint or model is unavailable"
     if code == 400:
-        if any(
-            token in text
-            for token in ("model", "unsupported", "invalid", "not supported")
-        ):
-            return "invalid model or provider configuration"
-        return "invalid provider request"
+        return "invalid model or provider configuration"
     return "permanent provider or configuration error"
 
 
@@ -567,11 +630,7 @@ def provider_permanent_http_error(
     detail: str,
 ) -> ProviderRequestError:
     summary = _permanent_http_summary(code, detail)
-    # Keep a sanitized snippet of the provider body for logs; never the raw
-    # multi-kilobyte JSON dump that some providers return on 404.
-    snippet = " ".join((detail or "").split())
-    if len(snippet) > 160:
-        snippet = snippet[:159].rstrip() + "…"
+    snippet = _sanitize_http_detail_snippet(detail)
     message = f"{label} permanent provider error: {summary} (HTTP {code})"
     if snippet:
         message = f"{message}: {snippet}"
@@ -579,6 +638,24 @@ def provider_permanent_http_error(
         ProviderFailureKind.PERMANENT_PROVIDER_ERROR,
         message,
     )
+
+
+def classify_non_retryable_http_error(
+    label: str,
+    code: int,
+    detail: str,
+) -> BaseException:
+    """Classify a non-retryable HTTP status for the map scheduler.
+
+    Permanent failures become ``ProviderRequestError`` with
+    ``PERMANENT_PROVIDER_ERROR``. Shape-dependent failures (context length,
+    413, generic 400) become a plain ``RuntimeError`` so the map scheduler
+    keeps its historical split path.
+    """
+    if http_error_is_permanent(code, detail):
+        return provider_permanent_http_error(label, code, detail)
+    snippet = _sanitize_http_detail_snippet(detail, limit=500)
+    return RuntimeError(f"{label} HTTP {code}: {snippet}")
 
 
 def latency_retry_fits(
@@ -1098,7 +1175,9 @@ def http_post_json(
             if exc.headers:
                 retry_after = exc.headers.get("Retry-After")
             if exc.code not in RETRYABLE_HTTP_CODES:
-                raise provider_permanent_http_error(label, exc.code, detail) from exc
+                raise classify_non_retryable_http_error(
+                    label, exc.code, detail
+                ) from exc
             if attempt == attempts:
                 raise provider_http_error(label, exc.code, detail, retry_after) from exc
             error = f"HTTP {exc.code}"
