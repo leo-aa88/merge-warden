@@ -1201,6 +1201,11 @@ class ReviewDeadlineTests(unittest.TestCase):
         self.assertEqual(timeout, mw.MAP_HTTP_TIMEOUT_SECONDS)
         self.assertEqual(attempts, mw.MAP_HTTP_ATTEMPTS)
         self.assertEqual(budget, mw.MAP_CALL_BUDGET_SECONDS)
+        self.assertEqual(timeout, 140)
+        self.assertEqual(attempts, 1)
+        self.assertEqual(budget, 150)
+        self.assertGreater(timeout, 90)
+        self.assertGreater(budget, 130)
         self.assertLess(timeout, mw.HTTP_TIMEOUT_SECONDS)
         self.assertLess(attempts, mw.HTTP_ATTEMPTS)
         self.assertLess(budget, mw.HTTP_TIMEOUT_SECONDS)
@@ -1214,14 +1219,14 @@ class ReviewDeadlineTests(unittest.TestCase):
         call_deadline = mw.bound_call_deadline(
             stage_deadline=now + 400.0,
             provider_deadline=now + 840.0,
-            call_budget=120.0,
+            call_budget=150.0,
             now=now,
         )
-        self.assertEqual(call_deadline, now + 120.0)
+        self.assertEqual(call_deadline, now + 150.0)
         stage_bound = mw.bound_call_deadline(
             stage_deadline=now + 30.0,
             provider_deadline=now + 840.0,
-            call_budget=120.0,
+            call_budget=150.0,
             now=now,
         )
         self.assertEqual(stage_bound, now + 30.0)
@@ -1238,6 +1243,7 @@ class ReviewDeadlineTests(unittest.TestCase):
         self.assertNotIsInstance(classified, mw.PipelineDeadlineExceeded)
         self.assertNotIsInstance(classified, mw.StageDeadlineExceeded)
         self.assertIn("latency budget", str(classified))
+        self.assertEqual(classified.kind, mw.ProviderFailureKind.LATENCY_TIMEOUT)
 
     def test_non_map_timeout_with_time_remaining_is_pipeline_deadline(self) -> None:
         """Retry-would-cross still fail-closes every stage except map."""
@@ -1295,6 +1301,52 @@ class ReviewDeadlineTests(unittest.TestCase):
                 )
         self.assertEqual(data, {"ok": True})
         self.assertAlmostEqual(urlopen.call_args.kwargs["timeout"], 10.0)
+
+    def test_http_socket_timeout_raises_deadline_failure(self) -> None:
+        with mock.patch(
+            "urllib.request.urlopen", side_effect=mw.socket.timeout("timed out")
+        ):
+            with self.assertRaises(mw.RequestDeadlineExceeded) as caught:
+                mw.http_post_json(
+                    "https://example.test/v1",
+                    {"a": 1},
+                    {"h": "v"},
+                    timeout=mw.MAP_HTTP_TIMEOUT_SECONDS,
+                    attempts=mw.MAP_HTTP_ATTEMPTS,
+                    label="xAI map",
+                )
+        self.assertIn("140.0s", str(caught.exception))
+
+    def test_http_urlerror_timeout_raises_deadline_failure(self) -> None:
+        with mock.patch(
+            "urllib.request.urlopen", side_effect=urllib.error.URLError("timed out")
+        ):
+            with self.assertRaises(mw.RequestDeadlineExceeded) as caught:
+                mw.http_post_json(
+                    "https://example.test/v1",
+                    {"a": 1},
+                    {"h": "v"},
+                    timeout=mw.MAP_HTTP_TIMEOUT_SECONDS,
+                    attempts=mw.MAP_HTTP_ATTEMPTS,
+                    label="xAI map",
+                )
+        self.assertIn("140.0s", str(caught.exception))
+
+    def test_http_non_timeout_urlerror_remains_transport_failure(self) -> None:
+        error = urllib.error.URLError("Temporary failure in name resolution")
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(mw.ProviderRequestError) as caught:
+                mw.http_post_json(
+                    "https://example.test/v1",
+                    {"a": 1},
+                    {"h": "v"},
+                    timeout=mw.MAP_HTTP_TIMEOUT_SECONDS,
+                    attempts=mw.MAP_HTTP_ATTEMPTS,
+                    label="xAI map",
+                )
+        self.assertEqual(
+            caught.exception.kind, mw.ProviderFailureKind.TRANSIENT_TRANSPORT
+        )
 
     def test_retry_is_refused_when_backoff_would_cross_deadline(self) -> None:
         error = urllib.error.URLError("timed out")

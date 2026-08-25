@@ -39,6 +39,8 @@ from review_pipeline import (
     SYNTHESIS_RESERVE_SECONDS,
     VALIDATION_RESERVE_SECONDS,
     VALIDATION_STAGE_TOKEN,
+    ProviderFailureKind,
+    ProviderRequestError,
     PipelineDeadlineExceeded,
     StageDeadlineExceeded,
     apply_incomplete_validation_guard,
@@ -377,7 +379,10 @@ def classify_deadline_exception(
             return StageDeadlineExceeded(stage, str(exc))
         return PipelineDeadlineExceeded(str(exc))
     if stage == "map":
-        return RuntimeError(f"{stage} call exceeded latency budget: {exc}")
+        return ProviderRequestError(
+            ProviderFailureKind.LATENCY_TIMEOUT,
+            f"{stage} call latency budget exhausted: {exc}",
+        )
     return PipelineDeadlineExceeded(str(exc))
 
 
@@ -396,6 +401,13 @@ def http_timeout_for_deadline(
             f"{label} request skipped because the review deadline is exhausted"
         )
     return min(configured, max(remaining, 0.001))
+
+
+def url_error_is_timeout(exc: urllib.error.URLError) -> bool:
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return True
+    return "timed out" in str(exc).lower()
 
 
 def compute_review_deadlines(
@@ -847,22 +859,50 @@ def http_post_json(
             detail = exc.read().decode("utf-8", errors="replace")
             if exc.headers:
                 retry_after = exc.headers.get("Retry-After")
-            if exc.code not in RETRYABLE_HTTP_CODES or attempt == attempts:
+            if exc.code not in RETRYABLE_HTTP_CODES:
                 raise RuntimeError(f"{label} HTTP {exc.code}: {detail}") from exc
+            if attempt == attempts:
+                raise ProviderRequestError(
+                    ProviderFailureKind.TRANSIENT_TRANSPORT,
+                    f"{label} HTTP {exc.code}: {detail}",
+                ) from exc
             error = f"HTTP {exc.code}"
             last_error = exc
         except RequestDeadlineExceeded:
             raise
+        except (TimeoutError, socket.timeout) as exc:
+            if attempt == attempts:
+                raise RequestDeadlineExceeded(
+                    f"{label} request timed out after {attempts} attempts "
+                    f"(last timeout {request_timeout:.1f}s)"
+                ) from exc
+            error = str(exc)
+            last_error = exc
+        except urllib.error.URLError as exc:
+            if url_error_is_timeout(exc):
+                if attempt == attempts:
+                    raise RequestDeadlineExceeded(
+                        f"{label} request timed out after {attempts} attempts "
+                        f"(last timeout {request_timeout:.1f}s)"
+                    ) from exc
+                error = str(exc)
+                last_error = exc
+            elif attempt == attempts:
+                raise ProviderRequestError(
+                    ProviderFailureKind.TRANSIENT_TRANSPORT,
+                    f"{label} request failed after {attempts} attempts: {exc}",
+                ) from exc
+            else:
+                error = str(exc)
+                last_error = exc
         except (
-            urllib.error.URLError,
             http.client.RemoteDisconnected,
             http.client.IncompleteRead,
             ConnectionResetError,
-            TimeoutError,
-            socket.timeout,
         ) as exc:
             if attempt == attempts:
-                raise RuntimeError(
+                raise ProviderRequestError(
+                    ProviderFailureKind.TRANSIENT_TRANSPORT,
                     f"{label} request failed after {attempts} attempts: {exc}"
                 ) from exc
             error = str(exc)

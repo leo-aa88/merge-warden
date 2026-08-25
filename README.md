@@ -195,7 +195,7 @@ max 4). Evidence ingestion stays single-threaded and deterministic.
 Failed map batches split into smaller requests instead of abandoning sibling
 chunks; a global cap of 32 logical map attempts still fail-closes the review.
 Initial map batches are balanced by chunk size (largest-first bin packing with
-a soft ~32k-character target) so one giant request is not scheduled beside
+a soft ~16k-character target) so one giant request is not scheduled beside
 several tiny ones. Hard per-request character limits still win.
 
 Binary and generated files can be excluded, but that exclusion is explicit in
@@ -231,12 +231,16 @@ time reserved for later stages:
 - reduce stops `150s` before the provider cutoff
 - synthesis uses the remaining provider budget
 
-Map calls also have a tighter per-call latency budget (90s HTTP timeout, 120s
-logical call budget, 2 HTTP attempts) so a slow batch splits while downstream
-reserves are still intact. A map follow-up is not started unless a full call
-budget remains. Exhausting the map-stage allocation leaves remaining
-primary chunks uncovered and **continues** into validation, reduction, and
-synthesis. Exhausting the global provider deadline still fail-closes immediately.
+Map calls also have a tighter per-call latency budget (140s HTTP timeout, 150s
+logical call budget, 1 HTTP attempt) so valid Grok responses longer than 90s
+can complete while slow batches still split before downstream reserves are
+threatened. A multi-chunk map call that exhausts its latency budget is split
+immediately instead of retrying the same expensive shape. A cheap transient
+transport failure may retry the same shape once when enough map budget remains.
+A map follow-up is not started unless a full call budget remains. Exhausting
+the map-stage allocation leaves remaining primary chunks uncovered and
+**continues** into validation, reduction, and synthesis. Exhausting the global
+provider deadline still fail-closes immediately.
 
 Once a stage cutoff is reached, that stage stops scheduling new provider
 calls and the pipeline continues. Remaining cross-context checks are marked
@@ -273,7 +277,9 @@ Optional environment overrides:
 GitHub review bodies and inline comments still have posting size limits
 (60k / 8k). Those are GitHub API limits, not source truncation.
 
-Provider HTTP calls retry transient failures (disconnects, timeouts,
-HTTP 429/5xx) a few times with exponential backoff. HTTP 429 honors
+Provider HTTP calls outside the map stage retry transient failures
+(disconnects, timeouts, HTTP 429/5xx) a few times with exponential backoff.
+Map provider calls use one HTTP attempt and return retryable transport failures
+to the scheduler so it can choose same-shape retry or split. HTTP 429 honors
 `Retry-After` when present, capped at 60 seconds. Every provider socket timeout
 and retry delay is also bounded by the remaining internal review budget.
