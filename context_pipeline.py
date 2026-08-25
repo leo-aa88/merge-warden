@@ -432,6 +432,49 @@ def file_has_usable_patch(file_info: dict) -> bool:
     return any(HUNK_RE.match(line) for line in patch.splitlines())
 
 
+def file_requires_complete_patch(
+    file_info: dict,
+    skipped_paths: set[str] | None = None,
+) -> bool:
+    """A changed text file must appear in a reconstructed complete diff."""
+    path = str(file_info.get("filename") or "").strip()
+    if not path:
+        return False
+    if skipped_paths and path in skipped_paths:
+        return False
+    additions = file_info.get("additions") or 0
+    deletions = file_info.get("deletions") or 0
+    return bool(additions) or bool(deletions)
+
+
+def omitted_required_patch_paths(
+    files: Iterable[dict],
+    skipped_paths: set[str] | None = None,
+) -> list[str]:
+    omitted: list[str] = []
+    for file_info in files:
+        if not file_requires_complete_patch(file_info, skipped_paths):
+            continue
+        if not file_has_usable_patch(file_info):
+            omitted.append(str(file_info.get("filename") or "").strip())
+    return omitted
+
+
+def missing_complete_diff_limit(
+    files: Iterable[dict],
+    skipped_paths: set[str] | None = None,
+) -> str:
+    omitted = omitted_required_patch_paths(files, skipped_paths)
+    if not omitted:
+        return MISSING_COMPLETE_DIFF_LIMIT
+    listed = ", ".join(f"`{path}`" for path in omitted)
+    return (
+        "Complete unified diff could not be loaded and per-file patch "
+        f"payloads omitted changed files: {listed}. "
+        "Merge Warden did not perform a complete review."
+    )
+
+
 def unified_diff_from_file_patches(files: Iterable[dict]) -> str:
     """Rebuild a reviewable unified diff from Pulls Files API `patch` fields."""
     parts: list[str] = []
@@ -469,18 +512,26 @@ def unified_diff_from_file_patches(files: Iterable[dict]) -> str:
     return "".join(parts)
 
 
-def resolve_reviewable_diff(diff: str, files: Iterable[dict]) -> tuple[str, bool]:
-    """Return (diff, missing_complete) for corpus construction.
+def resolve_reviewable_diff(
+    diff: str,
+    files: Iterable[dict],
+    skipped_paths: set[str] | None = None,
+) -> tuple[str, bool]:
+    """Return (reconstructed_or_empty, missing_complete) for corpus construction.
 
-    A failed complete-diff placeholder is not reviewable source. Prefer already
-    fetched per-file patches; otherwise the caller must fail closed.
+    A successful complete unified diff is used as-is. A failed placeholder is
+    never reviewable source: reconstruct hunks from the file inventory, but
+    decide completeness from that inventory rather than from a nonempty
+    reconstruction. Materialize ``files`` once so a generator cannot be
+    consumed before the completeness scan.
     """
     if not is_failed_complete_diff(diff):
         return diff, False
-    reconstructed = unified_diff_from_file_patches(files)
-    if reconstructed:
-        return reconstructed, False
-    return "", True
+    file_list = list(files)
+    reconstructed = unified_diff_from_file_patches(file_list)
+    omitted = omitted_required_patch_paths(file_list, skipped_paths)
+    missing_complete = bool(omitted) or not reconstructed
+    return reconstructed, missing_complete
 
 
 def chunk_source_file(path: str, text: str, limit: int) -> list[ContextChunk]:
@@ -888,22 +939,28 @@ def build_review_corpus(
             )
         )
 
-    diff, missing_complete_diff = resolve_reviewable_diff(inputs.diff, inputs.files)
+    file_list = list(inputs.files)
+    diff, missing_complete_diff = resolve_reviewable_diff(
+        inputs.diff,
+        file_list,
+        skipped_paths=inputs.skipped_paths,
+    )
+    if diff:
+        chunks.extend(chunk_diff(diff, max_single_chunk_chars))
     if missing_complete_diff:
         exclusions.append("complete unified diff unavailable")
-        chunks.append(
-            ContextChunk(
-                id="diff:unavailable:1",
-                kind="diff",
-                source="(unavailable complete diff)",
-                text="(complete unified diff was not available)\n",
-                excluded=True,
-                exclusion_reason="complete unified diff unavailable",
-                member_ids=["diff:unavailable:1"],
+        if not diff:
+            chunks.append(
+                ContextChunk(
+                    id="diff:unavailable:1",
+                    kind="diff",
+                    source="(unavailable complete diff)",
+                    text="(complete unified diff was not available)\n",
+                    excluded=True,
+                    exclusion_reason="complete unified diff unavailable",
+                    member_ids=["diff:unavailable:1"],
+                )
             )
-        )
-    else:
-        chunks.extend(chunk_diff(diff, max_single_chunk_chars))
 
     for file_info in inputs.files:
         path = file_info.get("filename") or ""
@@ -971,7 +1028,7 @@ def build_review_corpus(
     total_chars = sum(chunk.size for chunk in chunks if not chunk.excluded)
     limit_error = ""
     if missing_complete_diff:
-        limit_error = MISSING_COMPLETE_DIFF_LIMIT
+        limit_error = missing_complete_diff_limit(file_list, inputs.skipped_paths)
     elif total_chars > max_total_review_chars:
         limit_error = (
             f"PR contains {format_char_count(total_chars)} of reviewable context. "

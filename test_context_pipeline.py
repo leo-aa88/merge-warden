@@ -27,14 +27,17 @@ from context_pipeline import (
     build_review_corpus,
     chunk_diff,
     chunk_text,
+    failed_complete_diff_placeholder,
     format_char_count,
     incomplete_coverage_body,
     incomplete_limit_body,
     mark_chunks_covered,
     pack_chunks,
     reset_uncovered,
+    resolve_reviewable_diff,
     split_on_headings,
     split_text_by_lines,
+    unified_diff_from_file_patches,
 )
 from review_pipeline import (
     CANDIDATE_FINDINGS_NOT_POSTED,
@@ -808,6 +811,161 @@ class CorpusTests(unittest.TestCase):
                 for chunk in corpus.chunks
             )
         )
+
+    def test_failed_complete_diff_mixed_patches_cannot_approve(self) -> None:
+        corpus = build_review_corpus(
+            _inputs(
+                diff=failed_complete_diff_placeholder(
+                    "GraphQL: pull request diff is too large"
+                ),
+                files=[
+                    {
+                        "filename": "small.c",
+                        "status": "modified",
+                        "additions": 1,
+                        "deletions": 1,
+                        "patch": "@@ -1,1 +1,1 @@\n-old small\n+new small\n",
+                    },
+                    {
+                        "filename": "huge.c",
+                        "status": "modified",
+                        "additions": 4000,
+                        "deletions": 0,
+                    },
+                ],
+            )
+        )
+        reviewable = "\n".join(chunk.text for chunk in corpus.reviewable_chunks)
+        self.assertIn("new small", reviewable)
+        self.assertTrue(
+            any(
+                chunk.kind == "diff" and chunk.source == "small.c"
+                for chunk in corpus.reviewable_chunks
+            )
+        )
+        self.assertTrue(corpus.limit_error)
+        self.assertFalse(corpus.coverage.complete)
+        self.assertIn("did not perform a complete review", corpus.limit_error)
+        self.assertIn("huge.c", corpus.limit_error)
+        self.assertNotIn("no per-file patch payloads were available", corpus.limit_error)
+        self.assertNotIn("APPROVE", corpus.limit_error)
+        self.assertNotIn("APPROVE", incomplete_limit_body(corpus.limit_error))
+        self.assertNotIn("failed to load complete diff", reviewable)
+        self.assertNotIn(corpus.limit_error, reviewable)
+
+    def test_failed_complete_diff_skips_binaries_and_zero_zero_files(self) -> None:
+        corpus = build_review_corpus(
+            _inputs(
+                diff=failed_complete_diff_placeholder(
+                    "GraphQL: pull request diff is too large"
+                ),
+                files=[
+                    {
+                        "filename": "small.c",
+                        "status": "modified",
+                        "additions": 1,
+                        "deletions": 1,
+                        "patch": "@@ -1,1 +1,1 @@\n-old small\n+new small\n",
+                    },
+                    {
+                        "filename": "logo.png",
+                        "status": "modified",
+                        "additions": 0,
+                        "deletions": 0,
+                    },
+                    {
+                        "filename": "renamed.bin",
+                        "previous_filename": "old.bin",
+                        "status": "renamed",
+                        "additions": 0,
+                        "deletions": 0,
+                    },
+                ],
+                skipped_paths={"logo.png"},
+            )
+        )
+        reviewable = "\n".join(chunk.text for chunk in corpus.reviewable_chunks)
+        self.assertIn("new small", reviewable)
+        self.assertFalse(corpus.limit_error)
+        self.assertNotIn("logo.png", corpus.limit_error)
+        self.assertNotIn("renamed.bin", corpus.limit_error)
+
+    def test_unified_diff_from_file_patches_added_header_uses_dev_null(self) -> None:
+        diff = unified_diff_from_file_patches(
+            [
+                {
+                    "filename": "new.c",
+                    "status": "added",
+                    "additions": 1,
+                    "deletions": 0,
+                    "patch": "@@ -0,0 +1,1 @@\n+int x;\n",
+                }
+            ]
+        )
+        self.assertIn("diff --git a/new.c b/new.c", diff)
+        self.assertIn("--- /dev/null", diff)
+        self.assertIn("+++ b/new.c", diff)
+        self.assertIn("+int x;", diff)
+
+    def test_unified_diff_from_file_patches_removed_header_uses_dev_null(self) -> None:
+        diff = unified_diff_from_file_patches(
+            [
+                {
+                    "filename": "old.c",
+                    "status": "removed",
+                    "additions": 0,
+                    "deletions": 1,
+                    "patch": "@@ -1,1 +0,0 @@\n-int x;\n",
+                }
+            ]
+        )
+        self.assertIn("diff --git a/old.c b/old.c", diff)
+        self.assertIn("--- a/old.c", diff)
+        self.assertIn("+++ /dev/null", diff)
+        self.assertIn("-int x;", diff)
+
+    def test_unified_diff_from_file_patches_renamed_uses_previous_filename(self) -> None:
+        diff = unified_diff_from_file_patches(
+            [
+                {
+                    "filename": "new_name.c",
+                    "previous_filename": "old_name.c",
+                    "status": "renamed",
+                    "additions": 1,
+                    "deletions": 1,
+                    "patch": "@@ -1,1 +1,1 @@\n-old\n+new\n",
+                }
+            ]
+        )
+        self.assertIn("diff --git a/old_name.c b/new_name.c", diff)
+        self.assertIn("--- a/old_name.c", diff)
+        self.assertIn("+++ b/new_name.c", diff)
+
+    def test_resolve_reviewable_diff_materializes_generator(self) -> None:
+        files = iter(
+            [
+                {
+                    "filename": "small.c",
+                    "status": "modified",
+                    "additions": 1,
+                    "deletions": 1,
+                    "patch": "@@ -1,1 +1,1 @@\n-old\n+new\n",
+                },
+                {
+                    "filename": "huge.c",
+                    "status": "modified",
+                    "additions": 4000,
+                    "deletions": 0,
+                },
+            ]
+        )
+        reconstructed, missing = resolve_reviewable_diff(
+            failed_complete_diff_placeholder("too large"),
+            files,
+        )
+        self.assertTrue(missing)
+        self.assertIn("new", reconstructed)
+        self.assertIn("small.c", reconstructed)
 
     def test_arch_docs_do_not_evict_diff(self) -> None:
         marker = "UNIQUE_DIFF_MARKER"
@@ -6481,6 +6639,43 @@ class GenerateReviewPipelineTests(unittest.TestCase):
         self.assertEqual(payload["event"], "COMMENT")
         self.assertEqual(payload.get("comments") or [], [])
         self.assertIn("did not perform a complete review", markdown)
+        self.assertNotEqual(mw.normalize_event(payload["event"], payload["body"]), "APPROVE")
+        self.assertNotIn("# APPROVE", markdown)
+
+    def test_generate_review_failed_diff_mixed_patches_cannot_approve(self) -> None:
+        files = [
+            {
+                "filename": "small.c",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 1,
+                "patch": "@@ -1,1 +1,1 @@\n-old small\n+new small\n",
+            },
+            {
+                "filename": "huge.c",
+                "status": "modified",
+                "additions": 4000,
+                "deletions": 0,
+            },
+        ]
+
+        def call_model(_provider, system, user, _model, _key, **_kwargs):
+            return _pipeline_model_response(
+                system,
+                user,
+                {"event": "APPROVE", "body": "# APPROVE\nLooks good.\n", "comments": []},
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._generate_args(tmp)
+            rc = self._run_generate_review(args, files, call_model)
+            markdown = Path(args.output).read_text(encoding="utf-8")
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(payload["event"], "COMMENT")
+        self.assertEqual(payload.get("comments") or [], [])
+        self.assertIn("did not perform a complete review", markdown)
+        self.assertIn("huge.c", markdown)
         self.assertNotEqual(mw.normalize_event(payload["event"], payload["body"]), "APPROVE")
         self.assertNotIn("# APPROVE", markdown)
 

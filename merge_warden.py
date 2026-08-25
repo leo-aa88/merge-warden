@@ -24,7 +24,7 @@ from context_pipeline import (
     build_review_corpus,
     failed_complete_diff_placeholder,
     format_char_count,
-    unified_diff_from_file_patches,
+    omitted_required_patch_paths,
 )
 from review_pipeline import (
     DEFAULT_MAP_CONCURRENCY,
@@ -1669,18 +1669,23 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
     if diff_result.returncode == 0:
         diff = diff_result.stdout
     else:
-        # Do not chunk the gh error string as reviewable source: that used to
-        # make coverage complete and APPROVE reachable without the PR changes.
-        reconstructed = unified_diff_from_file_patches(files)
-        if reconstructed:
+        # Keep the failed-complete placeholder. Reconstruction from file
+        # patches happens in corpus construction so a partial Files API
+        # fallback cannot hide omitted changed files and reach APPROVE.
+        omitted = omitted_required_patch_paths(files, collect_skipped_paths(files))
+        if omitted:
+            listed = ", ".join(omitted)
             print(
-                "::warning::gh pr diff failed; reviewing per-file patch "
-                "payloads from the Pulls Files API",
+                f"::warning::gh pr diff failed; per-file patches omit {listed}",
                 file=sys.stderr,
             )
-            diff = reconstructed
         else:
-            diff = failed_complete_diff_placeholder(diff_result.stderr)
+            print(
+                "::warning::gh pr diff failed; reconstructing from per-file "
+                "patch payloads",
+                file=sys.stderr,
+            )
+        diff = failed_complete_diff_placeholder(diff_result.stderr)
 
     corpus = build_corpus(
         repo=repo,
