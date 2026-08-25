@@ -6956,6 +6956,184 @@ class ProviderCircuitPipelineTests(unittest.TestCase):
         self.assertNotIn("# APPROVE", review["body"])
         self.assertFalse(stats.map_deadline_exhausted)
 
+    def _validation_paths_corpus(self, paths: list[str]) -> ReviewCorpus:
+        map_chunk = _chunk(
+            "diff:src/foo.c:1", "src/foo.c", "+int main(void);\n", kind="diff"
+        )
+        corpus = _synthetic_corpus(
+            [map_chunk],
+            index="Changed files:\n- src/foo.c +1 -0\n",
+        )
+        corpus.source_chunks = [
+            _chunk(f"file:{path}:1", path, f"/* {path} */\nint field;\n")
+            for path in paths
+        ]
+        return corpus
+
+    def _validation_path_from_prompt(self, user: str) -> str:
+        for chunk_id in _chunk_ids_in_prompt(user):
+            if chunk_id.startswith("file:"):
+                return chunk_id.split(":", 1)[1].rsplit(":", 1)[0]
+        raise AssertionError(f"no validation file chunk in prompt: {user[:200]!r}")
+
+    def test_validation_in_flight_success_is_ingested_after_circuit_opens(
+        self,
+    ) -> None:
+        """A validation success that was already running is not stamped incomplete.
+
+        Map already pins this invariant. Observing health only at sequential
+        ingest treats `_observe_provider_result() is True` as \"this task
+        failed,\" including an in-flight success after the breaker opened.
+        """
+        paths = [
+            "include/success.h",
+            "include/b.h",
+            "include/c.h",
+            "include/d.h",
+        ]
+        success_path = paths[0]
+        corpus = self._validation_paths_corpus(paths)
+        findings = [
+            {
+                "id": f"V{index}",
+                "severity": "MAJOR",
+                "path": "src/foo.c",
+                "side": "RIGHT",
+                "line": index,
+                "body": f"candidate for {path}",
+                "confidence": "LIKELY",
+                "evidence": [],
+            }
+            for index, path in enumerate(paths, start=1)
+        ]
+        needs = [
+            {
+                "path": path,
+                "reason": "cross-context check",
+                "finding_ids": [f"V{index}"],
+            }
+            for index, path in enumerate(paths, start=1)
+        ]
+        started = threading.Barrier(4, timeout=5)
+        release_success = threading.Event()
+        real_observe = rp.ProviderHealth.observe_capacity_failure
+        validation_paths: list[str] = []
+
+        def observe_and_release(self, *args, **kwargs):
+            opened = real_observe(self, *args, **kwargs)
+            if self.circuit_open:
+                release_success.set()
+            return opened
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=findings,
+                    needs_context=needs,
+                )
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps(
+                    {
+                        "keep": [item["id"] for item in findings],
+                        "reject": [],
+                        "merge": [],
+                    }
+                )
+            if stage == "validation":
+                path = self._validation_path_from_prompt(user)
+                validation_paths.append(path)
+                started.wait()
+                if path == success_path:
+                    if not release_success.wait(timeout=5):
+                        raise AssertionError("success path was not released")
+                    return _map_chunks_json(_chunk_ids_in_prompt(user))
+                raise self._capacity_error()
+            raise AssertionError("synthesis must not run against an open circuit")
+
+        with mock.patch.object(
+            rp.ProviderHealth, "observe_capacity_failure", observe_and_release
+        ):
+            review, _coverage, store, stats = _run_hierarchical(
+                corpus, fake, validation_concurrency=4
+            )
+        self.assertTrue(stats.provider_circuit_open)
+        self.assertEqual(stats.synthesis_calls, 0)
+        self.assertEqual(review["event"], "COMMENT")
+        success_finding = store.findings[_fid("V1")]
+        self.assertNotIn(
+            f"validation:incomplete:{success_path}",
+            success_finding.evidence,
+        )
+        self.assertNotIn(success_path, store.incomplete_context)
+        self.assertGreaterEqual(stats.validation_chunks_acknowledged, 1)
+        failed_paths = [path for path in paths if path != success_path]
+        self.assertTrue(
+            any(path in store.incomplete_context for path in failed_paths)
+        )
+        _assert_unsynthesized_fallback(self, review)
+
+    def test_validation_does_not_dispatch_after_landed_503s_open_circuit(
+        self,
+    ) -> None:
+        """A free validation worker must not take another path after 503s land."""
+        paths = [f"include/p{index}.h" for index in range(1, 6)]
+        corpus = self._validation_paths_corpus(paths)
+        findings = [
+            {
+                "id": f"V{index}",
+                "severity": "MAJOR",
+                "path": "src/foo.c",
+                "side": "RIGHT",
+                "line": index,
+                "body": f"candidate for {path}",
+                "confidence": "LIKELY",
+                "evidence": [],
+            }
+            for index, path in enumerate(paths, start=1)
+        ]
+        needs = [
+            {
+                "path": path,
+                "reason": "cross-context check",
+                "finding_ids": [f"V{index}"],
+            }
+            for index, path in enumerate(paths, start=1)
+        ]
+        validation_paths: list[str] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                return _map_chunks_json(
+                    _chunk_ids_in_prompt(user),
+                    findings=findings,
+                    needs_context=needs,
+                )
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps(
+                    {
+                        "keep": [item["id"] for item in findings],
+                        "reject": [],
+                        "merge": [],
+                    }
+                )
+            if stage == "validation":
+                validation_paths.append(self._validation_path_from_prompt(user))
+                raise self._capacity_error()
+            raise AssertionError("synthesis must not run against an open circuit")
+
+        review, _coverage, _store, stats = _run_hierarchical(
+            corpus, fake, validation_concurrency=4
+        )
+        self.assertTrue(stats.provider_circuit_open)
+        self.assertEqual(len(validation_paths), 4)
+        self.assertEqual(stats.validation_attempts, 4)
+        self.assertGreater(stats.provider_circuit_prevented_calls, 0)
+        self.assertEqual(stats.synthesis_calls, 0)
+        self.assertEqual(review["event"], "COMMENT")
+
 
 class PermanentProviderErrorTests(unittest.TestCase):
     """Issue #72: permanent provider/config errors must not retry or split."""

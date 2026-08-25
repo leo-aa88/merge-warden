@@ -243,9 +243,11 @@ class ProviderRequestError(RuntimeError):
 class ProviderHealth:
     """Provider+model health for one review run. Scheduler thread only.
 
-    Workers must not mutate this object. The map (and later stage) schedulers
-    record capacity failures as results are ingested, so concurrent 503s are
-    counted in a deterministic order rather than in completion order.
+    Workers must not mutate this object. Concurrent stages record capacity
+    failures as soon as a worker future lands, before sequential ingest, so
+    a free slot cannot dispatch more work after a 503 already exists.
+    An already-open circuit stays open after in-flight successes; those
+    successes are still ingested and are not treated as failures.
     """
 
     provider: str = ""
@@ -1011,6 +1013,10 @@ def _observe_provider_result(
     Non-capacity errors (latency, transport, malformed JSON) do not affect
     provider health. ``health`` may be None when a stage is invoked from a
     unit test that does not share run-level state.
+
+    A True return means the breaker is open, including after a success that
+    landed once it was already open. Callers must not treat that as "this
+    result failed."
     """
     if health is None:
         return False
@@ -3707,6 +3713,38 @@ def run_validation_pass(
             return
         finalize_task(task)
 
+    def apply_health_from_worker(result: ValidationWorkerResult) -> None:
+        """Update provider health as soon as a future lands on this thread.
+
+        Same policy as map: concurrent 503s are counted here, before
+        sequential ingest, so a free worker cannot take another path after
+        the breaker should already be open.
+        """
+        nonlocal stop_validation
+        if provider_health is None:
+            return
+        if isinstance(
+            result.error, (PipelineDeadlineExceeded, StageDeadlineExceeded)
+        ):
+            return
+        if _is_permanent_provider_error(result.error):
+            return
+        was_open = provider_health.circuit_open
+        _observe_provider_result(
+            provider_health,
+            stats,
+            logical_id=f"validation:{result.item.path}",
+            error=result.error,
+            remaining_stage_seconds=remaining_stage_seconds(deadline),
+            succeeded=result.error is None,
+        )
+        if not provider_health.circuit_open:
+            return
+        stop_validation = True
+        if not was_open:
+            provider_health.note_prevented(len(pending))
+        abandon_pending()
+
     executor = ThreadPoolExecutor(
         max_workers=concurrency,
         thread_name_prefix="mw-val",
@@ -3778,22 +3816,22 @@ def run_validation_pass(
                     f"{result.elapsed_seconds:.1f}s",
                     flush=True,
                 )
-                if _observe_provider_result(
-                    provider_health,
-                    stats,
-                    logical_id=f"validation:{result.item.path}",
-                    error=result.error,
-                    remaining_stage_seconds=remaining_stage_seconds(deadline),
-                    succeeded=result.error is None and bool(seen or result.raw),
-                ):
-                    stop_validation = True
-                    defer_task(task)
-                    provider_health.note_prevented(len(pending))
-                    abandon_pending()
-                    continue
                 fresh = seen - task.acknowledged_ids
                 task.acknowledged_ids.update(seen)
                 stats.validation_chunks_acknowledged += len(fresh)
+                circuit_open = (
+                    provider_health is not None and provider_health.circuit_open
+                )
+                if circuit_open or stop_validation:
+                    # In-flight successes still count. Do not stamp
+                    # validation:incomplete on a path that just acknowledged
+                    # chunks. Remaining work cannot start another provider call.
+                    if result.error is not None or not seen:
+                        defer_task(task)
+                    elif task.pending_batches or _validation_remaining(task):
+                        finalize_task(task)
+                    abandon_pending()
+                    continue
                 adopt_new_needs()
                 requeue_or_finish(task)
 
@@ -3817,6 +3855,7 @@ def run_validation_pass(
                 )
                 in_flight.pop(sequence)
                 completed[sequence] = future.result()
+                apply_health_from_worker(completed[sequence])
                 error = completed[sequence].error
                 if isinstance(
                     error, (PipelineDeadlineExceeded, StageDeadlineExceeded)
