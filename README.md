@@ -269,8 +269,10 @@ calls and the pipeline continues. Remaining cross-context checks are marked
 identity (backticks and leading `./` stripped). Aliases of the same file
 share one validation slot and one marker. Remaining reduce groups are kept.
 Incomplete validation is acceptable; a review with no synthesis is not. A
-surviving `validation:incomplete:` marker makes `APPROVE` unreachable, using
-the same event normalizer as posting, even when primary coverage is complete. If
+recorded incomplete validation (including after the dependent finding is
+rejected) makes `APPROVE` unreachable, using the same event normalizer as
+posting, even when primary coverage is complete. Empty `incomplete_context`
+and no `validation:incomplete:` markers still allow `APPROVE`. If
 synthesis itself hits the provider cutoff, or returns a body that is not a
 JSON object, the pipeline fail-closes to
 `COMMENT` with **no inline comments**. If map-stage exhaustion leaves primary

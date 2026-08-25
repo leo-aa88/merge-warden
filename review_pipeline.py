@@ -2291,12 +2291,21 @@ def _mark_incomplete_validation(
 
 
 def _has_incomplete_validation(store: EvidenceStore) -> bool:
-    kept_ids = {finding.id for finding in store.kept_findings()}
-    if any(ids & kept_ids for ids in store.incomplete_context.values()):
+    """True while any requested validation context was never actually validated.
+
+    A failed validation remains binding on the review decision until that
+    context is actually validated. Rejecting the dependent finding must not
+    clear the fail-closed APPROVE guard. ``incomplete_context`` already has
+    the data; the guard consults it even when those member IDs are no longer
+    kept. ``validation:incomplete:`` evidence on any finding (kept or
+    rejected) is also binding, so a marker that exists only on a rejected
+    finding cannot vanish either.
+    """
+    if any(store.incomplete_context.values()):
         return True
     return any(
         item.startswith("validation:incomplete:")
-        for finding in store.kept_findings()
+        for finding in store.findings.values()
         for item in finding.evidence
     )
 
@@ -2327,12 +2336,18 @@ def normalize_event(event: str, body: str) -> str:
 def apply_incomplete_validation_guard(
     event: str, body: str, store: EvidenceStore
 ) -> tuple[str, str]:
-    """Make APPROVE unreachable while a kept finding has incomplete validation."""
+    """Make APPROVE unreachable while requested context was not validated.
+
+    A failed validation remains binding on the review decision until that
+    context is actually validated. Rejecting the dependent finding does not
+    clear this guard. Uses ``normalize_event`` so aliases (``lgtm``,
+    ``APPROVED``, ...) cannot sneak APPROVE through.
+    """
     if normalize_event(event, body) == "APPROVE" and _has_incomplete_validation(store):
         return "COMMENT", (
             "# COMMENT\n\n"
-            "Merge Warden could not validate all requested context for surviving "
-            "candidate findings, so it will not approve this pull request.\n\n"
+            "Merge Warden could not validate all requested context, so it will "
+            "not approve this pull request.\n\n"
             + body.lstrip()
         )
     return event, body
