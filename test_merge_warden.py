@@ -731,6 +731,120 @@ class PostReviewTests(unittest.TestCase):
         )
 
 
+def _comment(comment_id: int, login: str, body: str) -> dict:
+    return {"id": comment_id, "user": {"login": login}, "body": body}
+
+
+class DeletePreviousCommentsTests(unittest.TestCase):
+    """Cleanup identity is the HTML marker, not github-actions[bot]."""
+
+    def _deleted_paths(
+        self,
+        review_comments: list[dict],
+        issue_comments: list[dict],
+    ) -> list[str]:
+        deleted: list[str] = []
+
+        def fake_paginate(path: str) -> list[dict]:
+            if path == "repos/o/r/pulls/9/comments":
+                return review_comments
+            if path == "repos/o/r/issues/9/comments":
+                return issue_comments
+            self.fail(f"unexpected paginate path: {path}")
+            return []
+
+        def fake_run(args: list[str], *, check: bool = True, input_text: str | None = None):
+            self.assertEqual(args[:4], ["gh", "api", "--method", "DELETE"])
+            deleted.append(args[4])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(mw, "gh_api_paginate_items", side_effect=fake_paginate):
+            with mock.patch.object(mw, "run", side_effect=fake_run):
+                mw.delete_previous_comments("o/r", "9")
+        return deleted
+
+    def test_deletes_marked_review_comment_from_pat_user(self) -> None:
+        deleted = self._deleted_paths(
+            [_comment(11, "alice", f"{mw.MARKER}\nPAT inline")],
+            [],
+        )
+        self.assertEqual(deleted, ["repos/o/r/pulls/comments/11"])
+
+    def test_deletes_marked_review_comment_from_github_app(self) -> None:
+        deleted = self._deleted_paths(
+            [_comment(12, "my-app[bot]", f"{mw.MARKER}\napp inline")],
+            [],
+        )
+        self.assertEqual(deleted, ["repos/o/r/pulls/comments/12"])
+
+    def test_deletes_marked_review_comment_from_github_actions_bot(self) -> None:
+        deleted = self._deleted_paths(
+            [_comment(13, "github-actions[bot]", f"{mw.MARKER}\nbot inline")],
+            [],
+        )
+        self.assertEqual(deleted, ["repos/o/r/pulls/comments/13"])
+
+    def test_keeps_review_comment_without_marker(self) -> None:
+        deleted = self._deleted_paths(
+            [
+                _comment(14, "alice", "human review without marker"),
+                _comment(15, "github-actions[bot]", "bot comment without marker"),
+                _comment(16, "my-app[bot]", "app comment without marker"),
+            ],
+            [],
+        )
+        self.assertEqual(deleted, [])
+
+    def test_deletes_marked_issue_comment_from_pat_and_app(self) -> None:
+        deleted = self._deleted_paths(
+            [],
+            [
+                _comment(21, "alice", f"{mw.MARKER}\nPAT conversation"),
+                _comment(22, "my-app[bot]", f"{mw.MARKER}\napp conversation"),
+            ],
+        )
+        self.assertEqual(
+            deleted,
+            [
+                "repos/o/r/issues/comments/21",
+                "repos/o/r/issues/comments/22",
+            ],
+        )
+
+    def test_keeps_issue_comment_without_marker(self) -> None:
+        deleted = self._deleted_paths(
+            [],
+            [
+                _comment(23, "alice", "ordinary conversation"),
+                _comment(24, "github-actions[bot]", "bot conversation without marker"),
+            ],
+        )
+        self.assertEqual(deleted, [])
+
+    def test_mixed_comments_delete_only_those_with_marker(self) -> None:
+        deleted = self._deleted_paths(
+            [
+                _comment(11, "alice", f"{mw.MARKER}\nPAT inline"),
+                _comment(12, "my-app[bot]", f"{mw.MARKER}\napp inline"),
+                _comment(13, "github-actions[bot]", f"{mw.MARKER}\nbot inline"),
+                _comment(14, "bob", "unrelated inline"),
+            ],
+            [
+                _comment(21, "alice", f"{mw.MARKER}\nPAT conversation"),
+                _comment(22, "carol", "unrelated conversation"),
+            ],
+        )
+        self.assertEqual(
+            deleted,
+            [
+                "repos/o/r/pulls/comments/11",
+                "repos/o/r/pulls/comments/12",
+                "repos/o/r/pulls/comments/13",
+                "repos/o/r/issues/comments/21",
+            ],
+        )
+
+
 class GitHubErrorFormattingTests(unittest.TestCase):
     def test_github_422_json_is_preserved(self) -> None:
         detail = mw.format_api_error_body(

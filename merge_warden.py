@@ -124,7 +124,6 @@ USER_MESSAGE_SUFFIX = (
     "evidence store. Do not silently ignore uncovered context: if the coverage "
     "report says the review is incomplete, you must not APPROVE."
 )
-BOT_LOGINS = {"github-actions[bot]"}
 DEFAULT_PROMPT = Path(__file__).resolve().parent / "prompt.md"
 DEFAULT_ARCH_CANDIDATES = (
     "AGENTS.md",
@@ -1313,11 +1312,12 @@ def review_summary_body(review: dict) -> str:
 
 
 def delete_previous_comments(repo: str, pr_number: str) -> None:
+    # Identity is the HTML marker, not the posting actor. github.token reviews
+    # are github-actions[bot]; PAT and GitHub App tokens are the user / app bot.
     review_comments = gh_api_paginate_items(f"repos/{repo}/pulls/{pr_number}/comments")
     for comment in review_comments:
         body = comment.get("body") or ""
-        login = ((comment.get("user") or {}).get("login") or "")
-        if MARKER in body and login in BOT_LOGINS:
+        if MARKER in body:
             run(
                 ["gh", "api", "--method", "DELETE", f"repos/{repo}/pulls/comments/{comment['id']}"],
                 check=False,
@@ -1326,8 +1326,7 @@ def delete_previous_comments(repo: str, pr_number: str) -> None:
     issue_comments = gh_api_paginate_items(f"repos/{repo}/issues/{pr_number}/comments")
     for comment in issue_comments:
         body = comment.get("body") or ""
-        login = ((comment.get("user") or {}).get("login") or "")
-        if MARKER in body and login in BOT_LOGINS:
+        if MARKER in body:
             run(
                 [
                     "gh",
