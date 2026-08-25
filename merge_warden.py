@@ -42,6 +42,7 @@ from review_pipeline import (
     PipelineDeadlineExceeded,
     StageDeadlineExceeded,
     apply_incomplete_validation_guard,
+    canonical_severity,
     finding_record,
     map_stage_deadline,
     normalize_event,
@@ -1170,12 +1171,7 @@ SEVERITY_LABEL = {
 
 
 def normalize_severity(value: str) -> str:
-    raw = (value or "").strip().lower()
-    if raw in {"blocking", "blocker"}:
-        return "blocking"
-    if raw == "major":
-        return "major"
-    return "minor"
+    return canonical_severity(value).lower()
 
 
 def wrap_review_body(markdown: str) -> str:

@@ -299,6 +299,19 @@ class InlineCommentLocationTests(unittest.TestCase):
         self.assertNotIn("subject_type", comments[0])
 
 
+class SeverityNormalizationTests(unittest.TestCase):
+    def test_blocker_alias_still_posts_as_blocking(self) -> None:
+        self.assertEqual(mw.normalize_severity("blocker"), "blocking")
+        self.assertEqual(mw.normalize_severity("BLOCKER"), "blocking")
+        self.assertIn("**BLOCKING.**", mw.format_inline_body("blocker", "leak"))
+        self.assertIn("**BLOCKING.**", mw.format_inline_body("BLOCKER", "leak"))
+
+    def test_unknown_labels_stay_minor_not_below_it(self) -> None:
+        self.assertEqual(mw.normalize_severity("CRITICAL"), "minor")
+        self.assertEqual(mw.normalize_severity("suggestion"), "minor")
+        self.assertIn("**MINOR.**", mw.format_inline_body("CRITICAL", "nit"))
+
+
 class IncompletePipelinePostingTests(unittest.TestCase):
     PR = {
         "number": 1,

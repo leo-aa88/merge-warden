@@ -189,9 +189,11 @@ request more context, then hierarchically reduces finding IDs again
 review. Independent map batches run concurrently (default 4 in-flight
 provider calls) so provider latency overlaps. After pre-reduce, remaining
 cross-context validation is ordered by finding severity (BLOCKING, then
-MAJOR, then MINOR) and merge-decision impact, then independent paths run
-with a separate, more conservative worker pool (default 2 in-flight,
-max 4). Evidence ingestion stays single-threaded and deterministic.
+MAJOR, then MINOR) and merge-decision impact. Mapper aliases such as
+`BLOCKER` canonicalize to `BLOCKING` before ranking and merge joins;
+unknown labels collapse to MINOR so they cannot rank below it. Independent
+paths then run with a separate, more conservative worker pool (default 2
+in-flight, max 4). Evidence ingestion stays single-threaded and deterministic.
 Failed map batches split into smaller requests instead of abandoning sibling
 chunks; a global cap of 32 logical map attempts still fail-closes the review.
 Initial map batches are balanced by chunk size (largest-first bin packing with

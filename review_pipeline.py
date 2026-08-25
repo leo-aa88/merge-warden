@@ -98,6 +98,29 @@ SEVERITY_ORDER = {
     "MAJOR": 1,
     "BLOCKING": 2,
 }
+
+
+def canonical_severity(value: object) -> str:
+    """Map a mapper/posting label onto BLOCKING | MAJOR | MINOR.
+
+    BLOCKER is posting's alias of BLOCKING. Unknown labels (CRITICAL, HIGH,
+    garbage) collapse to MINOR so they cannot rank below MINOR in validation
+    scheduling or merge joins. That is not escalation: a real MINOR stays
+    MINOR, and unknown is never promoted to BLOCKING.
+    """
+    raw = str(value or "").strip().upper()
+    if raw in {"BLOCKING", "BLOCKER"}:
+        return "BLOCKING"
+    if raw == "MAJOR":
+        return "MAJOR"
+    return "MINOR"
+
+
+def severity_rank(value: object) -> int:
+    """Rank used by ingest, merge joins, and validation scheduling."""
+    return SEVERITY_ORDER[canonical_severity(value)]
+
+
 # Strongest label among members (CONFIRMED > LIKELY > QUESTION). Uncertainty
 # is preserved separately: every evidence item, including
 # validation:incomplete:<path>, is unioned onto the representative. Canonical
@@ -222,9 +245,9 @@ class EvidenceStore:
 def join_severity(findings: list[Finding]) -> str:
     """Strongest severity among ``findings`` (BLOCKING > MAJOR > MINOR)."""
     return max(
-        findings,
-        key=lambda finding: SEVERITY_ORDER.get(finding.severity, -1),
-    ).severity
+        (canonical_severity(finding.severity) for finding in findings),
+        key=severity_rank,
+    )
 
 
 def join_confidence(findings: list[Finding]) -> str:
@@ -1052,7 +1075,7 @@ def _parse_finding(
             evidence.append(text)
     return Finding(
         id=finding_id,
-        severity=str(raw.get("severity") or "MINOR").upper(),
+        severity=canonical_severity(raw.get("severity")),
         path=str(raw.get("path") or "").strip(),
         side=side,
         line=line,
@@ -1765,7 +1788,7 @@ def validation_path_sort_key(
     """
     if not related:
         return (1, 1, original_index)
-    severity = max(SEVERITY_ORDER.get(finding.severity, -1) for finding in related)
+    severity = max(severity_rank(finding.severity) for finding in related)
     impact = max(
         VALIDATION_IMPACT_ORDER.get(finding.confidence, -1) for finding in related
     )
