@@ -2256,8 +2256,11 @@ def _mark_incomplete_validation(
     related: list[Finding],
     path: str,
 ) -> None:
-    marker = f"validation:incomplete:{path}"
-    failed = store.incomplete_context.setdefault(path, set())
+    key = _context_path_key(path)
+    if not key:
+        return
+    marker = f"validation:incomplete:{key}"
+    failed = store.incomplete_context.setdefault(key, set())
     for finding in related:
         failed.add(finding.id)
         if marker not in finding.evidence:
@@ -2321,6 +2324,12 @@ def _format_id_list(ids: set[str], *, limit: int = MISSING_VALIDATION_ID_NOTE_LI
 
 
 def _context_path_key(path: str) -> str:
+    """File identity for load, validation scheduling, and incompleteness.
+
+    Strips surrounding backticks and repeated leading ``./`` only. Does not
+    resolve ``..``, basename, or case-fold, so ``foo.h`` stays distinct from
+    ``vendor/lib/foo.h`` and ``.gitignore`` stays ``.gitignore``.
+    """
     clean = (path or "").strip().strip("`")
     while clean.startswith("./"):
         clean = clean[2:]
@@ -2360,12 +2369,38 @@ def _load_source_chunks(
     return []
 
 
+def _unscheduled_validation_needs(
+    store: EvidenceStore,
+    scheduled_paths: set[str],
+) -> list[tuple[int, str]]:
+    """Return (needs_context index, canonical path) for paths not yet scheduled.
+
+    Path identity is ``_context_path_key``: backticks and repeated leading
+    ``./`` only. The first spelling of a file claims the slot; later aliases
+    are skipped. ``scheduled_paths`` is updated in place so the initial plan
+    and late-adopted needs share one set.
+    """
+    claimed: list[tuple[int, str]] = []
+    for original_index, need in enumerate(store.needs_context):
+        key = _context_path_key(need.path)
+        if not key or key in scheduled_paths:
+            continue
+        scheduled_paths.add(key)
+        claimed.append((original_index, key))
+    return claimed
+
+
 def _validation_task_for_path(
     store: EvidenceStore,
     path: str,
     original_index: int,
 ) -> ValidationTask | None:
-    related_needs = [item for item in store.needs_context if item.path == path]
+    key = _context_path_key(path)
+    if not key:
+        return None
+    related_needs = [
+        item for item in store.needs_context if _context_path_key(item.path) == key
+    ]
     related = findings_for_context_need(store, related_needs)
     if not related and all(item.finding_ids for item in related_needs):
         # Rejected or superseded findings must not generate validation work.
@@ -2376,7 +2411,7 @@ def _validation_task_for_path(
     # remains a candidate. Demote pending CONFIRMED on copies only.
     rank_views = aggregated_related_findings(store, related)
     return ValidationTask(
-        path=path,
+        path=key,
         related_needs=related_needs,
         related=related,
         related_for_prompt=validation_prompt_findings(
@@ -2395,14 +2430,11 @@ def plan_validation_tasks(store: EvidenceStore) -> list[ValidationTask]:
     raw canonical record. Within a severity, LIKELY findings outrank
     QUESTION, which outrank CONFIRMED. Paths with equal rank keep their
     original ``needs_context`` order so tests and retries stay deterministic.
+    Aliases of one file (``foo.h``, ``./foo.h``, `` `foo.h` ``) share one task.
     """
     tasks: list[ValidationTask] = []
     seen_paths: set[str] = set()
-    for original_index, need in enumerate(store.needs_context):
-        path = need.path
-        if not path or path in seen_paths:
-            continue
-        seen_paths.add(path)
+    for original_index, path in _unscheduled_validation_needs(store, seen_paths):
         task = _validation_task_for_path(store, path, original_index)
         if task is None:
             continue
@@ -2655,13 +2687,12 @@ def run_validation_pass(
 
         ``ingest_map_result`` may append to ``store.needs_context``. Dropping
         those paths would skip cross-context work the old sequential loop
-        still visited. New tasks keep the same severity ordering.
+        still visited. New tasks keep the same severity ordering. Aliases of
+        an already-scheduled file do not consume another validation slot.
         """
-        for original_index, need in enumerate(store.needs_context):
-            path = need.path
-            if not path or path in scheduled_paths:
-                continue
-            scheduled_paths.add(path)
+        for original_index, path in _unscheduled_validation_needs(
+            store, scheduled_paths
+        ):
             task = _validation_task_for_path(store, path, original_index)
             if task is None:
                 continue
