@@ -1490,23 +1490,85 @@ def review_summary_body(review: dict, overflow: list[dict] | None = None) -> str
     return wrap_review_body(text)
 
 
-def collect_previous_comment_ids(repo: str, pr_number: str) -> list[str]:
-    """Snapshot GitHub API paths of marked pull-review and issue comments.
+def authenticated_github_login() -> str | None:
+    """Return the GitHub login that owns reviews posted with the current token.
 
-    Identity is the HTML marker, not the posting actor. github.token reviews
-    are github-actions[bot]; PAT and GitHub App tokens are the user / app bot.
+    Lookup order:
+    1. GET /user — PAT / user tokens expose a non-empty ``login``.
+    2. GET /installation — GitHub App installation tokens expose ``app_slug``;
+       reviews post as ``{app_slug}[bot]``.
+    3. If both lookups fail and ``GITHUB_ACTIONS`` is set, ``github-actions[bot]``.
+       Default ``github.token`` in Actions typically 403s ``/user`` and has no
+       installation document; that fallback resolves the Actions token identity,
+       it is not an author allowlist. ``GITHUB_ACTOR`` is the triggering user
+       and must not be used.
+
+    Returns None when identity cannot be established. Callers must skip
+    previous-comment deletion rather than fall back to marker-only matching.
     """
+    try:
+        data = gh_api("GET", "user")
+        if isinstance(data, dict):
+            login = str(data.get("login") or "").strip()
+            if login:
+                return login
+    except CommandError:
+        pass
+
+    try:
+        data = gh_api("GET", "installation")
+        if isinstance(data, dict):
+            slug = str(data.get("app_slug") or "").strip()
+            if slug:
+                return f"{slug}[bot]"
+    except CommandError:
+        pass
+
+    if parse_bool(os.environ.get("GITHUB_ACTIONS"), default=False):
+        return "github-actions[bot]"
+    return None
+
+
+def is_owned_merge_warden_comment(comment: dict, posting_login: str | None) -> bool:
+    """True only when the comment is Merge Warden output from posting_login.
+
+    The HTML marker is necessary, not sufficient. A pasted marker on a human
+    or foreign-bot comment does not transfer ownership.
+    """
+    if not str(posting_login or "").strip():
+        return False
+    body = str(comment.get("body") or "")
+    if MARKER not in body:
+        return False
+    user = comment.get("user")
+    if not isinstance(user, dict):
+        return False
+    return str(user.get("login") or "") == str(posting_login).strip()
+
+
+def collect_previous_comment_ids(
+    repo: str,
+    pr_number: str,
+    posting_login: str | None,
+) -> list[str]:
+    """Snapshot GitHub API paths of comments owned by this posting identity.
+
+    Ownership is ``MARKER in body`` AND ``comment.user.login == posting_login``.
+    Missing posting identity yields an empty snapshot so nothing is deleted.
+    """
+    posting_login = str(posting_login or "").strip()
+    if not posting_login:
+        return []
+
     paths: list[str] = []
     review_comments = gh_api_paginate_items(f"repos/{repo}/pulls/{pr_number}/comments")
     for comment in review_comments:
-        body = comment.get("body") or ""
-        if MARKER in body:
+        if is_owned_merge_warden_comment(comment, posting_login):
             paths.append(f"repos/{repo}/pulls/comments/{comment['id']}")
 
     issue_comments = gh_api_paginate_items(f"repos/{repo}/issues/{pr_number}/comments")
     for comment in issue_comments:
-        body = comment.get("body") or ""
-        if MARKER in body:
+        if is_owned_merge_warden_comment(comment, posting_login):
             paths.append(f"repos/{repo}/issues/comments/{comment['id']}")
     return paths
 
@@ -1517,7 +1579,17 @@ def delete_previous_comment_ids(paths: list[str]) -> None:
 
 
 def delete_previous_comments(repo: str, pr_number: str) -> None:
-    delete_previous_comment_ids(collect_previous_comment_ids(repo, pr_number))
+    posting_login = authenticated_github_login()
+    if not posting_login:
+        print(
+            "Could not resolve the GitHub identity that posts Merge Warden reviews; "
+            "leaving previous comments in place",
+            file=sys.stderr,
+        )
+        return
+    delete_previous_comment_ids(
+        collect_previous_comment_ids(repo, pr_number, posting_login)
+    )
 
 
 def post_review(repo: str, pr_number: str, payload: dict) -> tuple[str, list[dict]]:
@@ -1528,9 +1600,18 @@ def post_review(repo: str, pr_number: str, payload: dict) -> tuple[str, list[dic
         raise RuntimeError("Review payload is missing commit_id")
     event = normalize_event(str(payload.get("event") or "COMMENT"), body)
 
+    # Identity before snapshot. Marker-only matching would delete a pasted
+    # marker on someone else's comment. Unknown identity → empty snapshot.
+    posting_login = authenticated_github_login()
+    if not posting_login:
+        print(
+            "Could not resolve the GitHub identity that posts Merge Warden reviews; "
+            "leaving previous comments in place",
+            file=sys.stderr,
+        )
     # Snapshot before POST. New review comments also contain MARKER; deleting
     # by a post-success re-list would remove the review we just posted.
-    previous_ids = collect_previous_comment_ids(repo, pr_number)
+    previous_ids = collect_previous_comment_ids(repo, pr_number, posting_login)
 
     events_to_try = [event]
     if event != "COMMENT":

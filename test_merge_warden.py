@@ -10,6 +10,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 import urllib.error
@@ -1356,6 +1357,8 @@ class PostReviewTests(unittest.TestCase):
         comments = [{"path": "parser.c", "line": 10, "body": "n"}]
 
         def fake_gh_api(method: str, path: str, payload: dict | None = None, paginate: bool = False):
+            if path == "user":
+                return {"login": "github-actions[bot]"}
             if payload and payload.get("event") == "APPROVE":
                 raise mw.CommandError("Cannot approve this pull request")
             return {"id": 1}
@@ -1383,6 +1386,8 @@ class PostReviewTests(unittest.TestCase):
         ]
 
         def fake_gh_api(method: str, path: str, payload: dict | None = None, paginate: bool = False):
+            if path == "user":
+                return {"login": "github-actions[bot]"}
             if payload and len(payload.get("comments") or []) > 1:
                 raise mw.CommandError("Unprocessable comment")
             return {"id": 1}
@@ -1413,6 +1418,8 @@ class PostReviewTests(unittest.TestCase):
         calls: list[dict] = []
 
         def fake_gh_api(method: str, path: str, payload: dict | None = None, paginate: bool = False):
+            if path == "user":
+                return {"login": "github-actions[bot]"}
             if payload is not None:
                 calls.append(
                     {
@@ -1461,8 +1468,17 @@ class PostReviewTests(unittest.TestCase):
         *,
         repo: str = "o/r",
         pr_number: str = "1",
+        user: object = None,
+        installation: object = None,
     ):
-        """Record LIST/POST/DELETE order. Mutating the comment lists simulates GitHub."""
+        """Record LIST/POST/DELETE order. Mutating the comment lists simulates GitHub.
+
+        `user` / `installation` are GET user and GET installation responses.
+        Pass a BaseException instance to make that lookup fail. Default GET user
+        returns github-actions[bot] so transactional tests have a posting identity.
+        """
+        if user is None and installation is None:
+            user = {"login": "github-actions[bot]"}
 
         def fake_paginate(path: str) -> list[dict]:
             ops.append(("LIST", path))
@@ -1479,6 +1495,12 @@ class PostReviewTests(unittest.TestCase):
             payload: dict | None = None,
             paginate: bool = False,
         ):
+            if path in {"user", "installation"}:
+                ops.append(("IDENTITY", path))
+                response = user if path == "user" else installation
+                if isinstance(response, BaseException):
+                    raise response
+                return response
             ops.append(("POST", path, (payload or {}).get("event")))
             return gh_api_impl(method, path, payload)
 
@@ -1500,8 +1522,12 @@ class PostReviewTests(unittest.TestCase):
 
     def test_failed_post_does_not_delete_previous_comments(self) -> None:
         ops: list[tuple] = []
-        review_comments = [_comment(11, "alice", f"{mw.MARKER}\nold blocking inline")]
-        issue_comments = [_comment(21, "alice", f"{mw.MARKER}\nold conversation")]
+        review_comments = [
+            _comment(11, "github-actions[bot]", f"{mw.MARKER}\nold blocking inline")
+        ]
+        issue_comments = [
+            _comment(21, "github-actions[bot]", f"{mw.MARKER}\nold conversation")
+        ]
 
         def fail_every_post(method: str, path: str, payload: dict | None) -> dict:
             raise mw.CommandError("422 Unprocessable Entity")
@@ -1531,10 +1557,14 @@ class PostReviewTests(unittest.TestCase):
     def test_successful_post_deletes_only_snapshotted_ids_after_post(self) -> None:
         ops: list[tuple] = []
         review_comments = [
-            _comment(11, "alice", f"{mw.MARKER}\nold inline"),
-            _comment(14, "bob", "human inline without marker"),
+            _comment(11, "github-actions[bot]", f"{mw.MARKER}\nold inline"),
+            _comment(12, "alice", f"{mw.MARKER}\nforeign marked inline"),
+            _comment(14, "github-actions[bot]", "same-author unmarked inline"),
         ]
-        issue_comments = [_comment(21, "alice", f"{mw.MARKER}\nold conversation")]
+        issue_comments = [
+            _comment(21, "github-actions[bot]", f"{mw.MARKER}\nold conversation"),
+            _comment(22, "alice", f"{mw.MARKER}\nforeign marked conversation"),
+        ]
         new_inline = _comment(99, "github-actions[bot]", f"{mw.MARKER}\njust posted")
 
         def succeed_and_materialize_new(
@@ -1562,6 +1592,7 @@ class PostReviewTests(unittest.TestCase):
         self.assertEqual(event, "COMMENT")
         self.assertEqual(len(posted), 1)
         kinds = [op[0] for op in ops]
+        self.assertLess(kinds.index("IDENTITY"), kinds.index("LIST"))
         self.assertLess(kinds.index("LIST"), kinds.index("POST"))
         self.assertLess(kinds.index("POST"), kinds.index("DELETE"))
         deleted = [op[1] for op in ops if op[0] == "DELETE"]
@@ -1572,12 +1603,17 @@ class PostReviewTests(unittest.TestCase):
                 "repos/o/r/issues/comments/21",
             ],
         )
-        self.assertNotIn("repos/o/r/pulls/comments/99", deleted)
+        self.assertNotIn("repos/o/r/pulls/comments/12", deleted)
         self.assertNotIn("repos/o/r/pulls/comments/14", deleted)
+        self.assertNotIn("repos/o/r/issues/comments/22", deleted)
+        self.assertNotIn("repos/o/r/pulls/comments/99", deleted)
 
     def test_approve_fallback_deletes_previous_comments_after_comment_post(self) -> None:
         ops: list[tuple] = []
-        review_comments = [_comment(11, "alice", f"{mw.MARKER}\nold inline")]
+        review_comments = [
+            _comment(11, "github-actions[bot]", f"{mw.MARKER}\nold inline"),
+            _comment(12, "alice", f"{mw.MARKER}\nforeign marked"),
+        ]
         issue_comments: list[dict] = []
 
         def approve_then_comment(method: str, path: str, payload: dict | None) -> dict:
@@ -1613,6 +1649,88 @@ class PostReviewTests(unittest.TestCase):
             [op[1] for op in ops if op[0] == "DELETE"],
             ["repos/o/r/pulls/comments/11"],
         )
+        self.assertNotIn("repos/o/r/pulls/comments/12", [op[1] for op in ops if op[0] == "DELETE"])
+
+    def test_identity_lookup_failure_posts_without_deleting(self) -> None:
+        ops: list[tuple] = []
+        review_comments = [
+            _comment(11, "github-actions[bot]", f"{mw.MARKER}\nold inline"),
+            _comment(12, "alice", f"{mw.MARKER}\nforeign marked"),
+        ]
+        issue_comments = [_comment(21, "alice", f"{mw.MARKER}\nold conversation")]
+
+        def succeed_post(method: str, path: str, payload: dict | None) -> dict:
+            return {"id": 1}
+
+        api, paginate, run = self._record_github_ops(
+            ops,
+            review_comments,
+            issue_comments,
+            succeed_post,
+            user=mw.CommandError("GET /user 403"),
+            installation=mw.CommandError("GET /installation 404"),
+        )
+        stderr = io.StringIO()
+        env = {k: v for k, v in os.environ.items() if k != "GITHUB_ACTIONS"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(sys, "stderr", stderr):
+                with api, paginate, run:
+                    event, posted = mw.post_review(
+                        "o/r",
+                        "1",
+                        {
+                            "commit_id": "abc",
+                            "event": "COMMENT",
+                            "body": f"{mw.MARKER}\n# COMMENT\n",
+                            "comments": [{"path": "parser.c", "line": 10, "body": "n"}],
+                        },
+                    )
+        self.assertEqual(event, "COMMENT")
+        self.assertEqual(len(posted), 1)
+        kinds = [op[0] for op in ops]
+        self.assertIn("POST", kinds)
+        self.assertNotIn("DELETE", kinds)
+        self.assertNotIn("LIST", kinds)
+        self.assertIn("Could not resolve", stderr.getvalue())
+        self.assertNotIn("ghs_", stderr.getvalue())
+        self.assertNotIn("token", stderr.getvalue().lower())
+
+    def test_actions_token_fallback_deletes_only_actions_bot_comments(self) -> None:
+        ops: list[tuple] = []
+        review_comments = [
+            _comment(11, "github-actions[bot]", f"{mw.MARKER}\nold inline"),
+            _comment(12, "alice", f"{mw.MARKER}\nforeign marked"),
+        ]
+        issue_comments: list[dict] = []
+
+        def succeed_post(method: str, path: str, payload: dict | None) -> dict:
+            return {"id": 1}
+
+        api, paginate, run = self._record_github_ops(
+            ops,
+            review_comments,
+            issue_comments,
+            succeed_post,
+            user=mw.CommandError("GET /user 403"),
+            installation=mw.CommandError("GET /installation 404"),
+        )
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=False):
+            with api, paginate, run:
+                event, posted = mw.post_review(
+                    "o/r",
+                    "1",
+                    {
+                        "commit_id": "abc",
+                        "event": "COMMENT",
+                        "body": f"{mw.MARKER}\n# COMMENT\n",
+                        "comments": [{"path": "parser.c", "line": 10, "body": "n"}],
+                    },
+                )
+        self.assertEqual(event, "COMMENT")
+        self.assertEqual(len(posted), 1)
+        deleted = [op[1] for op in ops if op[0] == "DELETE"]
+        self.assertEqual(deleted, ["repos/o/r/pulls/comments/11"])
+        self.assertNotIn("repos/o/r/pulls/comments/12", deleted)
 
 
 def _comment(comment_id: int, login: str, body: str) -> dict:
@@ -1620,15 +1738,14 @@ def _comment(comment_id: int, login: str, body: str) -> dict:
 
 
 class DeletePreviousCommentsTests(unittest.TestCase):
-    """Cleanup identity is the HTML marker, not github-actions[bot]."""
+    """Cleanup requires the HTML marker AND the posting identity."""
 
-    def _deleted_paths(
+    def _owned_paths(
         self,
         review_comments: list[dict],
         issue_comments: list[dict],
+        posting_login: str | None,
     ) -> list[str]:
-        deleted: list[str] = []
-
         def fake_paginate(path: str) -> list[dict]:
             if path == "repos/o/r/pulls/9/comments":
                 return review_comments
@@ -1637,76 +1754,101 @@ class DeletePreviousCommentsTests(unittest.TestCase):
             self.fail(f"unexpected paginate path: {path}")
             return []
 
-        def fake_run(args: list[str], *, check: bool = True, input_text: str | None = None):
-            self.assertEqual(args[:4], ["gh", "api", "--method", "DELETE"])
-            deleted.append(args[4])
-            return subprocess.CompletedProcess(args, 0, "", "")
-
         with mock.patch.object(mw, "gh_api_paginate_items", side_effect=fake_paginate):
-            with mock.patch.object(mw, "run", side_effect=fake_run):
-                mw.delete_previous_comments("o/r", "9")
-        return deleted
+            return mw.collect_previous_comment_ids("o/r", "9", posting_login)
+
+    def test_missing_posting_login_returns_empty_without_listing(self) -> None:
+        with mock.patch.object(
+            mw, "gh_api_paginate_items", side_effect=AssertionError("listed")
+        ):
+            self.assertEqual(mw.collect_previous_comment_ids("o/r", "9", None), [])
+            self.assertEqual(mw.collect_previous_comment_ids("o/r", "9", ""), [])
+            self.assertEqual(mw.collect_previous_comment_ids("o/r", "9", "  "), [])
+
+    def test_actions_bot_does_not_delete_human_marked_comment(self) -> None:
+        owned = self._owned_paths(
+            [_comment(11, "alice", f"{mw.MARKER}\npasted marker")],
+            [],
+            "github-actions[bot]",
+        )
+        self.assertEqual(owned, [])
+
+    def test_app_bot_does_not_delete_other_bot_marked_comment(self) -> None:
+        owned = self._owned_paths(
+            [_comment(12, "other-bot[bot]", f"{mw.MARKER}\nforeign bot")],
+            [],
+            "merge-warden-app[bot]",
+        )
+        self.assertEqual(owned, [])
+
+    def test_same_author_without_marker_is_not_owned(self) -> None:
+        owned = self._owned_paths(
+            [_comment(13, "alice", "human review without marker")],
+            [],
+            "alice",
+        )
+        self.assertEqual(owned, [])
 
     def test_deletes_marked_review_comment_from_pat_user(self) -> None:
-        deleted = self._deleted_paths(
+        owned = self._owned_paths(
             [_comment(11, "alice", f"{mw.MARKER}\nPAT inline")],
             [],
+            "alice",
         )
-        self.assertEqual(deleted, ["repos/o/r/pulls/comments/11"])
+        self.assertEqual(owned, ["repos/o/r/pulls/comments/11"])
 
     def test_deletes_marked_review_comment_from_github_app(self) -> None:
-        deleted = self._deleted_paths(
-            [_comment(12, "my-app[bot]", f"{mw.MARKER}\napp inline")],
+        owned = self._owned_paths(
+            [_comment(12, "merge-warden-app[bot]", f"{mw.MARKER}\napp inline")],
             [],
+            "merge-warden-app[bot]",
         )
-        self.assertEqual(deleted, ["repos/o/r/pulls/comments/12"])
+        self.assertEqual(owned, ["repos/o/r/pulls/comments/12"])
 
     def test_deletes_marked_review_comment_from_github_actions_bot(self) -> None:
-        deleted = self._deleted_paths(
+        owned = self._owned_paths(
             [_comment(13, "github-actions[bot]", f"{mw.MARKER}\nbot inline")],
             [],
+            "github-actions[bot]",
         )
-        self.assertEqual(deleted, ["repos/o/r/pulls/comments/13"])
+        self.assertEqual(owned, ["repos/o/r/pulls/comments/13"])
 
     def test_keeps_review_comment_without_marker(self) -> None:
-        deleted = self._deleted_paths(
+        owned = self._owned_paths(
             [
                 _comment(14, "alice", "human review without marker"),
                 _comment(15, "github-actions[bot]", "bot comment without marker"),
                 _comment(16, "my-app[bot]", "app comment without marker"),
             ],
             [],
+            "alice",
         )
-        self.assertEqual(deleted, [])
+        self.assertEqual(owned, [])
 
-    def test_deletes_marked_issue_comment_from_pat_and_app(self) -> None:
-        deleted = self._deleted_paths(
+    def test_deletes_marked_issue_comment_from_matching_pat_only(self) -> None:
+        owned = self._owned_paths(
             [],
             [
                 _comment(21, "alice", f"{mw.MARKER}\nPAT conversation"),
                 _comment(22, "my-app[bot]", f"{mw.MARKER}\napp conversation"),
             ],
+            "alice",
         )
-        self.assertEqual(
-            deleted,
-            [
-                "repos/o/r/issues/comments/21",
-                "repos/o/r/issues/comments/22",
-            ],
-        )
+        self.assertEqual(owned, ["repos/o/r/issues/comments/21"])
 
     def test_keeps_issue_comment_without_marker(self) -> None:
-        deleted = self._deleted_paths(
+        owned = self._owned_paths(
             [],
             [
                 _comment(23, "alice", "ordinary conversation"),
                 _comment(24, "github-actions[bot]", "bot conversation without marker"),
             ],
+            "alice",
         )
-        self.assertEqual(deleted, [])
+        self.assertEqual(owned, [])
 
-    def test_mixed_comments_delete_only_those_with_marker(self) -> None:
-        deleted = self._deleted_paths(
+    def test_mixed_comments_delete_only_owned_marked(self) -> None:
+        owned = self._owned_paths(
             [
                 _comment(11, "alice", f"{mw.MARKER}\nPAT inline"),
                 _comment(12, "my-app[bot]", f"{mw.MARKER}\napp inline"),
@@ -1717,15 +1859,180 @@ class DeletePreviousCommentsTests(unittest.TestCase):
                 _comment(21, "alice", f"{mw.MARKER}\nPAT conversation"),
                 _comment(22, "carol", "unrelated conversation"),
             ],
+            "alice",
         )
         self.assertEqual(
-            deleted,
+            owned,
             [
                 "repos/o/r/pulls/comments/11",
-                "repos/o/r/pulls/comments/12",
-                "repos/o/r/pulls/comments/13",
                 "repos/o/r/issues/comments/21",
             ],
+        )
+
+
+class IsOwnedMergeWardenCommentTests(unittest.TestCase):
+    def test_requires_marker_and_matching_login(self) -> None:
+        marked = _comment(1, "alice", f"{mw.MARKER}\nbody")
+        self.assertTrue(mw.is_owned_merge_warden_comment(marked, "alice"))
+        self.assertFalse(mw.is_owned_merge_warden_comment(marked, "bob"))
+        self.assertFalse(mw.is_owned_merge_warden_comment(marked, None))
+        self.assertFalse(mw.is_owned_merge_warden_comment(marked, ""))
+
+    def test_marker_alone_is_not_ownership(self) -> None:
+        pasted = _comment(1, "alice", f"{mw.MARKER}\npasted")
+        self.assertFalse(
+            mw.is_owned_merge_warden_comment(pasted, "github-actions[bot]")
+        )
+
+    def test_same_author_unmarked_is_not_owned(self) -> None:
+        unmarked = _comment(1, "alice", "no marker")
+        self.assertFalse(mw.is_owned_merge_warden_comment(unmarked, "alice"))
+
+    def test_missing_user_is_not_owned(self) -> None:
+        comment = {"id": 1, "body": f"{mw.MARKER}\nbody"}
+        self.assertFalse(mw.is_owned_merge_warden_comment(comment, "alice"))
+
+
+class AuthenticatedGithubLoginTests(unittest.TestCase):
+    def _login(
+        self,
+        fake_gh_api,
+        *,
+        environ: dict[str, str] | None = None,
+        drop: tuple[str, ...] = ("GITHUB_ACTIONS",),
+    ) -> str | None:
+        env = {k: v for k, v in os.environ.items() if k not in drop}
+        if environ:
+            env.update(environ)
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(mw, "gh_api", side_effect=fake_gh_api):
+                return mw.authenticated_github_login()
+
+    def test_user_token_returns_login(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def fake_gh_api(
+            method: str,
+            path: str,
+            payload: dict | None = None,
+            paginate: bool = False,
+        ):
+            calls.append((method, path))
+            if path == "user":
+                return {"login": "alice"}
+            self.fail(f"unexpected {method} {path}")
+            return None
+
+        self.assertEqual(self._login(fake_gh_api), "alice")
+        self.assertEqual(calls, [("GET", "user")])
+
+    def test_user_token_wins_over_actions_actor(self) -> None:
+        def fake_gh_api(
+            method: str,
+            path: str,
+            payload: dict | None = None,
+            paginate: bool = False,
+        ):
+            if path == "user":
+                return {"login": "alice"}
+            self.fail(f"unexpected {method} {path}")
+            return None
+
+        self.assertEqual(
+            self._login(
+                fake_gh_api,
+                environ={"GITHUB_ACTIONS": "true", "GITHUB_ACTOR": "human"},
+                drop=(),
+            ),
+            "alice",
+        )
+
+    def test_installation_returns_app_bot_login(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def fake_gh_api(
+            method: str,
+            path: str,
+            payload: dict | None = None,
+            paginate: bool = False,
+        ):
+            calls.append((method, path))
+            if path == "user":
+                raise mw.CommandError("HTTP 403")
+            if path == "installation":
+                return {"app_slug": "merge-warden-app"}
+            self.fail(f"unexpected {method} {path}")
+            return None
+
+        self.assertEqual(self._login(fake_gh_api), "merge-warden-app[bot]")
+        self.assertEqual(calls, [("GET", "user"), ("GET", "installation")])
+
+    def test_empty_user_login_falls_through_to_installation(self) -> None:
+        def fake_gh_api(
+            method: str,
+            path: str,
+            payload: dict | None = None,
+            paginate: bool = False,
+        ):
+            if path == "user":
+                return {"login": ""}
+            if path == "installation":
+                return {"app_slug": "my-app"}
+            self.fail(f"unexpected {method} {path}")
+            return None
+
+        self.assertEqual(self._login(fake_gh_api), "my-app[bot]")
+
+    def test_both_lookups_fail_outside_actions_returns_none(self) -> None:
+        def fake_gh_api(
+            method: str,
+            path: str,
+            payload: dict | None = None,
+            paginate: bool = False,
+        ):
+            raise mw.CommandError("HTTP 403")
+
+        self.assertIsNone(
+            self._login(fake_gh_api, environ={"GITHUB_ACTOR": "human"})
+        )
+
+    def test_does_not_use_github_actor(self) -> None:
+        def fake_gh_api(
+            method: str,
+            path: str,
+            payload: dict | None = None,
+            paginate: bool = False,
+        ):
+            raise mw.CommandError("HTTP 403")
+
+        self.assertIsNone(
+            self._login(fake_gh_api, environ={"GITHUB_ACTOR": "human"})
+        )
+        self.assertEqual(
+            self._login(
+                fake_gh_api,
+                environ={"GITHUB_ACTIONS": "true", "GITHUB_ACTOR": "human"},
+                drop=(),
+            ),
+            "github-actions[bot]",
+        )
+
+    def test_actions_token_fallback_when_lookups_fail(self) -> None:
+        def fake_gh_api(
+            method: str,
+            path: str,
+            payload: dict | None = None,
+            paginate: bool = False,
+        ):
+            raise mw.CommandError("HTTP 403")
+
+        self.assertEqual(
+            self._login(
+                fake_gh_api,
+                environ={"GITHUB_ACTIONS": "true"},
+                drop=(),
+            ),
+            "github-actions[bot]",
         )
 
 
