@@ -121,7 +121,9 @@ Merge Warden may *generate* `APPROVE`, `COMMENT`, or `REQUEST_CHANGES`.
 Pass a PAT or GitHub App token as `github-token` when you need `APPROVE` to
 post. Previous Merge Warden comments (inline and conversation) are replaced by
 matching the HTML marker `<!-- merge-warden -->`, not by author login, so those
-tokens do not accumulate duplicate threads across runs.
+tokens do not accumulate duplicate threads across runs. Replacement runs only
+after GitHub accepts the new review; a failed post leaves the previous threads
+in place.
 
 If GitHub rejects `APPROVE` or `REQUEST_CHANGES`, the action posts a `COMMENT`
 instead of failing. Use `generated-event` / `posted-event` (and the matching
