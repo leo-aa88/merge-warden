@@ -332,6 +332,21 @@ def _huge_c_unified_diff() -> str:
     )
 
 
+def _small_c_unified_diff() -> str:
+    return (
+        "diff --git a/small.c b/small.c\n"
+        "--- a/small.c\n"
+        "+++ b/small.c\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-old small\n"
+        "+new small\n"
+    )
+
+
+def _huge_and_small_unified_diff() -> str:
+    return _huge_c_unified_diff() + _small_c_unified_diff()
+
+
 def _blocking_on_huge(line: int = 100) -> dict:
     return {
         "path": "huge.c",
@@ -339,6 +354,16 @@ def _blocking_on_huge(line: int = 100) -> dict:
         "line": line,
         "severity": "blocking",
         "body": "overflow in the large file",
+    }
+
+
+def _blocking_on_small(line: int = 1) -> dict:
+    return {
+        "path": "small.c",
+        "side": "RIGHT",
+        "line": line,
+        "severity": "blocking",
+        "body": "bug in the small file",
     }
 
 
@@ -407,22 +432,52 @@ class LargeFileOmittedPatchCommentableTests(unittest.TestCase):
         )
         self.assertIn(1, commentable["small.c"]["RIGHT"])
         small = mw.build_inline_comments(
-            {
-                "comments": [
-                    {
-                        "path": "small.c",
-                        "side": "RIGHT",
-                        "line": 1,
-                        "severity": "blocking",
-                        "body": "bug in the small file",
-                    }
-                ]
-            },
+            {"comments": [_blocking_on_small()]},
             commentable,
         )
         self.assertEqual(len(small), 1)
         self.assertEqual(small[0]["path"], "small.c")
         self.assertEqual(small[0]["line"], 1)
+
+    def test_complete_multi_file_diff_isolates_commentable_lines_per_path(
+        self,
+    ) -> None:
+        files = [_omitted_patch_file(), _small_patched_file()]
+        diff = _huge_and_small_unified_diff()
+        commentable = mw.commentable_by_path(files, diff)
+        huge_right = commentable["huge.c"]["RIGHT"]
+        small_right = commentable["small.c"]["RIGHT"]
+        self.assertIn(100, huge_right)
+        self.assertNotIn(1, huge_right)
+        self.assertIn(1, small_right)
+        self.assertNotIn(100, small_right)
+        built = mw.build_inline_comments(
+            {"comments": [_blocking_on_huge(), _blocking_on_small()]},
+            commentable,
+        )
+        self.assertEqual(len(built), 2)
+        by_path = {item["path"]: item for item in built}
+        self.assertEqual(by_path["huge.c"]["line"], 100)
+        self.assertEqual(by_path["small.c"]["line"], 1)
+        self.assertIn("**BLOCKING.**", by_path["huge.c"]["body"])
+        self.assertIn("**BLOCKING.**", by_path["small.c"]["body"])
+
+    def test_complete_diff_unions_additional_hunk_with_files_api_patch(
+        self,
+    ) -> None:
+        files = [_small_patched_file()]
+        extra = (
+            "diff --git a/small.c b/small.c\n"
+            "--- a/small.c\n"
+            "+++ b/small.c\n"
+            "@@ -50,1 +50,1 @@\n"
+            "-old extra\n"
+            "+new extra\n"
+        )
+        commentable = mw.commentable_by_path(files, extra)
+        right = commentable["small.c"]["RIGHT"]
+        self.assertIn(1, right)
+        self.assertIn(50, right)
 
     PR = {
         "number": 1,
@@ -526,16 +581,7 @@ class LargeFileOmittedPatchCommentableTests(unittest.TestCase):
         review = {
             "event": "REQUEST_CHANGES",
             "body": "# REQUEST CHANGES\n\nCovered defects.\n",
-            "comments": [
-                _blocking_on_huge(),
-                {
-                    "path": "small.c",
-                    "side": "RIGHT",
-                    "line": 1,
-                    "severity": "blocking",
-                    "body": "bug in the small file",
-                },
-            ],
+            "comments": [_blocking_on_huge(), _blocking_on_small()],
         }
         with tempfile.TemporaryDirectory() as tmp:
             args = self._args(tmp)
@@ -553,6 +599,33 @@ class LargeFileOmittedPatchCommentableTests(unittest.TestCase):
         self.assertNotIn("huge.c", paths)
         self.assertIn("small.c", paths)
         self.assertEqual(payload["comments"][0]["line"], 1)
+
+    def test_generate_review_complete_multi_file_diff_posts_both_without_snapping(
+        self,
+    ) -> None:
+        review = {
+            "event": "REQUEST_CHANGES",
+            "body": "# REQUEST CHANGES\n\nCovered defects.\n",
+            "comments": [_blocking_on_huge(), _blocking_on_small()],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp)
+            rc = self._generate(
+                args,
+                review,
+                files=[_omitted_patch_file(), _small_patched_file()],
+                diff_returncode=0,
+                diff_stdout=_huge_and_small_unified_diff(),
+            )
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        by_path = {item["path"]: item for item in payload["comments"]}
+        self.assertEqual(set(by_path), {"huge.c", "small.c"})
+        self.assertEqual(by_path["huge.c"]["line"], 100)
+        self.assertEqual(by_path["small.c"]["line"], 1)
+        self.assertNotEqual(by_path["small.c"]["line"], 100)
+        self.assertIn("**BLOCKING.**", by_path["huge.c"]["body"])
+        self.assertIn("**BLOCKING.**", by_path["small.c"]["body"])
 
 
 class SeverityNormalizationTests(unittest.TestCase):
