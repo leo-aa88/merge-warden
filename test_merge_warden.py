@@ -299,6 +299,262 @@ class InlineCommentLocationTests(unittest.TestCase):
         self.assertNotIn("subject_type", comments[0])
 
 
+def _omitted_patch_file(path: str = "huge.c") -> dict:
+    return {
+        "filename": path,
+        "status": "modified",
+        "additions": 4000,
+        "deletions": 10,
+        "patch": None,
+    }
+
+
+def _small_patched_file(path: str = "small.c") -> dict:
+    return {
+        "filename": path,
+        "status": "modified",
+        "additions": 1,
+        "deletions": 1,
+        "patch": "@@ -1,1 +1,1 @@\n-old small\n+new small\n",
+    }
+
+
+def _huge_c_unified_diff() -> str:
+    return (
+        "diff --git a/huge.c b/huge.c\n"
+        "--- a/huge.c\n"
+        "+++ b/huge.c\n"
+        "@@ -100,3 +100,3 @@\n"
+        " int a;\n"
+        "-int b;\n"
+        "+int B;\n"
+        " int c;\n"
+    )
+
+
+def _blocking_on_huge(line: int = 100) -> dict:
+    return {
+        "path": "huge.c",
+        "side": "RIGHT",
+        "line": line,
+        "severity": "blocking",
+        "body": "overflow in the large file",
+    }
+
+
+class LargeFileOmittedPatchCommentableTests(unittest.TestCase):
+    """GitHub omits files[].patch above ~20KB / 3000 lines (issue #48)."""
+
+    def test_omitted_patch_without_complete_diff_is_not_commentable(self) -> None:
+        files = [_omitted_patch_file()]
+        commentable = mw.commentable_by_path(files)
+        self.assertEqual(commentable["huge.c"]["RIGHT"], set())
+        self.assertEqual(commentable["huge.c"]["LEFT"], set())
+        self.assertIsNone(
+            mw.snap_comment(
+                {"path": "huge.c", "side": "RIGHT", "line": 100, "body": "BLOCKING"},
+                commentable,
+            )
+        )
+        self.assertEqual(
+            mw.build_inline_comments({"comments": [_blocking_on_huge()]}, commentable),
+            [],
+        )
+
+    def test_complete_diff_makes_omitted_patch_hunk_commentable(self) -> None:
+        files = [_omitted_patch_file()]
+        diff = _huge_c_unified_diff()
+        expected = mw.parse_patch(
+            "@@ -100,3 +100,3 @@\n int a;\n-int b;\n+int B;\n int c;\n"
+        )
+        commentable = mw.commentable_by_path(files, diff)
+        self.assertIn(100, commentable["huge.c"]["RIGHT"])
+        self.assertEqual(commentable["huge.c"]["RIGHT"], expected["RIGHT"])
+        self.assertEqual(commentable["huge.c"]["LEFT"], expected["LEFT"])
+        self.assertNotIn(1, commentable["huge.c"]["RIGHT"])
+        snapped = mw.snap_comment(
+            {"path": "huge.c", "side": "RIGHT", "line": 100, "body": "BLOCKING"},
+            commentable,
+        )
+        self.assertEqual(
+            snapped, {"path": "huge.c", "side": "RIGHT", "line": 100}
+        )
+        built = mw.build_inline_comments(
+            {"comments": [_blocking_on_huge()]},
+            commentable,
+        )
+        self.assertEqual(len(built), 1)
+        self.assertEqual(built[0]["path"], "huge.c")
+        self.assertEqual(built[0]["line"], 100)
+        self.assertIn("**BLOCKING.**", built[0]["body"])
+
+    def test_failed_complete_placeholder_does_not_invent_commentable_lines(
+        self,
+    ) -> None:
+        files = [_omitted_patch_file(), _small_patched_file()]
+        diff = mw.failed_complete_diff_placeholder(
+            "GraphQL: pull request diff is too large"
+        )
+        commentable = mw.commentable_by_path(files, diff)
+        self.assertEqual(commentable["huge.c"]["RIGHT"], set())
+        self.assertEqual(commentable["huge.c"]["LEFT"], set())
+        self.assertIsNone(
+            mw.snap_comment(_blocking_on_huge(), commentable)
+        )
+        self.assertEqual(
+            mw.build_inline_comments({"comments": [_blocking_on_huge()]}, commentable),
+            [],
+        )
+        self.assertIn(1, commentable["small.c"]["RIGHT"])
+        small = mw.build_inline_comments(
+            {
+                "comments": [
+                    {
+                        "path": "small.c",
+                        "side": "RIGHT",
+                        "line": 1,
+                        "severity": "blocking",
+                        "body": "bug in the small file",
+                    }
+                ]
+            },
+            commentable,
+        )
+        self.assertEqual(len(small), 1)
+        self.assertEqual(small[0]["path"], "small.c")
+        self.assertEqual(small[0]["line"], 1)
+
+    PR = {
+        "number": 1,
+        "title": "t",
+        "body": "b",
+        "url": "https://example.test/pr/1",
+        "author": {"login": "a"},
+        "baseRefName": "main",
+        "headRefName": "feat",
+        "headRefOid": "deadbeef",
+        "labels": [],
+        "closingIssuesReferences": [],
+    }
+
+    def _args(self, tmp: str) -> argparse.Namespace:
+        return argparse.Namespace(
+            provider="xai",
+            model="grok-4.6",
+            prompt_file=str(mw.DEFAULT_PROMPT),
+            pr="1",
+            head_ref="pr-head",
+            output=str(Path(tmp) / "merge-warden.md"),
+            json_output=str(Path(tmp) / "merge-warden.json"),
+            post=False,
+            skip_if_missing_key=False,
+        )
+
+    def _stats(self):
+        coverage = mock.Mock(complete=True, uncovered_chunk_ids=[])
+        stats = mock.Mock(
+            deadline_exhausted=False,
+            validation_deadline_exhausted=False,
+            pre_reduce_deadline_exhausted=False,
+            reduce_deadline_exhausted=False,
+            map_deadline_exhausted=False,
+            synthesis_calls=1,
+            notes=[],
+        )
+        stats.footer.return_value = "pipeline footer"
+        return coverage, stats
+
+    def _generate(
+        self,
+        args: argparse.Namespace,
+        review: dict,
+        *,
+        files: list[dict],
+        diff_returncode: int,
+        diff_stdout: str,
+        diff_stderr: str = "",
+    ) -> int:
+        coverage, stats = self._stats()
+        with mock.patch.dict(os.environ, {"XAI_API_KEY": "sk"}):
+            with mock.patch.object(mw, "gh_json", return_value=self.PR):
+                with mock.patch.object(mw, "collect_pr_files", return_value=files):
+                    with mock.patch.object(
+                        mw,
+                        "run",
+                        return_value=mock.Mock(
+                            returncode=diff_returncode,
+                            stdout=diff_stdout,
+                            stderr=diff_stderr,
+                        ),
+                    ):
+                        with mock.patch.object(mw, "load_arch_docs", return_value=[]):
+                            with mock.patch.object(
+                                mw,
+                                "run_hierarchical_review",
+                                return_value=(review, coverage, EvidenceStore(), stats),
+                            ):
+                                with mock.patch.object(
+                                    mw.time, "monotonic", return_value=0.0
+                                ):
+                                    return mw.generate_review(args, "o/r")
+
+    def test_generate_review_keeps_blocking_from_complete_diff(self) -> None:
+        review = {
+            "event": "REQUEST_CHANGES",
+            "body": "# REQUEST CHANGES\n\nCovered defects.\n",
+            "comments": [_blocking_on_huge()],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp)
+            rc = self._generate(
+                args,
+                review,
+                files=[_omitted_patch_file()],
+                diff_returncode=0,
+                diff_stdout=_huge_c_unified_diff(),
+            )
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(payload["comments"]), 1)
+        self.assertEqual(payload["comments"][0]["path"], "huge.c")
+        self.assertEqual(payload["comments"][0]["line"], 100)
+        self.assertIn("**BLOCKING.**", payload["comments"][0]["body"])
+
+    def test_generate_review_failed_diff_does_not_anchor_omitted_patch(
+        self,
+    ) -> None:
+        review = {
+            "event": "REQUEST_CHANGES",
+            "body": "# REQUEST CHANGES\n\nCovered defects.\n",
+            "comments": [
+                _blocking_on_huge(),
+                {
+                    "path": "small.c",
+                    "side": "RIGHT",
+                    "line": 1,
+                    "severity": "blocking",
+                    "body": "bug in the small file",
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp)
+            rc = self._generate(
+                args,
+                review,
+                files=[_omitted_patch_file(), _small_patched_file()],
+                diff_returncode=1,
+                diff_stdout="",
+                diff_stderr="GraphQL: pull request diff is too large",
+            )
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        paths = [item["path"] for item in payload["comments"]]
+        self.assertNotIn("huge.c", paths)
+        self.assertIn("small.c", paths)
+        self.assertEqual(payload["comments"][0]["line"], 1)
+
+
 class SeverityNormalizationTests(unittest.TestCase):
     def test_blocker_alias_still_posts_as_blocking(self) -> None:
         self.assertEqual(mw.normalize_severity("blocker"), "blocking")
