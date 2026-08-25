@@ -155,10 +155,78 @@ DEFAULT_SKIP_NAMES = {
     "lex.yy.c",
 }
 
-ISSUE_REF_RE = re.compile(
-    r"(?:(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+)?#(\d+)",
+# Token-start #N: not glued to a preceding word character (rejects C#12, Python#3).
+# stdlib re lookbehind is fixed-width, so PR/step/pull-request exclusion lives in
+# scrape_issue_numbers rather than this pattern.
+ISSUE_REF_RE = re.compile(r"(?<!\w)#(\d+)")
+_EXCLUDED_LEAD_RE = re.compile(
+    r"(?<!\w)(?:PR|pull\s+request|step)\s+$",
     re.IGNORECASE,
 )
+
+
+def _opening_fence_kind(line: str) -> str | None:
+    stripped = line.lstrip(" ")
+    if len(line) - len(stripped) > 3:
+        return None
+    if stripped.startswith("```"):
+        return "`"
+    if stripped.startswith("~~~"):
+        return "~"
+    return None
+
+
+def _closes_fence(line: str, kind: str) -> bool:
+    stripped = line.lstrip(" ")
+    if len(line) - len(stripped) > 3:
+        return False
+    return stripped.startswith(kind * 3)
+
+
+def _without_fenced_code(text: str) -> str:
+    """Drop paired ``` / ~~~ fences so example #1 is not scraped as an issue.
+
+    This is not a markdown parser. An unclosed fence leaves the tail intact so a
+    later `Fixes #N` is still collected.
+    """
+    lines = text.splitlines(keepends=True)
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        kind = _opening_fence_kind(lines[index])
+        if kind is None:
+            kept.append(lines[index])
+            index += 1
+            continue
+        closer = index + 1
+        while closer < len(lines) and not _closes_fence(lines[closer], kind):
+            closer += 1
+        if closer >= len(lines):
+            kept.extend(lines[index:])
+            break
+        index = closer + 1
+    return "".join(kept)
+
+
+def scrape_issue_numbers(text: str) -> list[int]:
+    """Issue numbers from a PR body, in encounter order.
+
+    A `#N` is an issue reference when it starts a token (not `C#12`) and is not
+    immediately preceded by `PR`, `pull request`, or `step`. Close/fix/resolve
+    forms such as `Fixes #12` match because `#` starts a token. Official
+    `closingIssuesReferences` are prepended separately. `#1..#5` is two refs,
+    not a range.
+    """
+    haystack = _without_fenced_code(text or "")
+    numbers: list[int] = []
+    for match in ISSUE_REF_RE.finditer(haystack):
+        prefix = haystack[: match.start()]
+        if _EXCLUDED_LEAD_RE.search(prefix):
+            continue
+        numbers.append(int(match.group(1)))
+    return numbers
+
+
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
@@ -609,8 +677,7 @@ def collect_issue_records(repo: str, pr_body: str, closing: list[dict]) -> tuple
         number = item.get("number")
         if isinstance(number, int):
             numbers.append(number)
-    for match in ISSUE_REF_RE.finditer(pr_body or ""):
-        numbers.append(int(match.group(1)))
+    numbers.extend(scrape_issue_numbers(pr_body or ""))
 
     seen: set[int] = set()
     unique: list[int] = []
