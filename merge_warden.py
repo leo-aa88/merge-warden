@@ -1276,10 +1276,58 @@ def merge_inline_comments(comments: list[dict]) -> list[dict]:
     return [merged[key] for key in order]
 
 
-def build_inline_comments(
+def rank_inline_comments(comments: list[dict]) -> list[dict]:
+    """Stable sort: BLOCKING, then MAJOR, then MINOR. Equal rank keeps input order."""
+    return sorted(
+        comments,
+        key=lambda item: SEVERITY_RANK.get(
+            normalize_severity(str(item.get("severity") or "minor")),
+            SEVERITY_RANK["minor"],
+        ),
+        reverse=True,
+    )
+
+
+def format_overflow_inline_comments(comments: list[dict]) -> str:
+    """Render capped-out inline comments for the posted GitHub review body."""
+    if not comments:
+        return ""
+    sections = [
+        "---",
+        "",
+        "# Findings not posted as inline comments",
+        "",
+        f"GitHub accepts at most {MAX_COMMENTS} inline comments per review. "
+        "These findings were ranked below that cap (BLOCKING, then MAJOR, then "
+        "MINOR) and are listed here so they are not dropped.",
+        "",
+    ]
+    for index, comment in enumerate(comments, 1):
+        path = str(comment.get("path") or "")
+        side = str(comment.get("side") or "RIGHT")
+        line = comment.get("line")
+        location = f"`{path}` ({side}:{line})" if path else f"({side}:{line})"
+        body = str(comment.get("body") or "").strip() or "(empty comment)"
+        if not body.startswith("**"):
+            severity = normalize_severity(str(comment.get("severity") or "minor"))
+            body = f"**{SEVERITY_LABEL[severity]}.** {body}"
+        sections.append(f"## {index}. {location}")
+        sections.append("")
+        sections.append(body)
+        sections.append("")
+    return "\n".join(sections).rstrip() + "\n"
+
+
+def prepare_inline_comments(
     review: dict,
     commentable: dict[str, dict[str, set[int]]],
-) -> list[dict]:
+) -> tuple[list[dict], list[dict]]:
+    """Snap, merge by location, rank by severity, and split at MAX_COMMENTS.
+
+    Returns (kept, overflow). GitHub caps a review at 25 inline comments.
+    Rank after merge so a BLOCKING finding is never dropped to keep 25 MINOR
+    notes. Overflow belongs in the posted review body, not discarded.
+    """
     raw_comments = review.get("comments") or []
     prepared: list[dict] = []
     if isinstance(raw_comments, list):
@@ -1299,9 +1347,13 @@ def build_inline_comments(
             )
 
     if not prepared:
-        return []
+        return [], []
 
-    prepared = merge_inline_comments(prepared)[:MAX_COMMENTS]
+    ranked = rank_inline_comments(merge_inline_comments(prepared))
+    return ranked[:MAX_COMMENTS], ranked[MAX_COMMENTS:]
+
+
+def format_posted_inline_comments(items: list[dict]) -> list[dict]:
     return [
         {
             "path": item["path"],
@@ -1309,8 +1361,16 @@ def build_inline_comments(
             "line": item["line"],
             "body": format_inline_body(item["severity"], item["body"]),
         }
-        for item in prepared
+        for item in items
     ]
+
+
+def build_inline_comments(
+    review: dict,
+    commentable: dict[str, dict[str, set[int]]],
+) -> list[dict]:
+    kept, _overflow = prepare_inline_comments(review, commentable)
+    return format_posted_inline_comments(kept)
 
 
 def format_unposted_candidate_findings(findings: list[dict]) -> str:
@@ -1352,8 +1412,9 @@ def render_markdown(
     posted_comments: list[dict] | None = None,
     pipeline_footer: str = "",
     unposted_findings: list[dict] | None = None,
+    overflow_comments: list[dict] | None = None,
 ) -> str:
-    body = wrap_review_body(str(review.get("body") or ""))
+    body = review_summary_body(review, overflow_comments)
     if (
         posted_event is None
         or posted_comments is None
@@ -1374,8 +1435,12 @@ def render_markdown(
     return truncate(body.rstrip() + "\n" + "\n".join(extra), MAX_REVIEW_CHARS, "review")
 
 
-def review_summary_body(review: dict) -> str:
-    return wrap_review_body(str(review.get("body") or ""))
+def review_summary_body(review: dict, overflow: list[dict] | None = None) -> str:
+    text = str(review.get("body") or "")
+    extra = format_overflow_inline_comments(overflow or [])
+    if extra:
+        text = f"{text.rstrip()}\n\n{extra}"
+    return wrap_review_body(text)
 
 
 def collect_previous_comment_ids(repo: str, pr_number: str) -> list[str]:
@@ -1921,9 +1986,11 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
         review["event"] = "COMMENT"
         review["comments"] = []
 
-    comments = build_inline_comments(review, commentable)
+    kept, overflow = prepare_inline_comments(review, commentable)
+    comments = format_posted_inline_comments(kept)
     if fail_closed_inline:
         comments = []
+        overflow = []
     head_sha = pr.get("headRefOid") or ""
     event = normalize_event(str(review.get("event") or ""), str(review.get("body") or ""))
     if fail_closed_inline:
@@ -1936,13 +2003,14 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             review["event"] = guarded_event
             review["body"] = guarded_body
             comments = []
+            overflow = []
         event = guarded_event
         if not coverage.complete and event == "APPROVE":
             event = "COMMENT"
     payload = {
         "commit_id": head_sha,
         "event": event,
-        "body": review_summary_body(review),
+        "body": review_summary_body(review, overflow),
         "comments": comments,
     }
     unposted = (
@@ -1958,6 +2026,7 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
             event,
             pipeline_footer=stats.footer(),
             unposted_findings=unposted,
+            overflow_comments=overflow,
         ),
         encoding="utf-8",
     )
@@ -1999,6 +2068,7 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
                     posted_comments=posted_comments,
                     pipeline_footer=stats.footer(),
                     unposted_findings=unposted,
+                    overflow_comments=overflow,
                 ),
                 encoding="utf-8",
             )

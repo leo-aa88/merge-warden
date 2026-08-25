@@ -312,6 +312,254 @@ class SeverityNormalizationTests(unittest.TestCase):
         self.assertIn("**MINOR.**", mw.format_inline_body("CRITICAL", "nit"))
 
 
+def _commentable_lines(path: str = "parser.c", count: int = 40) -> dict[str, dict[str, set[int]]]:
+    return {path: {"RIGHT": set(range(1, count + 1)), "LEFT": set()}}
+
+
+def _inline_comment(
+    line: int,
+    severity: str,
+    body: str | None = None,
+    *,
+    path: str = "parser.c",
+) -> dict:
+    return {
+        "path": path,
+        "side": "RIGHT",
+        "line": line,
+        "severity": severity,
+        "body": body if body is not None else f"finding {line}",
+    }
+
+
+def _added_file(path: str, line_count: int) -> dict:
+    hunk = [f"@@ -0,0 +1,{line_count} @@"]
+    hunk.extend(f"+line {index}" for index in range(1, line_count + 1))
+    return {
+        "filename": path,
+        "status": "added",
+        "additions": line_count,
+        "deletions": 0,
+        "patch": "\n".join(hunk) + "\n",
+    }
+
+
+class InlineCommentCapTests(unittest.TestCase):
+    def test_blocking_after_25_minors_is_kept_inline(self) -> None:
+        comments = [
+            _inline_comment(index, "minor") for index in range(1, 26)
+        ] + [_inline_comment(26, "blocking")]
+        built = mw.build_inline_comments({"comments": comments}, _commentable_lines())
+        self.assertLessEqual(len(built), mw.MAX_COMMENTS)
+        self.assertEqual(len(built), 25)
+        self.assertIn(26, [item["line"] for item in built])
+        self.assertTrue(any("**BLOCKING.**" in item["body"] for item in built))
+
+    def test_minor_after_25_blocking_overflows_into_review_body(self) -> None:
+        comments = [
+            _inline_comment(index, "blocking") for index in range(1, 26)
+        ] + [_inline_comment(26, "minor")]
+        commentable = _commentable_lines()
+        built = mw.build_inline_comments({"comments": comments}, commentable)
+        kept, overflow = mw.prepare_inline_comments({"comments": comments}, commentable)
+        self.assertEqual(len(built), 25)
+        self.assertFalse(any(item["line"] == 26 for item in built))
+        self.assertFalse(any("**MINOR.**" in item["body"] for item in built))
+        self.assertEqual(len(kept), 25)
+        self.assertEqual(len(overflow), 1)
+        self.assertEqual(overflow[0]["line"], 26)
+        self.assertEqual(overflow[0]["severity"], "minor")
+        body = mw.review_summary_body({"body": "# REQUEST CHANGES\n"}, overflow)
+        self.assertIn("finding 26", body)
+        self.assertIn("**MINOR.**", body)
+        self.assertIn("parser.c", body)
+
+    def test_blocker_alias_ranks_with_blocking_under_the_cap(self) -> None:
+        comments = [
+            _inline_comment(index, "minor") for index in range(1, 26)
+        ] + [_inline_comment(26, "blocker", "the leak")]
+        built = mw.build_inline_comments({"comments": comments}, _commentable_lines())
+        self.assertEqual(len(built), 25)
+        self.assertTrue(
+            any(item["line"] == 26 and "**BLOCKING.**" in item["body"] for item in built)
+        )
+
+    def test_merge_by_location_happens_before_the_cap(self) -> None:
+        comments = [_inline_comment(index, "minor") for index in range(1, 26)]
+        comments.append(_inline_comment(1, "minor", "second note on line 1"))
+        commentable = _commentable_lines()
+        built = mw.build_inline_comments({"comments": comments}, commentable)
+        kept, overflow = mw.prepare_inline_comments({"comments": comments}, commentable)
+        self.assertEqual(len(built), 25)
+        self.assertEqual(overflow, [])
+        line_one = next(item for item in built if item["line"] == 1)
+        self.assertIn("finding 1", line_one["body"])
+        self.assertIn("second note on line 1", line_one["body"])
+        self.assertEqual({item["line"] for item in kept}, set(range(1, 26)))
+
+    def test_equal_severity_keeps_original_order_under_the_cap(self) -> None:
+        comments = [_inline_comment(index, "minor") for index in range(1, 27)]
+        built = mw.build_inline_comments({"comments": comments}, _commentable_lines())
+        self.assertEqual([item["line"] for item in built], list(range(1, 26)))
+
+    def test_rank_order_is_blocking_then_major_then_minor(self) -> None:
+        comments = (
+            [_inline_comment(index, "minor") for index in range(1, 11)]
+            + [_inline_comment(index, "major") for index in range(11, 21)]
+            + [_inline_comment(index, "blocking") for index in range(21, 31)]
+        )
+        built = mw.build_inline_comments({"comments": comments}, _commentable_lines())
+        self.assertEqual(
+            [item["line"] for item in built],
+            list(range(21, 31)) + list(range(11, 21)) + list(range(1, 6)),
+        )
+
+    def test_review_summary_body_appends_overflow_section(self) -> None:
+        overflow = [
+            {
+                "path": "parser.c",
+                "side": "RIGHT",
+                "line": 26,
+                "severity": "minor",
+                "body": "**MINOR.** finding 26",
+            }
+        ]
+        body = mw.review_summary_body({"body": "# REQUEST CHANGES\n"}, overflow)
+        self.assertIn("# REQUEST CHANGES", body)
+        self.assertIn("finding 26", body)
+        self.assertIn("**MINOR.**", body)
+        self.assertIn("`parser.c`", body)
+        empty = mw.review_summary_body({"body": "# APPROVE\n"}, [])
+        self.assertIn("# APPROVE", empty)
+        self.assertNotIn("not posted as inline comments", empty.lower())
+
+
+class InlineCommentCapPostingTests(unittest.TestCase):
+    PR = {
+        "number": 1,
+        "title": "t",
+        "body": "b",
+        "url": "https://example.test/pr/1",
+        "author": {"login": "a"},
+        "baseRefName": "main",
+        "headRefName": "feat",
+        "headRefOid": "deadbeef",
+        "labels": [],
+        "closingIssuesReferences": [],
+    }
+
+    def _args(self, tmp: str, *, post: bool = False) -> argparse.Namespace:
+        return argparse.Namespace(
+            provider="xai",
+            model="grok-4.6",
+            prompt_file=str(mw.DEFAULT_PROMPT),
+            pr="1",
+            head_ref="pr-head",
+            output=str(Path(tmp) / "merge-warden.md"),
+            json_output=str(Path(tmp) / "merge-warden.json"),
+            post=post,
+            skip_if_missing_key=False,
+        )
+
+    def _stats(self):
+        coverage = mock.Mock(complete=True, uncovered_chunk_ids=[])
+        stats = mock.Mock(
+            deadline_exhausted=False,
+            validation_deadline_exhausted=False,
+            pre_reduce_deadline_exhausted=False,
+            reduce_deadline_exhausted=False,
+            map_deadline_exhausted=False,
+            synthesis_calls=1,
+            notes=[],
+        )
+        stats.footer.return_value = "pipeline footer"
+        return coverage, stats
+
+    def _generate(
+        self,
+        args: argparse.Namespace,
+        review: dict,
+        *,
+        post_side_effect=None,
+        files: list[dict] | None = None,
+    ) -> tuple[int, list[dict]]:
+        coverage, stats = self._stats()
+        posted: list[dict] = []
+
+        def capture_post(_repo: str, _pr: str, payload: dict):
+            posted.append(payload)
+            return payload["event"], payload.get("comments") or []
+
+        if files is None:
+            files = [_added_file("parser.c", 30)]
+        with mock.patch.dict(os.environ, {"XAI_API_KEY": "sk"}):
+            with mock.patch.object(mw, "gh_json", return_value=self.PR):
+                with mock.patch.object(mw, "collect_pr_files", return_value=files):
+                    with mock.patch.object(
+                        mw,
+                        "run",
+                        return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+                    ):
+                        with mock.patch.object(mw, "load_arch_docs", return_value=[]):
+                            with mock.patch.object(
+                                mw,
+                                "run_hierarchical_review",
+                                return_value=(review, coverage, EvidenceStore(), stats),
+                            ):
+                                post = post_side_effect or capture_post
+                                with mock.patch.object(mw, "post_review", side_effect=post):
+                                    with mock.patch.object(
+                                        mw.time, "monotonic", return_value=0.0
+                                    ):
+                                        rc = mw.generate_review(args, "o/r")
+        return rc, posted
+
+    def test_generate_review_payload_body_contains_overflow(self) -> None:
+        comments = [
+            _inline_comment(index, "blocking") for index in range(1, 26)
+        ] + [_inline_comment(26, "minor", "overflow nit")]
+        review = {
+            "event": "REQUEST_CHANGES",
+            "body": "# REQUEST CHANGES\n\nCovered defects.\n",
+            "comments": comments,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp, post=True)
+            rc, posted = self._generate(args, review)
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(payload["comments"]), 25)
+        self.assertFalse(any(item["line"] == 26 for item in payload["comments"]))
+        self.assertIn("overflow nit", payload["body"])
+        self.assertIn("**MINOR.**", payload["body"])
+        self.assertEqual(len(posted), 1)
+        self.assertIn("overflow nit", posted[0]["body"])
+        self.assertEqual(posted[0]["comments"], payload["comments"])
+
+    def test_generate_review_keeps_late_blocking_inline(self) -> None:
+        comments = [
+            _inline_comment(index, "minor") for index in range(1, 26)
+        ] + [_inline_comment(26, "blocking", "late blocker")]
+        review = {
+            "event": "REQUEST_CHANGES",
+            "body": "# REQUEST CHANGES\n\nCovered defects.\n",
+            "comments": comments,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._args(tmp)
+            rc, _posted = self._generate(args, review)
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(payload["comments"]), 25)
+        self.assertTrue(
+            any(
+                item["line"] == 26 and "**BLOCKING.**" in item["body"]
+                for item in payload["comments"]
+            )
+        )
+        self.assertIn("finding 25", payload["body"])
+
+
 class IncompletePipelinePostingTests(unittest.TestCase):
     PR = {
         "number": 1,
