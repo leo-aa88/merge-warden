@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import email.utils
+import errno
 import http.client
 import json
 import os
@@ -404,10 +405,11 @@ def http_timeout_for_deadline(
 
 
 def url_error_is_timeout(exc: urllib.error.URLError) -> bool:
+    """Classify urlopen's configured read timeout, not kernel/connect ETIMEDOUT."""
     reason = getattr(exc, "reason", None)
-    if isinstance(reason, (TimeoutError, socket.timeout)):
-        return True
-    return "timed out" in str(exc).lower()
+    if not isinstance(reason, (TimeoutError, socket.timeout)):
+        return False
+    return getattr(reason, "errno", None) != errno.ETIMEDOUT
 
 
 def provider_latency_timeout(label: str, attempts: int, request_timeout: float) -> ProviderRequestError:

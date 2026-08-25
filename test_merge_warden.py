@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import email.message
+import errno
 import http.client
 import io
 import json
@@ -1123,7 +1124,7 @@ class HttpPostRetryTests(unittest.TestCase):
         sleep.assert_not_called()
 
     def test_gives_up_after_timeout_attempts(self) -> None:
-        error = urllib.error.URLError("timed out")
+        error = urllib.error.URLError(TimeoutError("timed out"))
         with mock.patch("urllib.request.urlopen", side_effect=error) as urlopen:
             with mock.patch("time.sleep") as sleep:
                 with self.assertRaises(mw.ProviderRequestError) as ctx:
@@ -1319,9 +1320,10 @@ class ReviewDeadlineTests(unittest.TestCase):
         self.assertIn("140.0s", str(caught.exception))
         self.assertEqual(caught.exception.kind, mw.ProviderFailureKind.LATENCY_TIMEOUT)
 
-    def test_http_urlerror_timeout_raises_latency_failure(self) -> None:
+    def test_http_urlerror_timeout_reason_raises_latency_failure(self) -> None:
         with mock.patch(
-            "urllib.request.urlopen", side_effect=urllib.error.URLError("timed out")
+            "urllib.request.urlopen",
+            side_effect=urllib.error.URLError(TimeoutError("timed out")),
         ):
             with self.assertRaises(mw.ProviderRequestError) as caught:
                 mw.http_post_json(
@@ -1334,6 +1336,40 @@ class ReviewDeadlineTests(unittest.TestCase):
                 )
         self.assertIn("140.0s", str(caught.exception))
         self.assertEqual(caught.exception.kind, mw.ProviderFailureKind.LATENCY_TIMEOUT)
+
+    def test_http_urlerror_errno_timeout_remains_transport_failure(self) -> None:
+        error = urllib.error.URLError(
+            OSError(errno.ETIMEDOUT, "Connection timed out")
+        )
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(mw.ProviderRequestError) as caught:
+                mw.http_post_json(
+                    "https://example.test/v1",
+                    {"a": 1},
+                    {"h": "v"},
+                    timeout=mw.MAP_HTTP_TIMEOUT_SECONDS,
+                    attempts=mw.MAP_HTTP_ATTEMPTS,
+                    label="xAI map",
+                )
+        self.assertEqual(
+            caught.exception.kind, mw.ProviderFailureKind.TRANSIENT_TRANSPORT
+        )
+
+    def test_http_urlerror_string_timeout_remains_transport_failure(self) -> None:
+        error = urllib.error.URLError("timed out")
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(mw.ProviderRequestError) as caught:
+                mw.http_post_json(
+                    "https://example.test/v1",
+                    {"a": 1},
+                    {"h": "v"},
+                    timeout=mw.MAP_HTTP_TIMEOUT_SECONDS,
+                    attempts=mw.MAP_HTTP_ATTEMPTS,
+                    label="xAI map",
+                )
+        self.assertEqual(
+            caught.exception.kind, mw.ProviderFailureKind.TRANSIENT_TRANSPORT
+        )
 
     def test_http_non_timeout_urlerror_remains_transport_failure(self) -> None:
         error = urllib.error.URLError("Temporary failure in name resolution")
@@ -1352,7 +1388,7 @@ class ReviewDeadlineTests(unittest.TestCase):
         )
 
     def test_retry_is_refused_when_backoff_would_cross_deadline(self) -> None:
-        error = urllib.error.URLError("timed out")
+        error = urllib.error.URLError(TimeoutError("timed out"))
         with mock.patch("urllib.request.urlopen", side_effect=error) as urlopen:
             with mock.patch.object(mw.time, "monotonic", side_effect=[100.0, 100.4]):
                 with mock.patch("time.sleep") as sleep:
@@ -1366,6 +1402,70 @@ class ReviewDeadlineTests(unittest.TestCase):
                         )
         self.assertEqual(urlopen.call_count, 1)
         sleep.assert_not_called()
+
+    def test_generate_review_map_timeout_through_invoke_is_provider_failure(
+        self,
+    ) -> None:
+        pr = {
+            "number": 1,
+            "title": "t",
+            "body": "b",
+            "url": "https://example.test/pr/1",
+            "author": {"login": "alice"},
+            "baseRefName": "main",
+            "headRefName": "feat",
+            "headRefOid": "deadbeef",
+            "labels": [],
+            "closingIssuesReferences": [],
+        }
+        files = [
+            {
+                "filename": "a.c",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 1,
+                "patch": "@@ -1,1 +1,1 @@\n-old\n+new\n",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(
+                provider="xai",
+                model="grok-4.6",
+                prompt_file=str(mw.DEFAULT_PROMPT),
+                pr="1",
+                head_ref="pr-head",
+                output=str(Path(tmp) / "merge-warden.md"),
+                json_output=str(Path(tmp) / "merge-warden.json"),
+                post=False,
+                skip_if_missing_key=False,
+            )
+            with mock.patch.dict(os.environ, {"XAI_API_KEY": "sk"}):
+                with mock.patch.object(mw, "gh_json", return_value=pr):
+                    with mock.patch.object(mw, "collect_pr_files", return_value=files):
+                        with mock.patch.object(
+                            mw,
+                            "run",
+                            return_value=mock.Mock(
+                                returncode=0,
+                                stdout="diff --git a/a.c b/a.c\n"
+                                "@@ -1,1 +1,1 @@\n-old\n+new\n",
+                                stderr="",
+                            ),
+                        ):
+                            with mock.patch.object(mw, "load_arch_docs", return_value=[]):
+                                with mock.patch(
+                                    "urllib.request.urlopen",
+                                    side_effect=TimeoutError("timed out"),
+                                ):
+                                    rc = mw.generate_review(args, "o/r")
+            markdown = Path(args.output).read_text(encoding="utf-8")
+            payload = json.loads(Path(args.json_output).read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(payload["event"], "COMMENT")
+        self.assertEqual(payload.get("comments") or [], [])
+        self.assertIn("could not complete a full review", markdown)
+        self.assertIn("map batch", markdown)
+        self.assertNotIn("Review deadline exhausted", markdown)
 
 
 class PromptBudgetTests(unittest.TestCase):
