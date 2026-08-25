@@ -34,6 +34,7 @@ from review_pipeline import (
     DEFAULT_PROMPT_MAP,
     DEFAULT_PROMPT_REDUCE,
     DEFAULT_VALIDATION_CONCURRENCY,
+    MAP_CALL_BUDGET_MARGIN_SECONDS,
     MAP_CALL_BUDGET_SECONDS,
     MAP_HTTP_ATTEMPTS,
     MAP_HTTP_TIMEOUT_SECONDS,
@@ -49,6 +50,7 @@ from review_pipeline import (
     apply_incomplete_validation_guard,
     canonical_severity,
     finding_record,
+    map_call_timeout_override,
     map_stage_deadline,
     normalize_event,
     normalize_map_concurrency,
@@ -117,6 +119,10 @@ MAX_COMMENTS = 25
 MAX_COMMENT_CHARS = 8000
 MAX_LINKED_ISSUES = 20
 RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
+# Explicit load-shedding signals. These carry Retry-After and mean "come back
+# later", not "send a smaller request", so the scheduler backs off instead of
+# splitting the batch.
+CAPACITY_HTTP_CODES = {429, 503}
 HTTP_ATTEMPTS = 3
 HTTP_TIMEOUT_SECONDS = 300
 MAX_RETRY_AFTER_SECONDS = 60
@@ -401,8 +407,16 @@ def provider_call_limits(stage: str) -> tuple[float, int, float | None]:
     Map uses a tighter per-call budget so a slow batch splits while
     downstream stage reserves are still intact. Other stages keep the
     global HTTP timeout and retry the same shape a few times.
+
+    A map worker retrying a latency timeout may widen this one call via
+    ``map_call_timeout_override``. The budget widens with the timeout, since a
+    longer socket timeout under the standard budget would be clipped back to
+    the length that already failed.
     """
     if stage == "map":
+        override = map_call_timeout_override.get()
+        if override is not None:
+            return override, MAP_HTTP_ATTEMPTS, override + MAP_CALL_BUDGET_MARGIN_SECONDS
         return MAP_HTTP_TIMEOUT_SECONDS, MAP_HTTP_ATTEMPTS, MAP_CALL_BUDGET_SECONDS
     return HTTP_TIMEOUT_SECONDS, HTTP_ATTEMPTS, None
 
@@ -490,6 +504,50 @@ def provider_latency_timeout(label: str, attempts: int, request_timeout: float) 
             f"(last timeout {request_timeout:.1f}s)"
         ),
     )
+
+
+def provider_http_error(
+    label: str,
+    code: int,
+    detail: str,
+    retry_after: str | None,
+) -> ProviderRequestError:
+    """Classify a retryable HTTP status for the map scheduler.
+
+    429 and 503 are capacity signals: the request shape is fine and the
+    provider is asking for a delay. Every other retryable code stays a
+    transport failure and keeps the existing retry-then-split handling.
+    """
+    message = f"{label} HTTP {code}: {detail}"
+    if code in CAPACITY_HTTP_CODES:
+        return ProviderRequestError(
+            ProviderFailureKind.CAPACITY,
+            message,
+            retry_after_seconds=parse_retry_after(retry_after),
+        )
+    return ProviderRequestError(ProviderFailureKind.TRANSIENT_TRANSPORT, message)
+
+
+def latency_retry_fits(
+    timeout: float,
+    deadline: float | None,
+    delay: float = 0.0,
+) -> bool:
+    """Whether a full-length retry still fits before ``deadline``.
+
+    A latency timeout means the request needed more time than it was given.
+    Retrying under a clamped, shorter timeout cannot succeed, so the call
+    fails now and lets the caller re-issue it with a fresh budget instead of
+    burning the remainder of this one.
+
+    This governs the multi-attempt stages only. Map takes a single HTTP
+    attempt, so its timeouts return to the scheduler immediately, which may
+    then re-send the batch under a widened clock.
+    """
+    remaining = remaining_deadline_seconds(deadline)
+    if remaining is None:
+        return True
+    return remaining >= float(delay) + float(timeout)
 
 
 def compute_review_deadlines(
@@ -971,6 +1029,7 @@ def http_post_json(
         )
         retry_after = None
         last_error: BaseException | None = None
+        latency_timeout = False
         request_timeout = http_timeout_for_deadline(timeout, deadline, label=label)
         try:
             with urllib.request.urlopen(request, timeout=request_timeout) as response:
@@ -988,25 +1047,24 @@ def http_post_json(
             if exc.code not in RETRYABLE_HTTP_CODES:
                 raise RuntimeError(f"{label} HTTP {exc.code}: {detail}") from exc
             if attempt == attempts:
-                raise ProviderRequestError(
-                    ProviderFailureKind.TRANSIENT_TRANSPORT,
-                    f"{label} HTTP {exc.code}: {detail}",
-                ) from exc
+                raise provider_http_error(label, exc.code, detail, retry_after) from exc
             error = f"HTTP {exc.code}"
             last_error = exc
         except RequestDeadlineExceeded:
             raise
         except (TimeoutError, socket.timeout) as exc:
             if attempt == attempts:
-                raise provider_latency_timeout(label, attempts, request_timeout) from exc
+                raise provider_latency_timeout(label, attempt, request_timeout) from exc
             error = str(exc)
             last_error = exc
+            latency_timeout = True
         except urllib.error.URLError as exc:
             if url_error_is_timeout(exc):
                 if attempt == attempts:
-                    raise provider_latency_timeout(label, attempts, request_timeout) from exc
+                    raise provider_latency_timeout(label, attempt, request_timeout) from exc
                 error = str(exc)
                 last_error = exc
+                latency_timeout = True
             elif attempt == attempts:
                 raise ProviderRequestError(
                     ProviderFailureKind.TRANSIENT_TRANSPORT,
@@ -1034,6 +1092,13 @@ def http_post_json(
             raise RequestDeadlineExceeded(
                 f"{label} retry would cross the review deadline "
                 f"({max(remaining, 0.0):.1f}s remaining)"
+            ) from last_error
+        if latency_timeout and not latency_retry_fits(timeout, deadline, delay):
+            # There is room to wait but not to give the request the full clock
+            # it already proved it needs. Surface it so the caller can re-issue
+            # with a fresh budget rather than spend this one on a doomed retry.
+            raise provider_latency_timeout(
+                label, attempt, request_timeout
             ) from last_error
         delay_display = int(delay) if float(delay).is_integer() else delay
         print(

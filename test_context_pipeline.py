@@ -44,7 +44,11 @@ from review_pipeline import (
     CANDIDATE_FINDINGS_NOT_POSTED,
     DEFAULT_MAP_CONCURRENCY,
     DEFAULT_VALIDATION_CONCURRENCY,
+    MAP_CAPACITY_BACKOFF_SECONDS,
+    MAP_CAPACITY_RETRIES,
+    MAP_HTTP_TIMEOUT_SECONDS,
     MAP_MISSING_CHUNK_RETRIES,
+    MAP_TRANSPORT_RETRIES,
     MAX_MAP_ATTEMPTS,
     MAX_MAP_CHUNKS_PER_CALL,
     MAX_MAP_CONCURRENCY,
@@ -4249,11 +4253,13 @@ class MapSchedulerInvariantTests(unittest.TestCase):
             )
 
         _review, coverage, _store, stats = _run_hierarchical(corpus, fake)
-        self.assertEqual(shapes, [1])
+        # Retries are bounded by the per-chunk ceiling, then the chunk is
+        # abandoned and coverage stays incomplete.
+        self.assertEqual(shapes, [1] * (MAP_MISSING_CHUNK_RETRIES + 1))
         self.assertFalse(coverage.complete)
-        self.assertEqual(stats.map_attempts, 1)
+        self.assertEqual(stats.map_attempts, MAP_MISSING_CHUNK_RETRIES + 1)
 
-    def test_single_chunk_transport_failure_retries_once(self) -> None:
+    def test_single_chunk_transport_failure_retries_until_ceiling(self) -> None:
         chunks = _tiny_chunks(1)
         corpus = _synthetic_corpus(chunks)
         shapes: list[int] = []
@@ -4274,9 +4280,49 @@ class MapSchedulerInvariantTests(unittest.TestCase):
             )
 
         _review, coverage, _store, stats = _run_hierarchical(corpus, fake)
-        self.assertEqual(shapes, [1, 1])
+        # A single chunk has nothing to split into, so the transport ceiling is
+        # terminal: there is no handoff to the missing-chunk floor below it.
+        self.assertEqual(len(shapes), MAP_TRANSPORT_RETRIES + 1)
+        self.assertEqual(set(shapes), {1})
         self.assertFalse(coverage.complete)
-        self.assertEqual(stats.map_attempts, 2)
+        self.assertEqual(stats.map_attempts, MAP_TRANSPORT_RETRIES + 1)
+
+    def test_capacity_rejection_retries_the_same_shape_instead_of_splitting(
+        self,
+    ) -> None:
+        """Capacity says nothing about size, so halving the request is wrong."""
+        chunks = _tiny_chunks(4)
+        corpus = _synthetic_corpus(chunks)
+        clock = {"now": 10_000.0}
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                shapes.append(len(ids))
+                if len(shapes) == 1:
+                    raise ProviderRequestError(
+                        ProviderFailureKind.CAPACITY,
+                        "Gemini HTTP 503: high demand",
+                    )
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        def fake_sleep(seconds: float) -> None:
+            clock["now"] += seconds
+
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            with mock.patch.object(rp.time, "sleep", fake_sleep):
+                _review, coverage, _store, stats = _run_hierarchical(corpus, fake)
+        self.assertEqual(shapes, [4, 4])
+        self.assertEqual(stats.map_batches_split, 0)
+        self.assertEqual(stats.map_capacity_retries, 1)
+        self.assertTrue(coverage.complete)
 
     def test_child_batches_are_not_started_after_map_cutoff(self) -> None:
         chunks = _tiny_chunks(8)
@@ -5663,6 +5709,766 @@ class SerializedRequestBudgetTests(unittest.TestCase):
         self.assertIn("could not complete a full review", review["body"])
 
 
+class MapRetryBudgetTests(unittest.TestCase):
+    """Retries are bounded by the map budget, not by a fixed counter.
+
+    Both regressions below are real production failures: a single chunk was
+    abandoned while minutes of map budget were still unspent, which forced
+    coverage incomplete and a COMMENT verdict. Each is paired with its
+    inverse, where the budget really is gone and abandoning is correct, so
+    "retry forever" cannot pass this suite.
+    """
+
+    def _clocked_run(self, corpus, fake, clock, deadline, **kwargs):
+        slept: list[float] = []
+
+        def fake_sleep(seconds: float) -> None:
+            slept.append(seconds)
+            clock["now"] += seconds
+
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            with mock.patch.object(rp.time, "sleep", fake_sleep):
+                outcome = _run_hierarchical(corpus, fake, deadline=deadline, **kwargs)
+        return outcome, slept
+
+    @staticmethod
+    def _separate_batch_chunks(count: int) -> list[ContextChunk]:
+        """Chunks large enough that packing gives each its own map batch."""
+        size = MAP_SOFT_REQUEST_TARGET_CHARS - 1_000
+        return [
+            _chunk(f"C{index}", f"c{index}.c", "x" * size)
+            for index in range(1, count + 1)
+        ]
+
+    @staticmethod
+    def _single_chunk_model(clock, attempts, failure, cost, fail_times):
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                attempts.append(rp.map_call_timeout_override.get())
+                if len(attempts) <= fail_times:
+                    clock["now"] += cost
+                    raise failure()
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        return fake
+
+    def test_capacity_rejection_retries_while_the_budget_allows(self) -> None:
+        """gombit run 32850191741: 503s abandoned with ~183s of map left."""
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        attempts: list[float | None] = []
+        fake = self._single_chunk_model(
+            clock,
+            attempts,
+            lambda: ProviderRequestError(
+                ProviderFailureKind.CAPACITY, "Gemini HTTP 503: high demand"
+            ),
+            cost=24.0,
+            fail_times=4,
+        )
+
+        (_review, coverage, _store, stats), slept = self._clocked_run(
+            corpus, fake, clock, deadline
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(len(attempts), 5)
+        self.assertEqual(stats.map_capacity_retries, 4)
+        self.assertEqual(slept, [4.0, 8.0, 16.0, 30.0])
+
+    def test_capacity_rejection_stops_when_the_budget_cannot_fund_a_retry(
+        self,
+    ) -> None:
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        attempts: list[float | None] = []
+        fake = self._single_chunk_model(
+            clock,
+            attempts,
+            lambda: ProviderRequestError(
+                ProviderFailureKind.CAPACITY, "Gemini HTTP 503: high demand"
+            ),
+            cost=150.0,
+            fail_times=99,
+        )
+
+        (review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline
+        )
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+        # It must retry once (abandoning on the first 503 is the bug being
+        # fixed) and then stop on budget, well short of the retry ceiling.
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(stats.map_capacity_retries, 1)
+        self.assertLess(stats.map_capacity_retries, MAP_CAPACITY_RETRIES)
+        self.assertTrue(
+            any("uncovered after 1 capacity retry" in note for note in stats.notes),
+            stats.notes,
+        )
+
+    def test_capacity_retry_is_refused_when_backoff_would_leave_less_than_a_call(
+        self,
+    ) -> None:
+        """A Retry-After that would leave 149s must not be slept out.
+
+        Planning and the sleep gate both size the leftover against
+        ``map_call_seconds_needed``. Sleeping 4s and then skipping the retry
+        would burn time validation could still use.
+        """
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        delay = MAP_CAPACITY_BACKOFF_SECONDS[0]
+        leftover = rp.map_call_seconds_needed() - 1.0
+        attempts: list[float | None] = []
+        fake = self._single_chunk_model(
+            clock,
+            attempts,
+            lambda: ProviderRequestError(
+                ProviderFailureKind.CAPACITY,
+                "Gemini HTTP 503: high demand",
+                retry_after_seconds=delay,
+            ),
+            cost=420.0 - leftover - delay,
+            fail_times=99,
+        )
+
+        (_review, coverage, _store, stats), slept = self._clocked_run(
+            corpus, fake, clock, deadline
+        )
+        self.assertFalse(coverage.complete)
+        self.assertEqual(attempts, [None])
+        self.assertEqual(slept, [])
+        self.assertEqual(stats.map_capacity_retries, 0)
+
+    def test_capacity_retry_waits_when_the_dispatch_envelope_still_fits(
+        self,
+    ) -> None:
+        """The inverse: leftover exactly equal to a call budget must still sleep."""
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        delay = MAP_CAPACITY_BACKOFF_SECONDS[0]
+        leftover = rp.map_call_seconds_needed()
+        attempts: list[float | None] = []
+        fake = self._single_chunk_model(
+            clock,
+            attempts,
+            lambda: ProviderRequestError(
+                ProviderFailureKind.CAPACITY,
+                "Gemini HTTP 503: high demand",
+                retry_after_seconds=delay,
+            ),
+            cost=420.0 - leftover - delay,
+            fail_times=1,
+        )
+
+        (_review, coverage, _store, stats), slept = self._clocked_run(
+            corpus, fake, clock, deadline
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(slept, [delay])
+        self.assertEqual(stats.map_capacity_retries, 1)
+
+    def test_multi_chunk_capacity_failure_never_splits(self) -> None:
+        """Splitting doubles the request rate against a load-shedding provider.
+
+        It would also mint fresh retry signatures, resetting the per-request
+        ceiling and letting one flapping batch sleep away the map stage.
+        """
+        corpus = _synthetic_corpus(_tiny_chunks(4))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                shapes.append(len(_chunk_ids_in_prompt(user)))
+                raise ProviderRequestError(
+                    ProviderFailureKind.CAPACITY, "Gemini HTTP 503: high demand"
+                )
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        (review, coverage, _store, stats), slept = self._clocked_run(
+            corpus, fake, clock, deadline
+        )
+        self.assertEqual(set(shapes), {4})
+        self.assertEqual(stats.map_batches_split, 0)
+        self.assertEqual(len(shapes), MAP_CAPACITY_RETRIES + 1)
+        self.assertEqual(slept, list(MAP_CAPACITY_BACKOFF_SECONDS))
+        self.assertLessEqual(sum(slept), rp.MAX_MAP_CAPACITY_SLEEP_SECONDS)
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+
+    def test_stage_wide_backoff_cap_bounds_several_deferred_batches(self) -> None:
+        """Per-request ceilings do not bound several batches deferred at once.
+
+        Four independent batches are rejected for capacity with the maximum
+        Retry-After. Each honored deferral commits 60s, so only two fit under
+        the 120s stage cap and the rest must be abandoned rather than allowed
+        to sleep away time the later stages have reserved.
+        """
+        corpus = _synthetic_corpus(self._separate_batch_chunks(4))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        rejected: set[tuple[str, ...]] = set()
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                key = tuple(ids)
+                if key not in rejected:
+                    rejected.add(key)
+                    raise ProviderRequestError(
+                        ProviderFailureKind.CAPACITY,
+                        "Gemini HTTP 503: high demand",
+                        retry_after_seconds=rp.MAX_MAP_CAPACITY_BACKOFF_SECONDS,
+                    )
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        (review, coverage, _store, stats), slept = self._clocked_run(
+            corpus, fake, clock, deadline, map_concurrency=4
+        )
+        affordable = int(
+            rp.MAX_MAP_CAPACITY_SLEEP_SECONDS // rp.MAX_MAP_CAPACITY_BACKOFF_SECONDS
+        )
+        # Exactly the deferrals the cap can pay for, and no more. Without the
+        # cap all four would be retried.
+        self.assertEqual(stats.map_capacity_retries, affordable)
+        self.assertTrue(slept)
+        self.assertLessEqual(sum(slept), rp.MAX_MAP_CAPACITY_SLEEP_SECONDS)
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(
+            len(coverage.uncovered_chunk_ids), len(corpus.chunks) - affordable
+        )
+
+    def test_widened_retry_queued_behind_work_rechecks_its_own_budget(
+        self,
+    ) -> None:
+        """The dispatch gate must use the item's budget, not the constant.
+
+        A widened retry is affordable when planned, then sibling batches spend
+        the stage down while it waits in the queue. At dispatch there is still
+        room for a standard call but not for the widened one, so gating on the
+        constant would send it and let the deadline clamp it straight back to
+        the clock that already timed out.
+        """
+        corpus = _synthetic_corpus(self._separate_batch_chunks(3))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        map_cutoff = map_stage_deadline(deadline)
+        dispatched: list[tuple[str, float | None, float]] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                dispatched.append(
+                    (
+                        ",".join(ids),
+                        rp.map_call_timeout_override.get(),
+                        map_cutoff - clock["now"],
+                    )
+                )
+                if ids == ["C1"]:
+                    clock["now"] += MAP_HTTP_TIMEOUT_SECONDS
+                    raise ProviderRequestError(
+                        ProviderFailureKind.LATENCY_TIMEOUT, "timed out"
+                    )
+                # Siblings spend the stage down while the retry is queued.
+                clock["now"] += 40.0 if ids == ["C2"] else 60.0
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        (review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline, map_concurrency=1
+        )
+        # Whatever else happened, no widened call ran without its own budget.
+        for name, override, remaining in dispatched:
+            if override is None:
+                continue
+            self.assertGreaterEqual(
+                remaining,
+                override + rp.MAP_CALL_BUDGET_MARGIN_SECONDS,
+                f"{name} dispatched with {remaining}s for a {override}s clock",
+            )
+        self.assertIn("C1", coverage.uncovered_chunk_ids)
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertTrue(
+            any("widened retry no longer fits" in note for note in stats.notes),
+            stats.notes,
+        )
+
+    def test_unaffordable_widened_retry_is_refused_not_downgraded(self) -> None:
+        """When the stage cannot fund the escalation, abandon the chunk.
+
+        Re-sending under the clock that already timed out would spend the rest
+        of the stage proving the same thing, so the chunk is left uncovered and
+        the review fail-closes instead.
+        """
+        corpus = _synthetic_corpus(self._separate_batch_chunks(2))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        map_cutoff = map_stage_deadline(deadline)
+        dispatched: list[float | None] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                dispatched.append(rp.map_call_timeout_override.get())
+                if ids == ["C1"]:
+                    # Leave a standard call budget, less than a widened retry.
+                    clock["now"] = map_cutoff - MAP_CALL_BUDGET_SECONDS
+                    raise ProviderRequestError(
+                        ProviderFailureKind.LATENCY_TIMEOUT, "timed out"
+                    )
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        (review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline, map_concurrency=1
+        )
+        # C1 was never re-sent, under any clock.
+        self.assertEqual(dispatched.count(None), len(dispatched))
+        self.assertEqual(stats.map_latency_retries, 0)
+        self.assertIn("C1", coverage.uncovered_chunk_ids)
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertTrue(
+            any("no budget for a longer retry" in note for note in stats.notes),
+            stats.notes,
+        )
+
+    def test_deferred_batch_does_not_strand_sequential_ingest(self) -> None:
+        """Out-of-order dispatch must not let `next_ingest` skip live work.
+
+        Ingestion is strictly sequential, but capacity deferral dispatches out
+        of sequence. If the scheduler advances past a sequence that is merely
+        waiting out a backoff, that result lands in `completed` behind the
+        cursor and is never read: the loop never drains and never exits. This
+        hangs the whole action rather than fail-closing, so it is guarded with
+        a bounded join instead of asserting on the result alone.
+        """
+        corpus = _synthetic_corpus(self._separate_batch_chunks(2))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        rejected: set[tuple[str, ...]] = set()
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                key = tuple(ids)
+                if key not in rejected:
+                    rejected.add(key)
+                    # Different Retry-After values make the second batch
+                    # dispatch and finish while the first is still deferred.
+                    raise ProviderRequestError(
+                        ProviderFailureKind.CAPACITY,
+                        "Gemini HTTP 503: high demand",
+                        retry_after_seconds=40.0 if ids == ["C1"] else 5.0,
+                    )
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        box: dict[str, object] = {}
+        finished = threading.Event()
+
+        def run() -> None:
+            try:
+                box["outcome"], _slept = self._clocked_run(
+                    corpus, fake, clock, deadline, map_concurrency=2
+                )
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        self.assertTrue(
+            finished.wait(30.0), "map scheduler did not terminate"
+        )
+        _review, coverage, _store, _stats = box["outcome"]
+        self.assertTrue(coverage.complete)
+
+    def test_scheduler_ingests_finished_work_before_sleeping(self) -> None:
+        """A backoff must not stall results that are already back.
+
+        C1 is deferred for capacity while C2's malformed response sits in the
+        completed queue. Ingesting C2 releases its retry immediately, so the
+        scheduler must drain what it already has before sleeping out C1's
+        backoff. Sleeping first idles every worker for the whole delay.
+        """
+        corpus = _synthetic_corpus(self._separate_batch_chunks(2))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        events: list[str] = []
+        rejected: set[str] = set()
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                ids = _chunk_ids_in_prompt(user)
+                events.append(f"call:{','.join(ids)}")
+                if ids == ["C1"] and "C1" not in rejected:
+                    rejected.add("C1")
+                    raise ProviderRequestError(
+                        ProviderFailureKind.CAPACITY,
+                        "Gemini HTTP 503: high demand",
+                        retry_after_seconds=rp.MAX_MAP_CAPACITY_BACKOFF_SECONDS,
+                    )
+                if ids == ["C2"] and "C2" not in rejected:
+                    rejected.add("C2")
+                    return "definitely not JSON {"
+                return _map_chunks_json(ids)
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        def fake_sleep(seconds: float) -> None:
+            events.append(f"sleep:{seconds}")
+            clock["now"] += seconds
+
+        with mock.patch.object(rp.time, "monotonic", lambda: clock["now"]):
+            with mock.patch.object(rp.time, "sleep", fake_sleep):
+                _review, coverage, _store, _stats = _run_hierarchical(
+                    corpus, fake, deadline=deadline, map_concurrency=1
+                )
+        sleeps = [index for index, event in enumerate(events) if event.startswith("sleep:")]
+        self.assertTrue(sleeps, events)
+        # C2's retry was dispatchable the moment its result was ingested, so it
+        # must not wait behind C1's backoff.
+        self.assertEqual(events.count("call:C2"), 2, events)
+        second_c2 = [
+            index for index, event in enumerate(events) if event == "call:C2"
+        ][1]
+        self.assertLess(second_c2, sleeps[0], events)
+        self.assertTrue(coverage.complete)
+
+    def test_single_chunk_latency_timeout_is_retried_with_a_longer_clock(
+        self,
+    ) -> None:
+        """brainrot run 32837289271: one timeout, zero retries, ~228s left."""
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        attempts: list[float | None] = []
+        fake = self._single_chunk_model(
+            clock,
+            attempts,
+            lambda: ProviderRequestError(
+                ProviderFailureKind.LATENCY_TIMEOUT,
+                "xAI request timed out after 1 attempts",
+            ),
+            cost=MAP_HTTP_TIMEOUT_SECONDS,
+            fail_times=1,
+        )
+
+        map_cutoff = map_stage_deadline(deadline)
+        budget_at_dispatch: list[tuple[float | None, float]] = []
+
+        def recording(system: str, user: str) -> str:
+            budget_at_dispatch.append(
+                (rp.map_call_timeout_override.get(), map_cutoff - clock["now"])
+            )
+            return fake(system, user)
+
+        (_review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, recording, clock, deadline
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(stats.map_latency_retries, 1)
+        # The retry runs under a widened clock; the first attempt does not.
+        self.assertEqual(attempts, [None, MAP_HTTP_TIMEOUT_SECONDS * 1.5])
+        widened = [
+            (override, remaining)
+            for override, remaining in budget_at_dispatch
+            if override is not None
+        ]
+        self.assertEqual(len(widened), 1)
+        # It was dispatched with room for the whole widened call, not clamped
+        # back to the clock that already timed out.
+        override, remaining = widened[0]
+        self.assertGreaterEqual(
+            remaining, override + rp.MAP_CALL_BUDGET_MARGIN_SECONDS
+        )
+
+    def test_single_chunk_latency_timeout_stops_without_budget_to_widen(
+        self,
+    ) -> None:
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 10_000.0}
+        deadline = clock["now"] + 840.0
+        attempts: list[float | None] = []
+        fake = self._single_chunk_model(
+            clock,
+            attempts,
+            lambda: ProviderRequestError(
+                ProviderFailureKind.LATENCY_TIMEOUT,
+                "xAI request timed out after 1 attempts",
+            ),
+            # Leaves 120s of the 420s map stage: not enough for a longer retry.
+            cost=300.0,
+            fail_times=99,
+        )
+
+        (review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline
+        )
+        self.assertFalse(coverage.complete)
+        self.assertEqual(review["event"], "COMMENT")
+        self.assertEqual(attempts, [None])
+        self.assertEqual(stats.map_latency_retries, 0)
+        self.assertTrue(
+            any("no budget for a longer retry" in note for note in stats.notes),
+            stats.notes,
+        )
+
+    def test_ceilings_still_bind_when_the_budget_is_unbounded(self) -> None:
+        """Without a deadline, only the ceilings stop an always-failing chunk."""
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 0.0}
+        attempts: list[float | None] = []
+        fake = self._single_chunk_model(
+            clock,
+            attempts,
+            lambda: ProviderRequestError(
+                ProviderFailureKind.CAPACITY, "Gemini HTTP 503: high demand"
+            ),
+            cost=0.0,
+            fail_times=99,
+        )
+
+        (_review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, None
+        )
+        self.assertFalse(coverage.complete)
+        self.assertLess(stats.map_attempts, MAX_MAP_ATTEMPTS)
+        # Capacity is terminal once its ladder is spent: it does not fall
+        # through to the single-chunk floor for a second round of retries.
+        self.assertEqual(len(attempts), MAP_CAPACITY_RETRIES + 1)
+
+    def test_retry_budget_refuses_what_it_cannot_afford(self) -> None:
+        unlimited = rp.RetryBudget(remaining_seconds=None, attempts_left=1)
+        self.assertTrue(unlimited.can_fund(10_000.0))
+        no_attempts = rp.RetryBudget(remaining_seconds=10_000.0, attempts_left=0)
+        self.assertFalse(no_attempts.can_fund())
+        standard = rp.map_call_seconds_needed()
+        exact = rp.RetryBudget(remaining_seconds=standard, attempts_left=5)
+        self.assertTrue(exact.can_fund())
+        self.assertFalse(
+            rp.RetryBudget(
+                remaining_seconds=standard - 0.5, attempts_left=5
+            ).can_fund()
+        )
+        # Backoff is paid before the call, so it is part of what must fit.
+        self.assertFalse(exact.can_fund(delay_seconds=1.0))
+        self.assertTrue(
+            rp.RetryBudget(
+                remaining_seconds=standard + 30.0, attempts_left=5
+            ).can_fund(delay_seconds=30.0)
+        )
+
+    def test_planner_and_dispatcher_ask_one_budget_question(self) -> None:
+        """Planning must never fund a retry the dispatch gate would refuse.
+
+        ``map_call_seconds_needed`` is the dispatch contract. Pinning
+        ``can_fund`` to it exactly means a second, more optimistic margin
+        cannot be reintroduced on the planning side without failing here.
+        """
+        for timeout in (
+            None,
+            MAP_HTTP_TIMEOUT_SECONDS,
+            MAP_HTTP_TIMEOUT_SECONDS * 1.5,
+            rp.MAP_MAX_HTTP_TIMEOUT_SECONDS,
+        ):
+            needed = rp.map_call_seconds_needed(timeout)
+            with self.subTest(timeout=timeout):
+                self.assertTrue(
+                    rp.RetryBudget(
+                        remaining_seconds=needed, attempts_left=4
+                    ).can_fund(timeout)
+                )
+                self.assertFalse(
+                    rp.RetryBudget(
+                        remaining_seconds=needed - 0.5, attempts_left=4
+                    ).can_fund(timeout)
+                )
+
+    def test_widened_retry_is_refused_inside_the_old_planning_gap(self) -> None:
+        """A 210s retry planned at 217s remaining was skipped at dispatch.
+
+        The planner allowed ``escalated + 5`` while dispatch demanded
+        ``escalated + 10``, so this window planned, logged and enqueued a retry
+        that could never run. One funding formula closes it.
+        """
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 10_000.0}
+        # 357s of map stage; one 140s timeout leaves exactly 217s.
+        deadline = clock["now"] + 777.0
+        attempts: list[float | None] = []
+        fake = self._single_chunk_model(
+            clock,
+            attempts,
+            lambda: ProviderRequestError(
+                ProviderFailureKind.LATENCY_TIMEOUT,
+                "xAI request timed out after 1 attempts",
+            ),
+            cost=MAP_HTTP_TIMEOUT_SECONDS,
+            fail_times=1,
+        )
+
+        (_review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline
+        )
+        self.assertFalse(coverage.complete)
+        self.assertEqual(attempts, [None])
+        self.assertEqual(stats.map_latency_retries, 0)
+        notes = " | ".join(stats.notes)
+        self.assertIn("no budget for a longer retry", notes)
+        # The planner must not announce a retry it cannot fund, and no batch
+        # may be enqueued only for the dispatch gate to skip it.
+        self.assertNotIn("retrying with a", notes)
+        self.assertNotIn("no longer fits the map budget", notes)
+
+    def test_widened_retry_runs_when_it_exactly_fits(self) -> None:
+        """The inverse: at exactly the dispatch cost the retry must still run.
+
+        Without this, refusing every widened retry would pass the test above.
+        """
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 10_000.0}
+        # 360s of map stage; one 140s timeout leaves exactly the 220s a 210s
+        # widened call costs to dispatch.
+        deadline = clock["now"] + 780.0
+        attempts: list[float | None] = []
+        fake = self._single_chunk_model(
+            clock,
+            attempts,
+            lambda: ProviderRequestError(
+                ProviderFailureKind.LATENCY_TIMEOUT,
+                "xAI request timed out after 1 attempts",
+            ),
+            cost=MAP_HTTP_TIMEOUT_SECONDS,
+            fail_times=1,
+        )
+
+        (_review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(attempts, [None, MAP_HTTP_TIMEOUT_SECONDS * 1.5])
+        self.assertEqual(stats.map_latency_retries, 1)
+
+    def test_transport_split_children_inherit_the_parent_retry_spend(
+        self,
+    ) -> None:
+        """Per-chunk keying: a split must not mint a fresh retry ladder.
+
+        Transport is the only path that both retries the same shape and then
+        splits, so it is the only one that can catch a regression to keying on
+        the request signature.
+        """
+        corpus = _synthetic_corpus(_tiny_chunks(2))
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                shapes.append(len(_chunk_ids_in_prompt(user)))
+                raise ProviderRequestError(
+                    ProviderFailureKind.TRANSIENT_TRANSPORT,
+                    "connection reset after 0.5s",
+                )
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        _review, coverage, _store, stats = _run_hierarchical(corpus, fake)
+        # The parent spends the whole ladder, then splits once. Each child
+        # inherits that spend, so neither gets retries of its own. Keyed on
+        # the request signature instead, each child would start at zero.
+        self.assertEqual(shapes, [2] * (MAP_TRANSPORT_RETRIES + 1) + [1, 1])
+        self.assertEqual(stats.map_batches_split, 1)
+        self.assertEqual(stats.map_attempts, MAP_TRANSPORT_RETRIES + 3)
+        self.assertFalse(coverage.complete)
+
+    def test_capacity_backoff_prefers_retry_after_and_clamps_it(self) -> None:
+        self.assertEqual(rp.capacity_backoff_seconds(0, 12.0), 12.0)
+        self.assertEqual(
+            rp.capacity_backoff_seconds(0, 5_000.0),
+            rp.MAX_MAP_CAPACITY_BACKOFF_SECONDS,
+        )
+        self.assertEqual(
+            rp.capacity_backoff_seconds(0, None), MAP_CAPACITY_BACKOFF_SECONDS[0]
+        )
+        self.assertEqual(
+            rp.capacity_backoff_seconds(99, None), MAP_CAPACITY_BACKOFF_SECONDS[-1]
+        )
+        # A zero or negative Retry-After must not defeat the backoff.
+        self.assertEqual(
+            rp.capacity_backoff_seconds(0, 0.0), MAP_CAPACITY_BACKOFF_SECONDS[0]
+        )
+
+    def test_escalated_timeout_grows_but_stays_capped(self) -> None:
+        budget = rp.RetryBudget(remaining_seconds=10_000.0, attempts_left=4)
+        self.assertEqual(
+            rp.escalated_map_timeout(MAP_HTTP_TIMEOUT_SECONDS, budget),
+            MAP_HTTP_TIMEOUT_SECONDS * 1.5,
+        )
+        self.assertEqual(
+            rp.escalated_map_timeout(150.0, budget),
+            min(150.0 * 1.5, rp.MAP_MAX_HTTP_TIMEOUT_SECONDS),
+        )
+        starved = rp.RetryBudget(remaining_seconds=30.0, attempts_left=4)
+        self.assertIsNone(rp.escalated_map_timeout(MAP_HTTP_TIMEOUT_SECONDS, starved))
+        # At the cap there is nothing left to grant, so do not repeat the same
+        # doomed call under a new batch tag.
+        self.assertIsNone(
+            rp.escalated_map_timeout(rp.MAP_MAX_HTTP_TIMEOUT_SECONDS, budget)
+        )
+        self.assertIsNone(rp.escalated_map_timeout(10_000.0, budget))
+
+
 def _tiny_chunks(count: int, prefix: str = "C") -> list[ContextChunk]:
     width = len(str(count))
     return [
@@ -5717,7 +6523,6 @@ class MapFanoutAndDegradationTests(unittest.TestCase):
         self.assertEqual(stats.map_non_json_responses, 1)
         self.assertEqual(stats.map_calls_succeeded, 1)
         self.assertEqual(review["event"], "COMMENT")
-        self.assertEqual(MAP_MISSING_CHUNK_RETRIES, 1)
 
     def test_non_json_multi_chunk_response_degrades_batch(self) -> None:
         chunks = _tiny_chunks(4)
