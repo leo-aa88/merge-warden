@@ -639,8 +639,8 @@ class PostReviewTests(unittest.TestCase):
             return {"id": 1}
 
         with mock.patch.object(mw, "gh_api", side_effect=fake_gh_api), mock.patch.object(
-            mw, "delete_previous_comments"
-        ):
+            mw, "gh_api_paginate_items", return_value=[]
+        ), mock.patch.object(mw, "run"):
             event, posted = mw.post_review(
                 "o/r",
                 "1",
@@ -666,8 +666,8 @@ class PostReviewTests(unittest.TestCase):
             return {"id": 1}
 
         with mock.patch.object(mw, "gh_api", side_effect=fake_gh_api), mock.patch.object(
-            mw, "delete_previous_comments"
-        ):
+            mw, "gh_api_paginate_items", return_value=[]
+        ), mock.patch.object(mw, "run"):
             event, posted = mw.post_review(
                 "o/r",
                 "1",
@@ -704,8 +704,8 @@ class PostReviewTests(unittest.TestCase):
             return {"id": 1}
 
         with mock.patch.object(mw, "gh_api", side_effect=fake_gh_api), mock.patch.object(
-            mw, "delete_previous_comments"
-        ):
+            mw, "gh_api_paginate_items", return_value=[]
+        ), mock.patch.object(mw, "run"):
             event, posted = mw.post_review(
                 "o/r",
                 "224",
@@ -728,6 +728,168 @@ class PostReviewTests(unittest.TestCase):
                 ("COMMENT", 1, True),
                 ("COMMENT", 0, False),
             ],
+        )
+
+    def _record_github_ops(
+        self,
+        ops: list[tuple],
+        review_comments: list[dict],
+        issue_comments: list[dict],
+        gh_api_impl,
+        *,
+        repo: str = "o/r",
+        pr_number: str = "1",
+    ):
+        """Record LIST/POST/DELETE order. Mutating the comment lists simulates GitHub."""
+
+        def fake_paginate(path: str) -> list[dict]:
+            ops.append(("LIST", path))
+            if path == f"repos/{repo}/pulls/{pr_number}/comments":
+                return list(review_comments)
+            if path == f"repos/{repo}/issues/{pr_number}/comments":
+                return list(issue_comments)
+            self.fail(f"unexpected paginate path: {path}")
+            return []
+
+        def fake_gh_api(
+            method: str,
+            path: str,
+            payload: dict | None = None,
+            paginate: bool = False,
+        ):
+            ops.append(("POST", path, (payload or {}).get("event")))
+            return gh_api_impl(method, path, payload)
+
+        def fake_run(
+            args: list[str],
+            *,
+            check: bool = True,
+            input_text: str | None = None,
+        ):
+            self.assertEqual(args[:4], ["gh", "api", "--method", "DELETE"])
+            ops.append(("DELETE", args[4]))
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        return (
+            mock.patch.object(mw, "gh_api", side_effect=fake_gh_api),
+            mock.patch.object(mw, "gh_api_paginate_items", side_effect=fake_paginate),
+            mock.patch.object(mw, "run", side_effect=fake_run),
+        )
+
+    def test_failed_post_does_not_delete_previous_comments(self) -> None:
+        ops: list[tuple] = []
+        review_comments = [_comment(11, "alice", f"{mw.MARKER}\nold blocking inline")]
+        issue_comments = [_comment(21, "alice", f"{mw.MARKER}\nold conversation")]
+
+        def fail_every_post(method: str, path: str, payload: dict | None) -> dict:
+            raise mw.CommandError("422 Unprocessable Entity")
+
+        api, paginate, run = self._record_github_ops(
+            ops, review_comments, issue_comments, fail_every_post
+        )
+        with api, paginate, run:
+            with self.assertRaises(RuntimeError) as ctx:
+                mw.post_review(
+                    "o/r",
+                    "1",
+                    {
+                        "commit_id": "abc",
+                        "event": "REQUEST_CHANGES",
+                        "body": f"{mw.MARKER}\n# REQUEST CHANGES\n",
+                        "comments": [{"path": "parser.c", "line": 10, "body": "n"}],
+                    },
+                )
+        self.assertIn("Failed to post Merge Warden review", str(ctx.exception))
+        kinds = [op[0] for op in ops]
+        self.assertIn("LIST", kinds)
+        self.assertIn("POST", kinds)
+        self.assertNotIn("DELETE", kinds)
+        self.assertLess(kinds.index("LIST"), kinds.index("POST"))
+
+    def test_successful_post_deletes_only_snapshotted_ids_after_post(self) -> None:
+        ops: list[tuple] = []
+        review_comments = [
+            _comment(11, "alice", f"{mw.MARKER}\nold inline"),
+            _comment(14, "bob", "human inline without marker"),
+        ]
+        issue_comments = [_comment(21, "alice", f"{mw.MARKER}\nold conversation")]
+        new_inline = _comment(99, "github-actions[bot]", f"{mw.MARKER}\njust posted")
+
+        def succeed_and_materialize_new(
+            method: str, path: str, payload: dict | None
+        ) -> dict:
+            review_comments.append(new_inline)
+            return {"id": 1, "comments": [new_inline]}
+
+        api, paginate, run = self._record_github_ops(
+            ops, review_comments, issue_comments, succeed_and_materialize_new
+        )
+        with api, paginate, run:
+            event, posted = mw.post_review(
+                "o/r",
+                "1",
+                {
+                    "commit_id": "abc",
+                    "event": "COMMENT",
+                    "body": f"{mw.MARKER}\n# COMMENT\n",
+                    "comments": [
+                        {"path": "parser.c", "line": 10, "body": f"{mw.MARKER}\njust posted"}
+                    ],
+                },
+            )
+        self.assertEqual(event, "COMMENT")
+        self.assertEqual(len(posted), 1)
+        kinds = [op[0] for op in ops]
+        self.assertLess(kinds.index("LIST"), kinds.index("POST"))
+        self.assertLess(kinds.index("POST"), kinds.index("DELETE"))
+        deleted = [op[1] for op in ops if op[0] == "DELETE"]
+        self.assertEqual(
+            deleted,
+            [
+                "repos/o/r/pulls/comments/11",
+                "repos/o/r/issues/comments/21",
+            ],
+        )
+        self.assertNotIn("repos/o/r/pulls/comments/99", deleted)
+        self.assertNotIn("repos/o/r/pulls/comments/14", deleted)
+
+    def test_approve_fallback_deletes_previous_comments_after_comment_post(self) -> None:
+        ops: list[tuple] = []
+        review_comments = [_comment(11, "alice", f"{mw.MARKER}\nold inline")]
+        issue_comments: list[dict] = []
+
+        def approve_then_comment(method: str, path: str, payload: dict | None) -> dict:
+            if payload and payload.get("event") == "APPROVE":
+                raise mw.CommandError("Cannot approve this pull request")
+            return {"id": 1}
+
+        api, paginate, run = self._record_github_ops(
+            ops, review_comments, issue_comments, approve_then_comment
+        )
+        with api, paginate, run:
+            event, posted = mw.post_review(
+                "o/r",
+                "1",
+                {
+                    "commit_id": "abc",
+                    "event": "APPROVE",
+                    "body": f"{mw.MARKER}\n# APPROVE\n",
+                    "comments": [{"path": "parser.c", "line": 10, "body": "n"}],
+                },
+            )
+        self.assertEqual(event, "COMMENT")
+        self.assertEqual(len(posted), 1)
+        post_events = [op[2] for op in ops if op[0] == "POST"]
+        self.assertEqual(post_events, ["APPROVE", "COMMENT"])
+        comment_post_idx = next(
+            i for i, op in enumerate(ops) if op[0] == "POST" and op[2] == "COMMENT"
+        )
+        delete_indices = [i for i, op in enumerate(ops) if op[0] == "DELETE"]
+        self.assertTrue(delete_indices)
+        self.assertTrue(all(idx > comment_post_idx for idx in delete_indices))
+        self.assertEqual(
+            [op[1] for op in ops if op[0] == "DELETE"],
+            ["repos/o/r/pulls/comments/11"],
         )
 
 

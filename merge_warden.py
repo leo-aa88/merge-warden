@@ -1378,32 +1378,34 @@ def review_summary_body(review: dict) -> str:
     return wrap_review_body(str(review.get("body") or ""))
 
 
-def delete_previous_comments(repo: str, pr_number: str) -> None:
-    # Identity is the HTML marker, not the posting actor. github.token reviews
-    # are github-actions[bot]; PAT and GitHub App tokens are the user / app bot.
+def collect_previous_comment_ids(repo: str, pr_number: str) -> list[str]:
+    """Snapshot GitHub API paths of marked pull-review and issue comments.
+
+    Identity is the HTML marker, not the posting actor. github.token reviews
+    are github-actions[bot]; PAT and GitHub App tokens are the user / app bot.
+    """
+    paths: list[str] = []
     review_comments = gh_api_paginate_items(f"repos/{repo}/pulls/{pr_number}/comments")
     for comment in review_comments:
         body = comment.get("body") or ""
         if MARKER in body:
-            run(
-                ["gh", "api", "--method", "DELETE", f"repos/{repo}/pulls/comments/{comment['id']}"],
-                check=False,
-            )
+            paths.append(f"repos/{repo}/pulls/comments/{comment['id']}")
 
     issue_comments = gh_api_paginate_items(f"repos/{repo}/issues/{pr_number}/comments")
     for comment in issue_comments:
         body = comment.get("body") or ""
         if MARKER in body:
-            run(
-                [
-                    "gh",
-                    "api",
-                    "--method",
-                    "DELETE",
-                    f"repos/{repo}/issues/comments/{comment['id']}",
-                ],
-                check=False,
-            )
+            paths.append(f"repos/{repo}/issues/comments/{comment['id']}")
+    return paths
+
+
+def delete_previous_comment_ids(paths: list[str]) -> None:
+    for path in paths:
+        run(["gh", "api", "--method", "DELETE", path], check=False)
+
+
+def delete_previous_comments(repo: str, pr_number: str) -> None:
+    delete_previous_comment_ids(collect_previous_comment_ids(repo, pr_number))
 
 
 def post_review(repo: str, pr_number: str, payload: dict) -> tuple[str, list[dict]]:
@@ -1414,7 +1416,9 @@ def post_review(repo: str, pr_number: str, payload: dict) -> tuple[str, list[dic
         raise RuntimeError("Review payload is missing commit_id")
     event = normalize_event(str(payload.get("event") or "COMMENT"), body)
 
-    delete_previous_comments(repo, pr_number)
+    # Snapshot before POST. New review comments also contain MARKER; deleting
+    # by a post-success re-list would remove the review we just posted.
+    previous_ids = collect_previous_comment_ids(repo, pr_number)
 
     events_to_try = [event]
     if event != "COMMENT":
@@ -1442,6 +1446,7 @@ def post_review(repo: str, pr_number: str, payload: dict) -> tuple[str, list[dic
                     f"Posted Merge Warden review event={current_event} "
                     f"with {len(attempt)} inline comment(s)"
                 )
+                delete_previous_comment_ids(previous_ids)
                 return current_event, attempt
             except CommandError as exc:
                 last_error = exc
