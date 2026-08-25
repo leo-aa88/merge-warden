@@ -686,10 +686,25 @@ def snap_comment(
     side = str(comment.get("side") or "RIGHT").upper()
     if side not in {"LEFT", "RIGHT"}:
         side = "RIGHT"
-    try:
-        line = int(comment.get("line"))
-    except (TypeError, ValueError):
-        line = 1
+    raw_line = comment.get("line")
+    # Missing or non-numeric lines used to coerce to 1, which then snapped
+    # onto the first commentable hunk. Drop them instead. Digit strings stay
+    # usable because models emit "11". bool and float are excluded:
+    # int(True) == 1 and int(10.7) == 10.
+    if isinstance(raw_line, bool) or isinstance(raw_line, float):
+        return None
+    if isinstance(raw_line, int):
+        line = raw_line
+    elif isinstance(raw_line, str):
+        text = raw_line.strip()
+        if not text:
+            return None
+        try:
+            line = int(text)
+        except ValueError:
+            return None
+    else:
+        return None
     if path not in commentable:
         return None
     sides = commentable[path]
