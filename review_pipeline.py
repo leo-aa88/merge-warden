@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from collections import deque
@@ -102,6 +103,19 @@ MAP_MAX_HTTP_TIMEOUT_SECONDS = 240.0
 # and provider deadlines still clamp the result, so this is headroom, not a
 # guarantee that the socket outlives the budget.
 MAP_CALL_BUDGET_MARGIN_SECONDS = MAP_CALL_BUDGET_SECONDS - MAP_HTTP_TIMEOUT_SECONDS
+# Floor for a coverage-repair dispatch. Below this, a shortened map call is
+# unlikely to return, and burning the tail on a doomed attempt is worse than
+# abandoning the chunk: validation can still use those seconds, and uncovered
+# still means COMMENT. The floor is a plausibility bound, not a retry policy.
+MAP_MIN_REPAIR_SECONDS = 45.0
+# After this many successful map calls, the dispatch envelope may shrink from
+# the worst-case constant toward observed latency. Until then the conservative
+# 150s budget still applies.
+MAP_LATENCY_ESTIMATE_SAMPLES = 2
+# Multiplier on the slowest successful map call. Using the max, not the mean,
+# so a single fast outlier cannot shrink the estimate enough to dispatch a
+# call that overruns the map cutoff.
+MAP_LATENCY_SAFETY_FACTOR = 1.2
 VALIDATION_MISSING_CHUNK_RETRIES = 1
 MISSING_VALIDATION_ID_NOTE_LIMIT = 12
 # Bound structured map output complexity independently of input size.
@@ -531,6 +545,7 @@ class PipelineStats:
     map_chunks_uncovered: int = 0
     map_capacity_retries: int = 0
     map_latency_retries: int = 0
+    map_repair_attempts: int = 0
     provider_circuit_open: bool = False
     provider_circuit_reason: str = ""
     provider_availability_failures: int = 0
@@ -600,6 +615,8 @@ class PipelineStats:
             extras.append(f"{self.map_capacity_retries} capacity retry(ies)")
         if self.map_latency_retries:
             extras.append(f"{self.map_latency_retries} widened latency retry(ies)")
+        if self.map_repair_attempts:
+            extras.append(f"{self.map_repair_attempts} coverage-repair attempt(s)")
         extra = f", {', '.join(extras)}" if extras else ""
         total_request_chars = (
             self.map_request_chars
@@ -682,8 +699,9 @@ class MapWorkItem:
     # sentinel is -inf rather than 0.0 because time.monotonic()'s reference
     # point is undefined and may be negative.
     ready_at: float = float("-inf")
-    # Widened HTTP timeout for one retried latency timeout. None uses the
-    # standard map call limits.
+    # Widened HTTP timeout for one retried latency timeout, or a shortened
+    # timeout for a coverage-repair dispatch. None uses the standard map
+    # call limits.
     http_timeout: float | None = None
     # Why this batch was re-queued, or None for planned primary work. Counted
     # at dispatch so the footer reports retries that reached a provider rather
@@ -692,9 +710,56 @@ class MapWorkItem:
     # Identity that survives retries. Follow-ups inherit the parent's id so
     # three retries of one batch are not three independent health signals.
     logical_id: str = ""
+    # True when this dispatch was shortened to fit the remaining map window
+    # rather than funded as a full worst-case call.
+    coverage_repair: bool = False
 
 
-def map_call_seconds_needed(http_timeout: float | None = None) -> float:
+def _positive_env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return float(default)
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(default)
+    return value if value > 0 else float(default)
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        value = int(raw)
+    except ValueError:
+        return int(default)
+    return value if value > 0 else int(default)
+
+
+def map_min_repair_seconds() -> float:
+    return _positive_env_float(
+        "MERGE_WARDEN_MAP_MIN_REPAIR_SECONDS", MAP_MIN_REPAIR_SECONDS
+    )
+
+
+def map_latency_safety_factor() -> float:
+    return _positive_env_float(
+        "MERGE_WARDEN_MAP_LATENCY_SAFETY_FACTOR", MAP_LATENCY_SAFETY_FACTOR
+    )
+
+
+def map_latency_estimate_samples() -> int:
+    return _positive_env_int(
+        "MERGE_WARDEN_MAP_LATENCY_ESTIMATE_SAMPLES", MAP_LATENCY_ESTIMATE_SAMPLES
+    )
+
+
+def map_call_seconds_needed(
+    http_timeout: float | None = None,
+    *,
+    estimated_seconds: float | None = None,
+) -> float:
     """Wall clock one map dispatch may consume, given its HTTP timeout.
 
     This is the map stage's single funding contract. Retry planning, the
@@ -704,12 +769,79 @@ def map_call_seconds_needed(http_timeout: float | None = None) -> float:
     silently recreate the bug this scheduler exists to avoid: work abandoned
     while time remained.
 
-    ``None`` means the standard map call, which is bounded by its own logical
-    budget rather than by a per-item timeout.
+    ``None`` means a standard map call. Without an estimate that is the
+    worst-case logical budget. After enough successful samples the scheduler
+    may pass a bounded estimate so a demonstrated cheaper call can start in
+    the tail of the map window. An explicit ``http_timeout`` always wins:
+    widened retries and shortened repairs are funded as timeout plus margin.
     """
-    if http_timeout is None:
+    if http_timeout is not None:
+        return float(http_timeout) + MAP_CALL_BUDGET_MARGIN_SECONDS
+    if estimated_seconds is None:
         return float(MAP_CALL_BUDGET_SECONDS)
-    return float(http_timeout) + MAP_CALL_BUDGET_MARGIN_SECONDS
+    return min(
+        float(MAP_CALL_BUDGET_SECONDS),
+        max(map_min_repair_seconds(), float(estimated_seconds)),
+    )
+
+
+def shortened_map_http_timeout(remaining_seconds: float) -> float | None:
+    """HTTP timeout for a coverage-repair dispatch, or None if too short.
+
+    A repair call is still an attempt: it may time out, and timeout still
+    leaves the chunk uncovered. The floor exists because a few-second
+    attempt is unlikely to return and would only burn the tail.
+    """
+    remaining = float(remaining_seconds)
+    if remaining < map_min_repair_seconds():
+        return None
+    timeout = remaining - MAP_CALL_BUDGET_MARGIN_SECONDS
+    if timeout <= 0:
+        return None
+    return timeout
+
+
+def _follow_up_is_repairable(follow_up: MapFollowUp) -> bool:
+    """Untried-shape work that may take a shortened clock in the map tail.
+
+    Capacity retries keep their backoff envelope. Widened latency retries
+    keep the longer clock that the failed attempt proved they need. Repair
+    is for chunks the pipeline has not yet given a call that could succeed.
+    """
+    return (
+        follow_up.http_timeout is None
+        and follow_up.retry_kind is None
+        and follow_up.delay_seconds <= 0
+    )
+
+
+def _item_is_repairable(item: MapWorkItem) -> bool:
+    """Primary or split work that may take a shortened clock in the map tail."""
+    return item.http_timeout is None and item.retry_kind is None
+
+
+@dataclass
+class MapCallLatency:
+    """Successful map-call wall times, sampled on the scheduler thread.
+
+    Workers never touch this. The estimate is the slowest success times a
+    safety factor, capped at the standard call budget and floored at the
+    repair minimum, so a fast outlier cannot open a dispatch that overruns
+    the map cutoff.
+    """
+
+    samples: list[float] = field(default_factory=list)
+
+    def observe_success(self, elapsed_seconds: float) -> None:
+        if elapsed_seconds > 0:
+            self.samples.append(float(elapsed_seconds))
+
+    def estimated_seconds(self) -> float:
+        needed = map_latency_estimate_samples()
+        if len(self.samples) < needed:
+            return float(MAP_CALL_BUDGET_SECONDS)
+        observed = max(self.samples) * map_latency_safety_factor()
+        return map_call_seconds_needed(estimated_seconds=observed)
 
 
 @dataclass(frozen=True)
@@ -725,6 +857,7 @@ class RetryBudget:
     remaining_seconds: float | None
     attempts_left: int
     backoff_spent_seconds: float = 0.0
+    estimated_call_seconds: float | None = None
 
     def can_fund(
         self,
@@ -744,7 +877,10 @@ class RetryBudget:
             return False
         if self.remaining_seconds is None:
             return True
-        needed = float(delay_seconds) + map_call_seconds_needed(http_timeout)
+        estimate = None if http_timeout is not None else self.estimated_call_seconds
+        needed = float(delay_seconds) + map_call_seconds_needed(
+            http_timeout, estimated_seconds=estimate
+        )
         return self.remaining_seconds >= needed
 
     def can_sleep(self, delay: float) -> bool:
@@ -2810,6 +2946,7 @@ def run_map_stage(
     # Total capacity backoff already committed by this stage. Charged at
     # enqueue time so the accounting stays on the scheduler thread.
     backoff_spent = 0.0
+    latency = MapCallLatency()
 
     def remaining_map_seconds() -> float | None:
         return remaining_stage_seconds(deadline)
@@ -2818,18 +2955,25 @@ def run_map_stage(
         remaining = remaining_map_seconds()
         return remaining is not None and remaining <= 0
 
+    def estimated_map_call_seconds() -> float:
+        return latency.estimated_seconds()
+
     def map_call_fits_remaining_budget(item: MapWorkItem | None = None) -> bool:
         remaining = remaining_map_seconds()
         if remaining is None:
             return True
         timeout = None if item is None else item.http_timeout
-        return remaining >= map_call_seconds_needed(timeout)
+        estimate = None if timeout is not None else estimated_map_call_seconds()
+        return remaining >= map_call_seconds_needed(
+            timeout, estimated_seconds=estimate
+        )
 
     def current_retry_budget() -> RetryBudget:
         return RetryBudget(
             remaining_seconds=remaining_map_seconds(),
             attempts_left=max(MAX_MAP_ATTEMPTS - stats.map_attempts, 0),
             backoff_spent_seconds=backoff_spent,
+            estimated_call_seconds=estimated_map_call_seconds(),
         )
 
     def pop_ready_item() -> MapWorkItem | None:
@@ -2857,7 +3001,14 @@ def run_map_stage(
         if delay <= 0:
             return True
         remaining = remaining_map_seconds()
-        needed = map_call_seconds_needed(earliest.http_timeout)
+        estimate = (
+            None
+            if earliest.http_timeout is not None
+            else estimated_map_call_seconds()
+        )
+        needed = map_call_seconds_needed(
+            earliest.http_timeout, estimated_seconds=estimate
+        )
         if remaining is not None and remaining - delay < needed:
             # Sleeping would only burn time validation could still use.
             exhaust_map_stage()
@@ -2874,9 +3025,16 @@ def run_map_stage(
         if health.circuit_open:
             health.note_prevented(len(follow_ups))
             return
-        if not map_call_fits_remaining_budget():
-            # Not even a standard call fits, so no follow-up can dispatch. Stop
-            # map so synthesis can still use its reserved window.
+        remaining = remaining_map_seconds()
+        can_repair = (
+            remaining is not None
+            and shortened_map_http_timeout(remaining) is not None
+        )
+        if not map_call_fits_remaining_budget() and not (
+            can_repair and any(_follow_up_is_repairable(item) for item in follow_ups)
+        ):
+            # Not even a standard call or a shortened repair fits. Stop map
+            # so synthesis can still use its reserved window.
             extra = {
                 chunk.id
                 for follow_up in follow_ups
@@ -2888,29 +3046,39 @@ def run_map_stage(
             return
         now = time.monotonic()
         remaining = remaining_map_seconds()
+        estimate = estimated_map_call_seconds()
         for follow_up in follow_ups:
             leftover = [
                 chunk for chunk in follow_up.chunks if chunk.id not in mapped_ids
             ]
             if not leftover:
                 continue
+            follow_estimate = (
+                None if follow_up.http_timeout is not None else estimate
+            )
             needed = follow_up.delay_seconds + map_call_seconds_needed(
-                follow_up.http_timeout
+                follow_up.http_timeout, estimated_seconds=follow_estimate
             )
             if remaining is not None and remaining < needed:
-                # Retry planning sampled the clock slightly earlier than this,
-                # so a widened retry it could fund may no longer fit. Admitting
-                # it would mint a batch the dispatch gate immediately skips.
-                # A standard call still fits, so the stage keeps running and
-                # only these chunks stay uncovered.
-                stats.notes.append(
-                    sanitize_failure_note(
-                        f"map batch {parent_tag} follow-up left "
-                        f"{len(leftover)} chunk(s) uncovered: needs "
-                        f"{needed:.0f}s, map budget has {remaining:.0f}s"
+                if _follow_up_is_repairable(follow_up) and can_repair:
+                    # Dispatch will size the HTTP timeout to the remaining
+                    # window. Admitting the batch here is what lets an
+                    # untried split consume the stranded tail.
+                    pass
+                else:
+                    # Retry planning sampled the clock slightly earlier than
+                    # this, so a widened retry it could fund may no longer
+                    # fit. Admitting it would mint a batch the dispatch gate
+                    # immediately skips. A standard call still fits, so the
+                    # stage keeps running and only these chunks stay uncovered.
+                    stats.notes.append(
+                        sanitize_failure_note(
+                            f"map batch {parent_tag} follow-up left "
+                            f"{len(leftover)} chunk(s) uncovered: needs "
+                            f"{needed:.0f}s, map budget has {remaining:.0f}s"
+                        )
                     )
-                )
-                continue
+                    continue
             backoff_spent += follow_up.delay_seconds
             follow_up_serial[parent_tag] = follow_up_serial.get(parent_tag, 1) + 1
             next_sequence += 1
@@ -2966,6 +3134,24 @@ def run_map_stage(
             )
         stage_exhausted = True
         abandon_pending()
+
+    def skip_unrefundable(item: MapWorkItem, reason: str) -> bool:
+        """Skip a retry that cannot take a shortened clock. Exhaust if last.
+
+        Returning True means the stage should stop dispatching. A capacity
+        or widened retry must not kill a sibling that can still repair, but
+        skip-and-continue with an empty queue leaves leftover map seconds
+        unsurrendered and synthesis unreachable.
+        """
+        stats.notes.append(sanitize_failure_note(reason))
+        completed[item.sequence] = MapWorkerResult(item=item, skipped=True)
+        if any(_item_is_repairable(candidate) for candidate in pending):
+            return False
+        extra = sum(
+            1 for chunk in item.chunks if chunk.id not in mapped_ids
+        )
+        exhaust_map_stage(extra_uncovered=extra)
+        return True
 
     def apply_health_from_worker(result: MapWorkerResult) -> None:
         """Update provider health as soon as a future lands on this thread.
@@ -3041,34 +3227,65 @@ def run_map_stage(
                     pending.appendleft(item)
                     exhaust_map_stage()
                     break
-                if not map_call_fits_remaining_budget(item):
-                    if item.http_timeout is not None:
+                remaining = remaining_map_seconds()
+                if item.http_timeout is not None:
+                    if not map_call_fits_remaining_budget(item):
                         # A widened retry that no longer fits its own budget
                         # would be dispatched under the clock that already
                         # timed out. Leave this chunk uncovered instead of
                         # spending the rest of the stage proving that again.
-                        stats.notes.append(
-                            sanitize_failure_note(
-                                f"map batch {item.batch_tag} left uncovered: "
-                                f"widened retry no longer fits the map budget"
-                            )
-                        )
-                        completed[item.sequence] = MapWorkerResult(
-                            item=item, skipped=True
-                        )
+                        if skip_unrefundable(
+                            item,
+                            f"map batch {item.batch_tag} left uncovered: "
+                            f"widened retry no longer fits the map budget",
+                        ):
+                            break
                         continue
-                    pending.appendleft(item)
-                    exhaust_map_stage()
-                    break
+                elif remaining is not None:
+                    # Untried work in the tail of the map window gets a
+                    # shortened clock sized to what is left, so the socket
+                    # cannot outlive the cutoff. Remaining below the floor
+                    # is abandoned honestly: a doomed few-second call is
+                    # worse than handing those seconds to later stages.
+                    # Capacity retries keep their envelope: skip this item
+                    # so a repairable sibling can still run, then exhaust
+                    # when nothing repairable remains.
+                    if remaining < MAP_CALL_BUDGET_SECONDS:
+                        timeout = shortened_map_http_timeout(remaining)
+                        if timeout is not None and _item_is_repairable(item):
+                            item.http_timeout = timeout
+                            item.coverage_repair = True
+                        elif timeout is None:
+                            pending.appendleft(item)
+                            exhaust_map_stage()
+                            break
+                        elif skip_unrefundable(
+                            item,
+                            f"map batch {item.batch_tag} left uncovered: "
+                            f"retry envelope no longer fits the map budget",
+                        ):
+                            break
+                        else:
+                            continue
+                    elif not map_call_fits_remaining_budget(item):
+                        pending.appendleft(item)
+                        exhaust_map_stage()
+                        break
                 remaining = remaining_map_seconds()
                 remaining_display = (
                     "unbounded" if remaining is None else f"{remaining:.0f}s"
+                )
+                estimate = (
+                    None
+                    if item.http_timeout is not None
+                    else estimated_map_call_seconds()
                 )
                 print(
                     f"Map batch {item.batch_tag}: chunks={len(item.chunks)} "
                     f"request_chars={len(item.message)} "
                     f"stage_remaining={remaining_display} "
-                    f"call_budget={map_call_seconds_needed(item.http_timeout):.0f}s "
+                    f"call_budget="
+                    f"{map_call_seconds_needed(item.http_timeout, estimated_seconds=estimate):.0f}s "
                     f"http_timeout={item.http_timeout or MAP_HTTP_TIMEOUT_SECONDS:.0f}s "
                     f"({len(in_flight) + 1} in flight)",
                     flush=True,
@@ -3088,6 +3305,8 @@ def run_map_stage(
                     break
                 stats.map_attempts += 1
                 stats.map_request_chars += len(item.message)
+                if item.coverage_repair:
+                    stats.map_repair_attempts += 1
                 if item.retry_kind == ProviderFailureKind.CAPACITY:
                     stats.map_capacity_retries += 1
                 elif item.retry_kind == ProviderFailureKind.LATENCY_TIMEOUT:
@@ -3127,6 +3346,12 @@ def run_map_stage(
                     )
                     continue
                 attempt = apply_map_response(store, stats, result)
+                if (
+                    result.error is None
+                    and not result.oversized
+                    and not attempt.malformed
+                ):
+                    latency.observe_success(result.elapsed_seconds)
                 print(
                     f"Map batch {result.item.batch_tag}: ingested "
                     f"{len(attempt.acknowledged)}/{len(result.item.chunks)} "
@@ -3223,6 +3448,29 @@ def run_map_stage(
                     stop_for_permanent_provider(worker_result.error)
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
+
+    remaining = remaining_map_seconds()
+    if (
+        not stage_exhausted
+        and not health.circuit_open
+        and permanent_error is None
+        and deadline_error is None
+        and remaining is not None
+        and remaining < MAP_CALL_BUDGET_SECONDS
+    ):
+        # Dispatch can start the next primary batch before ingesting a
+        # capacity failure, so a same-shape retry may never be queued.
+        # The skip-unrefundable branch then never runs, leftover seconds
+        # sit below a full envelope, and synthesis is skipped. Surrender
+        # that tail here so unused map time still reaches later stages.
+        extra = sum(
+            1
+            for batch in packed
+            for chunk in batch
+            if chunk.id not in mapped_ids
+        )
+        if extra:
+            exhaust_map_stage(extra_uncovered=extra)
 
     _sync_provider_health_stats(stats, health)
     return MapStageResult(
