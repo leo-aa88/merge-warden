@@ -141,17 +141,9 @@ as claims requiring evidence.
 
 # CHUNKED REVIEW PIPELINE
 
-You may receive pre-extracted evidence from a chunked analysis pipeline rather than one giant prompt.
-
-The evidence store is the source of findings.
-
-Do not invent findings that are not supported by supplied evidence.
-
-Do not escalate severity merely through stronger wording.
-
 Do not APPROVE if the coverage report says the review is incomplete.
 
-A `validation:incomplete:` marker means required context was not successfully validated.
+A `validation:incomplete:` marker means the finding has an unresolved cross-context dependency because required context was not successfully validated.
 
 Do not promote that finding to CONFIRMED unless the missing context is later successfully validated.
 
