@@ -19,7 +19,13 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from context_pipeline import CorpusInputs, build_review_corpus, format_char_count
+from context_pipeline import (
+    CorpusInputs,
+    build_review_corpus,
+    failed_complete_diff_placeholder,
+    format_char_count,
+    omitted_required_patch_paths,
+)
 from review_pipeline import (
     DEFAULT_MAP_CONCURRENCY,
     DEFAULT_PROMPT_MAP,
@@ -1660,9 +1666,26 @@ def generate_review(args: argparse.Namespace, repo: str) -> int:
     files = collect_pr_files(repo, args.pr)
     commentable = commentable_by_path(files)
     diff_result = run(["gh", "pr", "diff", args.pr, "--repo", repo], check=False)
-    diff = diff_result.stdout if diff_result.returncode == 0 else ""
-    if diff_result.returncode != 0:
-        diff = f"(failed to load complete diff: {diff_result.stderr.strip()})\n"
+    if diff_result.returncode == 0:
+        diff = diff_result.stdout
+    else:
+        # Keep the failed-complete placeholder. Reconstruction from file
+        # patches happens in corpus construction so a partial Files API
+        # fallback cannot hide omitted changed files and reach APPROVE.
+        omitted = omitted_required_patch_paths(files, collect_skipped_paths(files))
+        if omitted:
+            listed = ", ".join(omitted)
+            print(
+                f"::warning::gh pr diff failed; per-file patches omit {listed}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "::warning::gh pr diff failed; reconstructing from per-file "
+                "patch payloads",
+                file=sys.stderr,
+            )
+        diff = failed_complete_diff_placeholder(diff_result.stderr)
 
     corpus = build_corpus(
         repo=repo,

@@ -165,11 +165,18 @@ with `git show`.
 - `comment-count` — `posted-comment-count` when posting, otherwise `generated-comment-count`
 
 Injected after the system prompt for the primary pass: architectural docs,
-issue bodies, PR description, and the complete diff. Changed-file source is
-not eagerly mapped as full files; when the map stage emits `needs_context`,
-Merge Warden loads the requested file from the PR head and sends numbered
-source chunks through targeted validation. That material is treated as
-untrusted data, not as instructions to the reviewer.
+issue bodies, PR description, and the complete diff. If `gh pr diff` fails,
+Merge Warden reconstructs hunks from the per-file `patch` fields already
+returned by the Pulls Files API and treats those hunks as review evidence.
+`APPROVE` stays unreachable unless every non-excluded changed file with
+line changes is represented in that reconstruction (`limit_error` /
+incomplete coverage). Skipped binaries and files with 0 additions and 0
+deletions do not require a patch. The `gh pr diff` error string is never
+treated as reviewed source. Changed-file source is not eagerly mapped as
+full files; when the map stage emits `needs_context`, Merge Warden loads
+the requested file from the PR head and sends numbered source chunks
+through targeted validation. That material is treated as untrusted data,
+not as instructions to the reviewer.
 
 Merge Warden does **not** truncate the PR to fit a context window. It builds
 a complete primary context corpus, splits it at semantic boundaries (diff
