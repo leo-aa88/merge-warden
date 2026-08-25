@@ -71,12 +71,6 @@ CANDIDATE_FINDINGS_NOT_POSTED = (
 # inherits its parent's spend instead of starting over.
 MAP_MISSING_CHUNK_RETRIES = 6
 MAP_TRANSPORT_RETRIES = 4
-# A retry is scheduled only when the stage can fund an attempt of the observed
-# cost plus this margin, so retrying never eats a downstream stage reserve.
-MAP_RETRY_MARGIN_SECONDS = 5.0
-# Floor on the projected cost of a retry. An instant failure is not free: it
-# still occupies a worker and a provider slot.
-MAP_MIN_RETRY_COST_SECONDS = 5.0
 # Backoff for capacity rejections that arrive without a Retry-After header,
 # indexed by prior capacity failures for the same request.
 MAP_CAPACITY_BACKOFF_SECONDS = (4.0, 8.0, 16.0, 30.0)
@@ -548,6 +542,23 @@ class MapWorkItem:
     retry_kind: ProviderFailureKind | None = None
 
 
+def map_call_seconds_needed(http_timeout: float | None = None) -> float:
+    """Wall clock one map dispatch may consume, given its HTTP timeout.
+
+    This is the map stage's single funding contract. Retry planning, the
+    enqueue gate and the dispatch gate all size work with this one function,
+    so a retry cannot be admitted under one budget and refused under another.
+    Two nearby formulas with different margins would silently recreate the bug
+    this scheduler exists to avoid: work abandoned while time remained.
+
+    ``None`` means the standard map call, which is bounded by its own logical
+    budget rather than by a per-item timeout.
+    """
+    if http_timeout is None:
+        return float(MAP_CALL_BUDGET_SECONDS)
+    return float(http_timeout) + MAP_CALL_BUDGET_MARGIN_SECONDS
+
+
 @dataclass(frozen=True)
 class RetryBudget:
     """What the map stage can still afford, sampled on the scheduler thread.
@@ -562,14 +573,26 @@ class RetryBudget:
     attempts_left: int
     backoff_spent_seconds: float = 0.0
 
-    def can_fund(self, projected_cost: float) -> bool:
-        """Whether another attempt of roughly ``projected_cost`` still fits."""
+    def can_fund(
+        self,
+        http_timeout: float | None = None,
+        *,
+        delay_seconds: float = 0.0,
+    ) -> bool:
+        """Whether the stage can still dispatch this follow-up after any backoff.
+
+        ``http_timeout`` is the follow-up's own widened timeout, or None for a
+        standard map call. The cost asked here is exactly what the dispatch
+        gate will demand, so planning never approves work dispatch will refuse.
+        The elapsed time of the attempt that just failed is sunk cost and is
+        deliberately not part of this question.
+        """
         if self.attempts_left <= 0:
             return False
         if self.remaining_seconds is None:
             return True
-        cost = max(float(projected_cost), MAP_MIN_RETRY_COST_SECONDS)
-        return self.remaining_seconds >= cost + MAP_RETRY_MARGIN_SECONDS
+        needed = float(delay_seconds) + map_call_seconds_needed(http_timeout)
+        return self.remaining_seconds >= needed
 
     def can_sleep(self, delay: float) -> bool:
         """Whether the stage may spend ``delay`` more waiting out backoff."""
@@ -2141,10 +2164,12 @@ def _follow_up_batches(
     problem. Single-chunk latency timeouts re-send under a longer clock, while
     multi-chunk ones split so an expensive shape is not repeated unchanged.
 
-    Every retry is gated on ``budget``: the ceilings below only bound churn
-    against an instantly failing provider. A chunk is abandoned when the stage
-    can no longer fund an attempt, never merely because a counter ran out
-    while time remained.
+    A chunk is uncovered when either bound is hit. ``budget`` is the primary
+    one and answers the question that motivated this scheduler: it refuses a
+    retry the map stage cannot pay for. The per-chunk ceilings are a second,
+    independent bound that can and does fire while budget remains, which is
+    what stops an instantly-failing provider from spending the whole stage on
+    one chunk. Either bound alone is sufficient to give up.
     """
     remaining = [chunk for chunk in result.missing if chunk.id not in mapped_ids]
     if result.complete or not remaining or result.budget_exhausted:
@@ -2184,7 +2209,7 @@ def _follow_up_batches(
         if (
             retries < MAP_CAPACITY_RETRIES
             and budget.can_sleep(delay)
-            and budget.can_fund(elapsed_seconds + delay)
+            and budget.can_fund(delay_seconds=delay)
         ):
             charge(capacity_failures)
             stats.notes.append(
@@ -2214,7 +2239,7 @@ def _follow_up_batches(
 
     if kind == ProviderFailureKind.TRANSIENT_TRANSPORT:
         retries = spent(transport_failures)
-        if retries < MAP_TRANSPORT_RETRIES and budget.can_fund(elapsed_seconds):
+        if retries < MAP_TRANSPORT_RETRIES and budget.can_fund():
             charge(transport_failures)
             stats.notes.append(
                 sanitize_failure_note(
@@ -2235,7 +2260,6 @@ def _follow_up_batches(
         chunk_id = current[0].id
         retries = single_failures.get(chunk_id, 0)
         escalated: float | None = None
-        projected = elapsed_seconds
         if kind == ProviderFailureKind.LATENCY_TIMEOUT:
             escalated = escalated_map_timeout(elapsed_seconds, budget)
             if escalated is None:
@@ -2246,8 +2270,7 @@ def _follow_up_batches(
                     )
                 )
                 return []
-            projected = escalated
-        if retries < MAP_MISSING_CHUNK_RETRIES and budget.can_fund(projected):
+        if retries < MAP_MISSING_CHUNK_RETRIES and budget.can_fund(escalated):
             single_failures[chunk_id] = retries + 1
             if escalated is not None:
                 stats.notes.append(
@@ -2410,17 +2433,12 @@ def run_map_stage(
         remaining = remaining_map_seconds()
         return remaining is not None and remaining <= 0
 
-    def map_call_seconds_needed(item: MapWorkItem | None = None) -> float:
-        """Wall clock one dispatch of ``item`` may consume."""
-        if item is None or item.http_timeout is None:
-            return float(MAP_CALL_BUDGET_SECONDS)
-        return item.http_timeout + MAP_CALL_BUDGET_MARGIN_SECONDS
-
     def map_call_fits_remaining_budget(item: MapWorkItem | None = None) -> bool:
         remaining = remaining_map_seconds()
         if remaining is None:
             return True
-        return remaining >= map_call_seconds_needed(item)
+        timeout = None if item is None else item.http_timeout
+        return remaining >= map_call_seconds_needed(timeout)
 
     def current_retry_budget() -> RetryBudget:
         return RetryBudget(
@@ -2461,8 +2479,8 @@ def run_map_stage(
     def enqueue(follow_ups: list[MapFollowUp], parent_tag: str) -> None:
         nonlocal next_sequence, backoff_spent
         if not map_call_fits_remaining_budget():
-            # Follow-up work exists, but not a full map call budget. Stop map
-            # so synthesis can still use its reserved window.
+            # Not even a standard call fits, so no follow-up can dispatch. Stop
+            # map so synthesis can still use its reserved window.
             extra = {
                 chunk.id
                 for follow_up in follow_ups
@@ -2473,11 +2491,29 @@ def run_map_stage(
                 exhaust_map_stage(extra_uncovered=len(extra))
             return
         now = time.monotonic()
+        remaining = remaining_map_seconds()
         for follow_up in follow_ups:
             leftover = [
                 chunk for chunk in follow_up.chunks if chunk.id not in mapped_ids
             ]
             if not leftover:
+                continue
+            needed = follow_up.delay_seconds + map_call_seconds_needed(
+                follow_up.http_timeout
+            )
+            if remaining is not None and remaining < needed:
+                # Retry planning sampled the clock slightly earlier than this,
+                # so a widened retry it could fund may no longer fit. Admitting
+                # it would mint a batch the dispatch gate immediately skips.
+                # A standard call still fits, so the stage keeps running and
+                # only these chunks stay uncovered.
+                stats.notes.append(
+                    sanitize_failure_note(
+                        f"map batch {parent_tag} follow-up left "
+                        f"{len(leftover)} chunk(s) uncovered: needs "
+                        f"{needed:.0f}s, map budget has {remaining:.0f}s"
+                    )
+                )
                 continue
             backoff_spent += follow_up.delay_seconds
             follow_up_serial[parent_tag] = follow_up_serial.get(parent_tag, 1) + 1
@@ -2587,7 +2623,7 @@ def run_map_stage(
                     f"Map batch {item.batch_tag}: chunks={len(item.chunks)} "
                     f"request_chars={len(item.message)} "
                     f"stage_remaining={remaining_display} "
-                    f"call_budget={map_call_seconds_needed(item):.0f}s "
+                    f"call_budget={map_call_seconds_needed(item.http_timeout):.0f}s "
                     f"http_timeout={item.http_timeout or MAP_HTTP_TIMEOUT_SECONDS:.0f}s "
                     f"({len(in_flight) + 1} in flight)",
                     flush=True,

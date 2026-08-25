@@ -357,7 +357,10 @@ blocker is never dropped to keep 25 MINOR notes.
 
 Provider HTTP calls outside the map stage retry transient failures
 (disconnects, timeouts, HTTP 429/5xx) a few times with exponential backoff.
-Map provider calls use one HTTP attempt and return retryable transport failures
-to the scheduler so it can choose same-shape retry or split. HTTP 429 honors
-`Retry-After` when present, capped at 60 seconds. Every provider socket timeout
-and retry delay is also bounded by the remaining internal review budget.
+Map provider calls use one HTTP attempt and hand the classified failure to the
+map scheduler, which owns all map backoff. It re-sends the same request for a
+capacity rejection, re-sends a single chunk under a longer timeout after a
+latency timeout, and splits a multi-chunk request only when request shape could
+plausibly be the problem. HTTP 429 honors `Retry-After` when present, capped at
+60 seconds. Every provider socket timeout and retry delay is also bounded by the
+remaining internal review budget.

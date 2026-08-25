@@ -4280,8 +4280,8 @@ class MapSchedulerInvariantTests(unittest.TestCase):
             )
 
         _review, coverage, _store, stats = _run_hierarchical(corpus, fake)
-        # Transport retries exhaust their own ceiling, then the single-chunk
-        # floor takes over before the chunk is finally abandoned.
+        # A single chunk has nothing to split into, so the transport ceiling is
+        # terminal: there is no handoff to the missing-chunk floor below it.
         self.assertEqual(len(shapes), MAP_TRANSPORT_RETRIES + 1)
         self.assertEqual(set(shapes), {1})
         self.assertFalse(coverage.complete)
@@ -6224,14 +6224,148 @@ class MapRetryBudgetTests(unittest.TestCase):
         unlimited = rp.RetryBudget(remaining_seconds=None, attempts_left=1)
         self.assertTrue(unlimited.can_fund(10_000.0))
         no_attempts = rp.RetryBudget(remaining_seconds=10_000.0, attempts_left=0)
-        self.assertFalse(no_attempts.can_fund(1.0))
-        tight = rp.RetryBudget(remaining_seconds=20.0, attempts_left=5)
-        self.assertTrue(tight.can_fund(10.0))
-        self.assertFalse(tight.can_fund(16.0))
-        # An instant failure still costs a worker and a provider slot.
+        self.assertFalse(no_attempts.can_fund())
+        standard = rp.map_call_seconds_needed()
+        exact = rp.RetryBudget(remaining_seconds=standard, attempts_left=5)
+        self.assertTrue(exact.can_fund())
         self.assertFalse(
-            rp.RetryBudget(remaining_seconds=8.0, attempts_left=5).can_fund(0.0)
+            rp.RetryBudget(
+                remaining_seconds=standard - 0.5, attempts_left=5
+            ).can_fund()
         )
+        # Backoff is paid before the call, so it is part of what must fit.
+        self.assertFalse(exact.can_fund(delay_seconds=1.0))
+        self.assertTrue(
+            rp.RetryBudget(
+                remaining_seconds=standard + 30.0, attempts_left=5
+            ).can_fund(delay_seconds=30.0)
+        )
+
+    def test_planner_and_dispatcher_ask_one_budget_question(self) -> None:
+        """Planning must never fund a retry the dispatch gate would refuse.
+
+        ``map_call_seconds_needed`` is the dispatch contract. Pinning
+        ``can_fund`` to it exactly means a second, more optimistic margin
+        cannot be reintroduced on the planning side without failing here.
+        """
+        for timeout in (
+            None,
+            MAP_HTTP_TIMEOUT_SECONDS,
+            MAP_HTTP_TIMEOUT_SECONDS * 1.5,
+            rp.MAP_MAX_HTTP_TIMEOUT_SECONDS,
+        ):
+            needed = rp.map_call_seconds_needed(timeout)
+            with self.subTest(timeout=timeout):
+                self.assertTrue(
+                    rp.RetryBudget(
+                        remaining_seconds=needed, attempts_left=4
+                    ).can_fund(timeout)
+                )
+                self.assertFalse(
+                    rp.RetryBudget(
+                        remaining_seconds=needed - 0.5, attempts_left=4
+                    ).can_fund(timeout)
+                )
+
+    def test_widened_retry_is_refused_inside_the_old_planning_gap(self) -> None:
+        """A 210s retry planned at 217s remaining was skipped at dispatch.
+
+        The planner allowed ``escalated + 5`` while dispatch demanded
+        ``escalated + 10``, so this window planned, logged and enqueued a retry
+        that could never run. One funding formula closes it.
+        """
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 10_000.0}
+        # 357s of map stage; one 140s timeout leaves exactly 217s.
+        deadline = clock["now"] + 777.0
+        attempts: list[float | None] = []
+        fake = self._single_chunk_model(
+            clock,
+            attempts,
+            lambda: ProviderRequestError(
+                ProviderFailureKind.LATENCY_TIMEOUT,
+                "xAI request timed out after 1 attempts",
+            ),
+            cost=MAP_HTTP_TIMEOUT_SECONDS,
+            fail_times=1,
+        )
+
+        (_review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline
+        )
+        self.assertFalse(coverage.complete)
+        self.assertEqual(attempts, [None])
+        self.assertEqual(stats.map_latency_retries, 0)
+        notes = " | ".join(stats.notes)
+        self.assertIn("no budget for a longer retry", notes)
+        # The planner must not announce a retry it cannot fund, and no batch
+        # may be enqueued only for the dispatch gate to skip it.
+        self.assertNotIn("retrying with a", notes)
+        self.assertNotIn("no longer fits the map budget", notes)
+
+    def test_widened_retry_runs_when_it_exactly_fits(self) -> None:
+        """The inverse: at exactly the dispatch cost the retry must still run.
+
+        Without this, refusing every widened retry would pass the test above.
+        """
+        corpus = _synthetic_corpus(_tiny_chunks(1))
+        clock = {"now": 10_000.0}
+        # 360s of map stage; one 140s timeout leaves exactly the 220s a 210s
+        # widened call costs to dispatch.
+        deadline = clock["now"] + 780.0
+        attempts: list[float | None] = []
+        fake = self._single_chunk_model(
+            clock,
+            attempts,
+            lambda: ProviderRequestError(
+                ProviderFailureKind.LATENCY_TIMEOUT,
+                "xAI request timed out after 1 attempts",
+            ),
+            cost=MAP_HTTP_TIMEOUT_SECONDS,
+            fail_times=1,
+        )
+
+        (_review, coverage, _store, stats), _slept = self._clocked_run(
+            corpus, fake, clock, deadline
+        )
+        self.assertTrue(coverage.complete)
+        self.assertEqual(attempts, [None, MAP_HTTP_TIMEOUT_SECONDS * 1.5])
+        self.assertEqual(stats.map_latency_retries, 1)
+
+    def test_transport_split_children_inherit_the_parent_retry_spend(
+        self,
+    ) -> None:
+        """Per-chunk keying: a split must not mint a fresh retry ladder.
+
+        Transport is the only path that both retries the same shape and then
+        splits, so it is the only one that can catch a regression to keying on
+        the request signature.
+        """
+        corpus = _synthetic_corpus(_tiny_chunks(2))
+        shapes: list[int] = []
+
+        def fake(system: str, user: str) -> str:
+            stage = mw.provider_call_stage(system, user)
+            if stage == "map":
+                shapes.append(len(_chunk_ids_in_prompt(user)))
+                raise ProviderRequestError(
+                    ProviderFailureKind.TRANSIENT_TRANSPORT,
+                    "connection reset after 0.5s",
+                )
+            if stage in {"pre-reduce", "reduce"}:
+                return json.dumps({"keep": [], "reject": [], "merge": []})
+            return json.dumps(
+                {"event": "COMMENT", "body": "# COMMENT\n", "comments": []}
+            )
+
+        _review, coverage, _store, stats = _run_hierarchical(corpus, fake)
+        # The parent spends the whole ladder, then splits once. Each child
+        # inherits that spend, so neither gets retries of its own. Keyed on
+        # the request signature instead, each child would start at zero.
+        self.assertEqual(shapes, [2] * (MAP_TRANSPORT_RETRIES + 1) + [1, 1])
+        self.assertEqual(stats.map_batches_split, 1)
+        self.assertEqual(stats.map_attempts, MAP_TRANSPORT_RETRIES + 3)
+        self.assertFalse(coverage.complete)
 
     def test_capacity_backoff_prefers_retry_after_and_clamps_it(self) -> None:
         self.assertEqual(rp.capacity_backoff_seconds(0, 12.0), 12.0)
